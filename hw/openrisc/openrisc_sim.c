@@ -64,7 +64,7 @@ static void cpu_openrisc_load_kernel(ram_addr_t ram_size,
 {
     long kernel_size;
     uint64_t elf_entry;
-    hwaddr entry;
+    hwaddr entry = 0;
 
     if (kernel_filename && !qtest_enabled()) {
         kernel_size = load_elf(kernel_filename, NULL, NULL,

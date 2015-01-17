@@ -74,7 +74,7 @@ static void pc_q35_init(MachineState *machine)
     ISADevice *floppy;
     MemoryRegion *pci_memory;
     MemoryRegion *rom_memory;
-    MemoryRegion *ram_memory;
+    MemoryRegion *ram_memory = NULL;
     GSIState *gsi_state;
     ISABus *isa_bus;
     int pci_enabled = 1;

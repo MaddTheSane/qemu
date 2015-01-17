@@ -471,7 +471,7 @@ static void gen_partset_reg(int opsize, TCGv reg, TCGv val)
 /* Sign or zero extend a value.  */
 static inline TCGv gen_extend(TCGv val, int opsize, int sign)
 {
-    TCGv tmp;
+    TCGv tmp = 0;
 
     switch (opsize) {
     case OS_BYTE:
@@ -583,7 +583,7 @@ static TCGv gen_ea(CPUM68KState *env, DisasContext *s, uint16_t insn,
 {
     TCGv reg;
     TCGv result;
-    uint32_t offset;
+    uint32_t offset = 0;
 
     switch ((insn >> 3) & 7) {
     case 0: /* Data register direct.  */
