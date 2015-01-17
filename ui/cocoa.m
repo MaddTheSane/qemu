@@ -944,7 +944,7 @@ int main (int argc, const char * argv[]) {
         }
     }
 
-    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    @autoreleasepool {
 
     // Pull this console process up to being a fully-fledged graphical
     // app with a menubar and Dock icon
@@ -1005,9 +1005,9 @@ int main (int argc, const char * argv[]) {
     [NSApp run];
 
     [appController release];
-    [pool release];
 
     return 0;
+    }
 }
 
 
@@ -1016,7 +1016,7 @@ int main (int argc, const char * argv[]) {
 static void cocoa_update(DisplayChangeListener *dcl,
                          int x, int y, int w, int h)
 {
-    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    @autoreleasepool {
 
     COCOA_DEBUG("qemu_cocoa: cocoa_update\n");
 
@@ -1032,22 +1032,22 @@ static void cocoa_update(DisplayChangeListener *dcl,
     }
     [cocoaView setNeedsDisplayInRect:rect];
 
-    [pool release];
+    }
 }
 
 static void cocoa_switch(DisplayChangeListener *dcl,
                          DisplaySurface *surface)
 {
-    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    @autoreleasepool {
 
     COCOA_DEBUG("qemu_cocoa: cocoa_switch\n");
     [cocoaView switchSurface:surface];
-    [pool release];
+    }
 }
 
 static void cocoa_refresh(DisplayChangeListener *dcl)
 {
-    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    @autoreleasepool {
 
     COCOA_DEBUG("qemu_cocoa: cocoa_refresh\n");
 
@@ -1071,7 +1071,7 @@ static void cocoa_refresh(DisplayChangeListener *dcl)
         }
     } while(event != nil);
     graphic_hw_update(NULL);
-    [pool release];
+    }
 }
 
 static void cocoa_cleanup(void)
