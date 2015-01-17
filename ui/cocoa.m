@@ -248,22 +248,17 @@ static int cocoa_keycode_to_qemu(int keycode)
 */
 @interface QemuCocoaView : NSView
 {
-    QEMUScreen screen;
     NSWindow *fullScreenWindow;
-    float cx,cy,cw,ch,cdx,cdy;
+    CGFloat cx,cy,cw,ch;
     CGDataProviderRef dataProviderRef;
     int modifiers_state[256];
-    BOOL isMouseGrabbed;
     BOOL isFullscreen;
-    BOOL isAbsoluteEnabled;
-    BOOL isMouseDeassociated;
 }
 - (void) switchSurface:(DisplaySurface *)surface;
 - (void) grabMouse;
 - (void) ungrabMouse;
 - (void) toggleFullScreen:(id)sender;
 - (void) handleEvent:(NSEvent *)event;
-- (void) setAbsoluteEnabled:(BOOL)tIsAbsoluteEnabled;
 /* The state surrounding mouse grabbing is potentially confusing.
  * isAbsoluteEnabled tracks qemu_input_is_absolute() [ie "is the emulated
  *   pointing device an absolute-position one?"], but is only updated on
@@ -276,18 +271,25 @@ static int cocoa_keycode_to_qemu(int keycode)
  *   CGAssociateMouseAndMouseCursorPosition(FALSE)
  *   (which basically happens if we grab in non-absolute mode).
  */
-- (BOOL) isMouseGrabbed;
-- (BOOL) isAbsoluteEnabled;
-- (BOOL) isMouseDeassociated;
-- (float) cdx;
-- (float) cdy;
-- (QEMUScreen) gscreen;
+@property (getter = isAbsoluteEnabled) BOOL absoluteEnabled;
+@property (readonly, getter=isMouseGrabbed) BOOL mouseGrabbed;
+@property (readonly, getter=isMouseDeassociated) BOOL mouseDeassociated;
+@property (readonly) CGFloat cdx;
+@property (readonly) CGFloat cdy;
+@property (readonly) QEMUScreen gscreen;
 @end
 
 QemuCocoaView *cocoaView;
 
 @implementation QemuCocoaView
-- (id)initWithFrame:(NSRect)frameRect
+@synthesize cdx;
+@synthesize cdy;
+@synthesize absoluteEnabled = isAbsoluteEnabled;
+@synthesize mouseGrabbed = isMouseGrabbed;
+@synthesize mouseDeassociated = isMouseDeassociated;
+@synthesize gscreen = screen;
+
+- (instancetype)initWithFrame:(NSRect)frameRect
 {
     COCOA_DEBUG("QemuCocoaView: initWithFrame\n");
 
@@ -355,39 +357,33 @@ QemuCocoaView *cocoaView;
         CGContextSetRGBFillColor(viewContextRef, 0, 0, 0, 1.0);
         CGContextFillRect(viewContextRef, NSRectToCGRect(rect));
     } else {
+#ifdef __LITTLE_ENDIAN__
+        CGColorSpaceRef tmpSpace = CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB); //colorspace for OS X >= 10.4
+#else
+        CGColorSpaceRef tmpSpace = CGColorSpaceCreateDeviceRGB(); //colorspace for OS X < 10.4 (actually ppc)
+#endif
         CGImageRef imageRef = CGImageCreate(
             screen.width, //width
             screen.height, //height
             screen.bitsPerComponent, //bitsPerComponent
             screen.bitsPerPixel, //bitsPerPixel
             (screen.width * (screen.bitsPerComponent/2)), //bytesPerRow
-#ifdef __LITTLE_ENDIAN__
-            CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB), //colorspace for OS X >= 10.4
-            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
-#else
-            CGColorSpaceCreateDeviceRGB(), //colorspace for OS X < 10.4 (actually ppc)
-            kCGImageAlphaNoneSkipFirst, //bitmapInfo
-#endif
+            tmpSpace,
+            kCGBitmapByteOrder32Host | kCGImageAlphaNoneSkipFirst,
             dataProviderRef, //provider
             NULL, //decode
             0, //interpolate
             kCGRenderingIntentDefault //intent
         );
+        CFRelease(tmpSpace);
 // test if host supports "CGImageCreateWithImageInRect" at compile time
-#if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_4)
         if (CGImageCreateWithImageInRect == NULL) { // test if "CGImageCreateWithImageInRect" is supported on host at runtime
-#endif
             // compatibility drawing code (draws everything) (OS X < 10.4)
             CGContextDrawImage (viewContextRef, CGRectMake(0, 0, [self bounds].size.width, [self bounds].size.height), imageRef);
-#if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_4)
         } else {
             // selective drawing code (draws only dirty rectangles) (OS X >= 10.4)
             const NSRect *rectList;
-#if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5)
             NSInteger rectCount;
-#else
-            int rectCount;
-#endif
             int i;
             CGImageRef clipImageRef;
             CGRect clipRect;
@@ -406,7 +402,6 @@ QemuCocoaView *cocoaView;
                 CGImageRelease (clipImageRef);
             }
         }
-#endif
         CGImageRelease (imageRef);
     }
 }
@@ -488,31 +483,25 @@ QemuCocoaView *cocoaView;
         [self ungrabMouse];
         [self setContentDimensions];
 // test if host supports "exitFullScreenModeWithOptions" at compile time
-#if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5)
         if ([NSView respondsToSelector:@selector(exitFullScreenModeWithOptions:)]) { // test if "exitFullScreenModeWithOptions" is supported on host at runtime
             [self exitFullScreenModeWithOptions:nil];
         } else {
-#endif
             [fullScreenWindow close];
             [normalWindow setContentView: self];
             [normalWindow makeKeyAndOrderFront: self];
             [NSMenu setMenuBarVisible:YES];
-#if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5)
         }
-#endif
     } else { // switch from desktop to fullscreen
-        isFullscreen = TRUE;
+        isFullscreen = YES;
         [self grabMouse];
         [self setContentDimensions];
 // test if host supports "enterFullScreenMode:withOptions" at compile time
-#if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5)
         if ([NSView respondsToSelector:@selector(enterFullScreenMode:withOptions:)]) { // test if "enterFullScreenMode:withOptions" is supported on host at runtime
             [self enterFullScreenMode:[NSScreen mainScreen] withOptions:[NSDictionary dictionaryWithObjectsAndKeys:
-                [NSNumber numberWithBool:NO], NSFullScreenModeAllScreens,
-                [NSDictionary dictionaryWithObjectsAndKeys:[NSNumber numberWithBool:NO], kCGDisplayModeIsStretched, nil], NSFullScreenModeSetting,
+                @NO, NSFullScreenModeAllScreens,
+                [NSDictionary dictionaryWithObjectsAndKeys:@NO, kCGDisplayModeIsStretched, nil], NSFullScreenModeSetting,
                  nil]];
         } else {
-#endif
             [NSMenu setMenuBarVisible:NO];
             fullScreenWindow = [[NSWindow alloc] initWithContentRect:[[NSScreen mainScreen] frame]
                 styleMask:NSBorderlessWindowMask
@@ -521,9 +510,7 @@ QemuCocoaView *cocoaView;
             [fullScreenWindow setHasShadow:NO];
             [fullScreenWindow setContentView:self];
             [fullScreenWindow makeKeyAndOrderFront:self];
-#if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_5)
         }
-#endif
     }
 }
 
@@ -777,13 +764,6 @@ QemuCocoaView *cocoaView;
     isMouseGrabbed = FALSE;
 }
 
-- (void) setAbsoluteEnabled:(BOOL)tIsAbsoluteEnabled {isAbsoluteEnabled = tIsAbsoluteEnabled;}
-- (BOOL) isMouseGrabbed {return isMouseGrabbed;}
-- (BOOL) isAbsoluteEnabled {return isAbsoluteEnabled;}
-- (BOOL) isMouseDeassociated {return isMouseDeassociated;}
-- (float) cdx {return cdx;}
-- (float) cdy {return cdy;}
-- (QEMUScreen) gscreen {return screen;}
 @end
 
 
@@ -793,9 +773,8 @@ QemuCocoaView *cocoaView;
     QemuCocoaAppController
  ------------------------------------------------------
 */
-@interface QemuCocoaAppController : NSObject
-{
-}
+@interface QemuCocoaAppController : NSObject <NSApplicationDelegate, NSFileManagerDelegate>
+
 - (void)startEmulationWithArgc:(int)argc argv:(char**)argv;
 - (void)openPanelDidEnd:(NSOpenPanel *)sheet returnCode:(int)returnCode contextInfo:(void *)contextInfo;
 - (void)toggleFullScreen:(id)sender;
@@ -827,7 +806,7 @@ QemuCocoaView *cocoaView;
             exit(1);
         }
         [normalWindow setAcceptsMouseMovedEvents:YES];
-        [normalWindow setTitle:[NSString stringWithFormat:@"QEMU"]];
+        normalWindow.title = @"QEMU";
         [normalWindow setContentView:cocoaView];
         [normalWindow useOptimizedDrawing:YES];
         [normalWindow makeKeyAndOrderFront:self];
@@ -841,8 +820,7 @@ QemuCocoaView *cocoaView;
 {
     COCOA_DEBUG("QemuCocoaAppController: dealloc\n");
 
-    if (cocoaView)
-        [cocoaView release];
+    [cocoaView release];
     [super dealloc];
 }
 
@@ -858,18 +836,11 @@ QemuCocoaView *cocoaView;
         [op setMessage:@"Select the disk image you want to boot.\n\nHit the \"Cancel\" button to quit"];
         NSArray *filetypes = [NSArray arrayWithObjects:@"img", @"iso", @"dmg",
                                  @"qcow", @"qcow2", @"cloop", @"vmdk", nil];
-#if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_6)
         [op setAllowedFileTypes:filetypes];
         [op beginSheetModalForWindow:normalWindow
             completionHandler:^(NSInteger returnCode)
             { [self openPanelDidEnd:op
                   returnCode:returnCode contextInfo:NULL ]; } ];
-#else
-        // Compatibility code for pre-10.6, using deprecated method
-        [op beginSheetForDirectory:nil file:nil types:filetypes
-              modalForWindow:normalWindow modalDelegate:self
-              didEndSelector:@selector(openPanelDidEnd:returnCode:contextInfo:) contextInfo:NULL];
-#endif
     } else {
         // or launch QEMU, with the global args
         [self startEmulationWithArgc:gArgc argv:(char **)gArgv];
@@ -973,7 +944,7 @@ int main (int argc, const char * argv[]) {
         }
     }
 
-    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    @autoreleasepool {
 
     // Pull this console process up to being a fully-fledged graphical
     // app with a menubar and Dock icon
@@ -1034,9 +1005,9 @@ int main (int argc, const char * argv[]) {
     [NSApp run];
 
     [appController release];
-    [pool release];
 
     return 0;
+    }
 }
 
 
@@ -1045,7 +1016,7 @@ int main (int argc, const char * argv[]) {
 static void cocoa_update(DisplayChangeListener *dcl,
                          int x, int y, int w, int h)
 {
-    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    @autoreleasepool {
 
     COCOA_DEBUG("qemu_cocoa: cocoa_update\n");
 
@@ -1061,22 +1032,22 @@ static void cocoa_update(DisplayChangeListener *dcl,
     }
     [cocoaView setNeedsDisplayInRect:rect];
 
-    [pool release];
+    }
 }
 
 static void cocoa_switch(DisplayChangeListener *dcl,
                          DisplaySurface *surface)
 {
-    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    @autoreleasepool {
 
     COCOA_DEBUG("qemu_cocoa: cocoa_switch\n");
     [cocoaView switchSurface:surface];
-    [pool release];
+    }
 }
 
 static void cocoa_refresh(DisplayChangeListener *dcl)
 {
-    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    @autoreleasepool {
 
     COCOA_DEBUG("qemu_cocoa: cocoa_refresh\n");
 
@@ -1100,7 +1071,7 @@ static void cocoa_refresh(DisplayChangeListener *dcl)
         }
     } while(event != nil);
     graphic_hw_update(NULL);
-    [pool release];
+    }
 }
 
 static void cocoa_cleanup(void)
