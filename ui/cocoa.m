@@ -248,15 +248,11 @@ static int cocoa_keycode_to_qemu(int keycode)
 */
 @interface QemuCocoaView : NSView
 {
-    QEMUScreen screen;
     NSWindow *fullScreenWindow;
-    CGFloat cx,cy,cw,ch,cdx,cdy;
+    CGFloat cx,cy,cw,ch;
     CGDataProviderRef dataProviderRef;
     int modifiers_state[256];
-    BOOL isMouseGrabbed;
     BOOL isFullscreen;
-    BOOL isAbsoluteEnabled;
-    BOOL isMouseDeassociated;
 }
 - (void) switchSurface:(DisplaySurface *)surface;
 - (void) grabMouse;
@@ -361,24 +357,25 @@ QemuCocoaView *cocoaView;
         CGContextSetRGBFillColor(viewContextRef, 0, 0, 0, 1.0);
         CGContextFillRect(viewContextRef, NSRectToCGRect(rect));
     } else {
+#ifdef __LITTLE_ENDIAN__
+        CGColorSpaceRef tmpSpace = CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB); //colorspace for OS X >= 10.4
+#else
+        CGColorSpaceRef tmpSpace = CGColorSpaceCreateDeviceRGB(); //colorspace for OS X < 10.4 (actually ppc)
+#endif
         CGImageRef imageRef = CGImageCreate(
             screen.width, //width
             screen.height, //height
             screen.bitsPerComponent, //bitsPerComponent
             screen.bitsPerPixel, //bitsPerPixel
             (screen.width * (screen.bitsPerComponent/2)), //bytesPerRow
-#ifdef __LITTLE_ENDIAN__
-            CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB), //colorspace for OS X >= 10.4
-            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
-#else
-            CGColorSpaceCreateDeviceRGB(), //colorspace for OS X < 10.4 (actually ppc)
-            kCGImageAlphaNoneSkipFirst, //bitmapInfo
-#endif
+            tmpSpace,
+            kCGBitmapByteOrder32Host | kCGImageAlphaNoneSkipFirst,
             dataProviderRef, //provider
             NULL, //decode
             0, //interpolate
             kCGRenderingIntentDefault //intent
         );
+        CFRelease(tmpSpace);
 // test if host supports "CGImageCreateWithImageInRect" at compile time
         if (CGImageCreateWithImageInRect == NULL) { // test if "CGImageCreateWithImageInRect" is supported on host at runtime
             // compatibility drawing code (draws everything) (OS X < 10.4)
@@ -495,14 +492,14 @@ QemuCocoaView *cocoaView;
             [NSMenu setMenuBarVisible:YES];
         }
     } else { // switch from desktop to fullscreen
-        isFullscreen = TRUE;
+        isFullscreen = YES;
         [self grabMouse];
         [self setContentDimensions];
 // test if host supports "enterFullScreenMode:withOptions" at compile time
         if ([NSView respondsToSelector:@selector(enterFullScreenMode:withOptions:)]) { // test if "enterFullScreenMode:withOptions" is supported on host at runtime
             [self enterFullScreenMode:[NSScreen mainScreen] withOptions:[NSDictionary dictionaryWithObjectsAndKeys:
-                [NSNumber numberWithBool:NO], NSFullScreenModeAllScreens,
-                [NSDictionary dictionaryWithObjectsAndKeys:[NSNumber numberWithBool:NO], kCGDisplayModeIsStretched, nil], NSFullScreenModeSetting,
+                @NO, NSFullScreenModeAllScreens,
+                [NSDictionary dictionaryWithObjectsAndKeys:@NO, kCGDisplayModeIsStretched, nil], NSFullScreenModeSetting,
                  nil]];
         } else {
             [NSMenu setMenuBarVisible:NO];
@@ -809,7 +806,7 @@ QemuCocoaView *cocoaView;
             exit(1);
         }
         [normalWindow setAcceptsMouseMovedEvents:YES];
-        [normalWindow setTitle:[NSString stringWithFormat:@"QEMU"]];
+        normalWindow.title = @"QEMU";
         [normalWindow setContentView:cocoaView];
         [normalWindow useOptimizedDrawing:YES];
         [normalWindow makeKeyAndOrderFront:self];
@@ -823,8 +820,7 @@ QemuCocoaView *cocoaView;
 {
     COCOA_DEBUG("QemuCocoaAppController: dealloc\n");
 
-    if (cocoaView)
-        [cocoaView release];
+    [cocoaView release];
     [super dealloc];
 }
 
