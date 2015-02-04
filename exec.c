@@ -553,7 +553,6 @@ void cpu_exec_init(CPUArchState *env)
     }
 }
 
-#if defined(TARGET_HAS_ICE)
 #if defined(CONFIG_USER_ONLY)
 static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
 {
@@ -569,7 +568,6 @@ static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
     }
 }
 #endif
-#endif /* TARGET_HAS_ICE */
 
 #if defined(CONFIG_USER_ONLY)
 void cpu_watchpoint_remove_all(CPUState *cpu, int mask)
@@ -689,7 +687,6 @@ static inline bool cpu_watchpoint_address_matches(CPUWatchpoint *wp,
 int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
                           CPUBreakpoint **breakpoint)
 {
-#if defined(TARGET_HAS_ICE)
     CPUBreakpoint *bp;
 
     bp = g_malloc(sizeof(*bp));
@@ -710,15 +707,11 @@ int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
         *breakpoint = bp;
     }
     return 0;
-#else
-    return -ENOSYS;
-#endif
 }
 
 /* Remove a specific breakpoint.  */
 int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
 {
-#if defined(TARGET_HAS_ICE)
     CPUBreakpoint *bp;
 
     QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
@@ -728,27 +721,21 @@ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
         }
     }
     return -ENOENT;
-#else
-    return -ENOSYS;
-#endif
 }
 
 /* Remove a specific breakpoint by reference.  */
 void cpu_breakpoint_remove_by_ref(CPUState *cpu, CPUBreakpoint *breakpoint)
 {
-#if defined(TARGET_HAS_ICE)
     QTAILQ_REMOVE(&cpu->breakpoints, breakpoint, entry);
 
     breakpoint_invalidate(cpu, breakpoint->pc);
 
     g_free(breakpoint);
-#endif
 }
 
 /* Remove all matching breakpoints. */
 void cpu_breakpoint_remove_all(CPUState *cpu, int mask)
 {
-#if defined(TARGET_HAS_ICE)
     CPUBreakpoint *bp, *next;
 
     QTAILQ_FOREACH_SAFE(bp, &cpu->breakpoints, entry, next) {
@@ -756,14 +743,12 @@ void cpu_breakpoint_remove_all(CPUState *cpu, int mask)
             cpu_breakpoint_remove_by_ref(cpu, bp);
         }
     }
-#endif
 }
 
 /* enable or disable single step mode. EXCP_DEBUG is returned by the
    CPU loop after each instruction */
 void cpu_single_step(CPUState *cpu, int enabled)
 {
-#if defined(TARGET_HAS_ICE)
     if (cpu->singlestep_enabled != enabled) {
         cpu->singlestep_enabled = enabled;
         if (kvm_enabled()) {
@@ -775,7 +760,6 @@ void cpu_single_step(CPUState *cpu, int enabled)
             tb_flush(env);
         }
     }
-#endif
 }
 
 void cpu_abort(CPUState *cpu, const char *fmt, ...)
@@ -1402,12 +1386,13 @@ static ram_addr_t ram_block_add(RAMBlock *new_block, Error **errp)
     cpu_physical_memory_set_dirty_range(new_block->offset,
                                         new_block->used_length);
 
-    qemu_ram_setup_dump(new_block->host, new_block->max_length);
-    qemu_madvise(new_block->host, new_block->max_length, QEMU_MADV_HUGEPAGE);
-    qemu_madvise(new_block->host, new_block->max_length, QEMU_MADV_DONTFORK);
-
-    if (kvm_enabled()) {
-        kvm_setup_guest_memory(new_block->host, new_block->max_length);
+    if (new_block->host) {
+        qemu_ram_setup_dump(new_block->host, new_block->max_length);
+        qemu_madvise(new_block->host, new_block->max_length, QEMU_MADV_HUGEPAGE);
+        qemu_madvise(new_block->host, new_block->max_length, QEMU_MADV_DONTFORK);
+        if (kvm_enabled()) {
+            kvm_setup_guest_memory(new_block->host, new_block->max_length);
+        }
     }
 
     return new_block->offset;
