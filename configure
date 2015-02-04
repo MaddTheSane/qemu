@@ -1609,8 +1609,13 @@ g(unsigned char *buf, int len)
 
 EOF
   if ! libtool_prog; then
-    echo "Disabling libtool due to broken toolchain support"
-    libtool=
+# also check for glibtool, just in case
+    libtool=glibtool
+    if ! libtool_prog; then
+
+      echo "Disabling libtool due to broken toolchain support"
+      libtool=
+    fi
   fi
 fi
 
@@ -2042,7 +2047,13 @@ fi
 # out by checking whether libtool supports the --version switch
 if test -n "$libtool"; then
   if ! "$libtool" --version >/dev/null 2>&1; then
-    libtool=
+# But many third-party package management tools
+# install GNU libtool as glibtool
+  if ! glibtool --version >/dev/null 2>&1; then
+    	libtool=
+      else
+      libtool=glibtool
+    fi
   fi
 fi
 
