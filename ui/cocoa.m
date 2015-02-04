@@ -497,10 +497,9 @@ QemuCocoaView *cocoaView;
         [self setContentDimensions];
 // test if host supports "enterFullScreenMode:withOptions" at compile time
         if ([NSView respondsToSelector:@selector(enterFullScreenMode:withOptions:)]) { // test if "enterFullScreenMode:withOptions" is supported on host at runtime
-            [self enterFullScreenMode:[NSScreen mainScreen] withOptions:[NSDictionary dictionaryWithObjectsAndKeys:
-                @NO, NSFullScreenModeAllScreens,
-                [NSDictionary dictionaryWithObjectsAndKeys:@NO, kCGDisplayModeIsStretched, nil], NSFullScreenModeSetting,
-                 nil]];
+            [self enterFullScreenMode:[NSScreen mainScreen] withOptions:@{
+                NSFullScreenModeAllScreens: @NO,
+                NSFullScreenModeSetting: @{(NSString*)kCGDisplayModeIsStretched: @NO}}];
         } else {
             [NSMenu setMenuBarVisible:NO];
             fullScreenWindow = [[NSWindow alloc] initWithContentRect:[[NSScreen mainScreen] frame]
