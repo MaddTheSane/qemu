@@ -68,6 +68,8 @@ check-unit-y += tests/check-qom-interface$(EXESUF)
 gcov-files-check-qom-interface-y = qom/object.c
 check-unit-y += tests/test-qemu-opts$(EXESUF)
 gcov-files-test-qemu-opts-y = qom/test-qemu-opts.c
+check-unit-y += tests/test-write-threshold$(EXESUF)
+gcov-files-test-write-threshold-y = block/write-threshold.c
 
 check-block-$(CONFIG_POSIX) += tests/qemu-iotests-quick.sh
 
@@ -266,7 +268,8 @@ tests/test-qdev-global-props$(EXESUF): tests/test-qdev-global-props.o \
 	libqemuutil.a libqemustub.a
 tests/test-vmstate$(EXESUF): tests/test-vmstate.o \
 	migration/vmstate.o migration/qemu-file.o migration/qemu-file-buf.o \
-        migration/qemu-file-unix.o \
+        migration/qemu-file-unix.o qjson.o \
+	$(qom-core-obj) \
 	libqemuutil.a libqemustub.a
 
 tests/test-qapi-types.c tests/test-qapi-types.h :\
@@ -359,6 +362,7 @@ tests/usb-hcd-xhci-test$(EXESUF): tests/usb-hcd-xhci-test.o $(libqos-usb-obj-y)
 tests/vhost-user-test$(EXESUF): tests/vhost-user-test.o qemu-char.o qemu-timer.o $(qtest-obj-y)
 tests/qemu-iotests/socket_scm_helper$(EXESUF): tests/qemu-iotests/socket_scm_helper.o
 tests/test-qemu-opts$(EXESUF): tests/test-qemu-opts.o libqemuutil.a libqemustub.a
+tests/test-write-threshold$(EXESUF): tests/test-write-threshold.o $(block-obj-y) libqemuutil.a libqemustub.a
 
 ifeq ($(CONFIG_POSIX),y)
 LIBS += -lutil
