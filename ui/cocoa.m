@@ -376,7 +376,6 @@ QemuCocoaView *cocoaView;
             kCGRenderingIntentDefault //intent
         );
         CFRelease(tmpSpace);
-// test if host supports "CGImageCreateWithImageInRect" at compile time
         if (CGImageCreateWithImageInRect == NULL) { // test if "CGImageCreateWithImageInRect" is supported on host at runtime
             // compatibility drawing code (draws everything) (OS X < 10.4)
             CGContextDrawImage (viewContextRef, CGRectMake(0, 0, [self bounds].size.width, [self bounds].size.height), imageRef);
@@ -482,8 +481,7 @@ QemuCocoaView *cocoaView;
         isFullscreen = FALSE;
         [self ungrabMouse];
         [self setContentDimensions];
-// test if host supports "exitFullScreenModeWithOptions" at compile time
-        if ([NSView respondsToSelector:@selector(exitFullScreenModeWithOptions:)]) { // test if "exitFullScreenModeWithOptions" is supported on host at runtime
+        if ([self respondsToSelector:@selector(exitFullScreenModeWithOptions:)]) { // test if "exitFullScreenModeWithOptions" is supported on host at runtime
             [self exitFullScreenModeWithOptions:nil];
         } else {
             [fullScreenWindow close];
@@ -495,8 +493,7 @@ QemuCocoaView *cocoaView;
         isFullscreen = YES;
         [self grabMouse];
         [self setContentDimensions];
-// test if host supports "enterFullScreenMode:withOptions" at compile time
-        if ([NSView respondsToSelector:@selector(enterFullScreenMode:withOptions:)]) { // test if "enterFullScreenMode:withOptions" is supported on host at runtime
+        if ([self respondsToSelector:@selector(enterFullScreenMode:withOptions:)]) { // test if "enterFullScreenMode:withOptions" is supported on host at runtime
             [self enterFullScreenMode:[NSScreen mainScreen] withOptions:@{
                 NSFullScreenModeAllScreens: @NO,
                 NSFullScreenModeSetting: @{(NSString*)kCGDisplayModeIsStretched: @NO}}];
@@ -875,7 +872,7 @@ QemuCocoaView *cocoaView;
     if(returnCode == NSCancelButton) {
         exit(0);
     } else if(returnCode == NSOKButton) {
-        char *img = (char*)[ [ [ sheet URL ] path ] cStringUsingEncoding:NSASCIIStringEncoding];
+        char *img = (char*)[ [ [ sheet URL ] path ] fileSystemRepresentation];
 
         char **argv = g_new(char *, 4);
 
