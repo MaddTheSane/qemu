@@ -30,16 +30,6 @@
 #include "ui/input.h"
 #include "sysemu/sysemu.h"
 
-#ifndef MAC_OS_X_VERSION_10_4
-#define MAC_OS_X_VERSION_10_4 1040
-#endif
-#ifndef MAC_OS_X_VERSION_10_5
-#define MAC_OS_X_VERSION_10_5 1050
-#endif
-#ifndef MAC_OS_X_VERSION_10_6
-#define MAC_OS_X_VERSION_10_6 1060
-#endif
-
 
 //#define DEBUG
 
@@ -49,7 +39,11 @@
 #define COCOA_DEBUG(...)  ((void) 0)
 #endif
 
+#if NSGEOMETRY_TYPES_SAME_AS_CGGEOMETRY_TYPES
+#define cgrect(nsrect) nsrect
+#else
 #define cgrect(nsrect) (*(CGRect *)&(nsrect))
+#endif
 
 typedef struct {
     int width;
@@ -357,11 +351,7 @@ QemuCocoaView *cocoaView;
         CGContextSetRGBFillColor(viewContextRef, 0, 0, 0, 1.0);
         CGContextFillRect(viewContextRef, NSRectToCGRect(rect));
     } else {
-#ifdef __LITTLE_ENDIAN__
-        CGColorSpaceRef tmpSpace = CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB); //colorspace for OS X >= 10.4
-#else
-        CGColorSpaceRef tmpSpace = CGColorSpaceCreateDeviceRGB(); //colorspace for OS X < 10.4 (actually ppc)
-#endif
+        CGColorSpaceRef tmpSpace = CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB);
         CGImageRef imageRef = CGImageCreate(
             screen.width, //width
             screen.height, //height
@@ -376,30 +366,25 @@ QemuCocoaView *cocoaView;
             kCGRenderingIntentDefault //intent
         );
         CFRelease(tmpSpace);
-        if (CGImageCreateWithImageInRect == NULL) { // test if "CGImageCreateWithImageInRect" is supported on host at runtime
-            // compatibility drawing code (draws everything) (OS X < 10.4)
-            CGContextDrawImage (viewContextRef, CGRectMake(0, 0, [self bounds].size.width, [self bounds].size.height), imageRef);
-        } else {
-            // selective drawing code (draws only dirty rectangles) (OS X >= 10.4)
-            const NSRect *rectList;
-            NSInteger rectCount;
-            int i;
-            CGImageRef clipImageRef;
-            CGRect clipRect;
+        // selective drawing code (draws only dirty rectangles)
+        const NSRect *rectList;
+        NSInteger rectCount;
+        int i;
+        CGImageRef clipImageRef;
+        CGRect clipRect;
 
-            [self getRectsBeingDrawn:&rectList count:&rectCount];
-            for (i = 0; i < rectCount; i++) {
-                clipRect.origin.x = rectList[i].origin.x / cdx;
-                clipRect.origin.y = (float)screen.height - (rectList[i].origin.y + rectList[i].size.height) / cdy;
-                clipRect.size.width = rectList[i].size.width / cdx;
-                clipRect.size.height = rectList[i].size.height / cdy;
-                clipImageRef = CGImageCreateWithImageInRect(
+        [self getRectsBeingDrawn:&rectList count:&rectCount];
+        for (i = 0; i < rectCount; i++) {
+            clipRect.origin.x = rectList[i].origin.x / cdx;
+            clipRect.origin.y = (float)screen.height - (rectList[i].origin.y + rectList[i].size.height) / cdy;
+            clipRect.size.width = rectList[i].size.width / cdx;
+            clipRect.size.height = rectList[i].size.height / cdy;
+            clipImageRef = CGImageCreateWithImageInRect(
                     imageRef,
                     clipRect
-                );
-                CGContextDrawImage (viewContextRef, cgrect(rectList[i]), clipImageRef);
-                CGImageRelease (clipImageRef);
-            }
+            );
+            CGContextDrawImage (viewContextRef, cgrect(rectList[i]), clipImageRef);
+            CGImageRelease (clipImageRef);
         }
         CGImageRelease (imageRef);
     }
@@ -481,32 +466,14 @@ QemuCocoaView *cocoaView;
         isFullscreen = FALSE;
         [self ungrabMouse];
         [self setContentDimensions];
-        if ([self respondsToSelector:@selector(exitFullScreenModeWithOptions:)]) { // test if "exitFullScreenModeWithOptions" is supported on host at runtime
-            [self exitFullScreenModeWithOptions:nil];
-        } else {
-            [fullScreenWindow close];
-            [normalWindow setContentView: self];
-            [normalWindow makeKeyAndOrderFront: self];
-            [NSMenu setMenuBarVisible:YES];
-        }
+        [self exitFullScreenModeWithOptions:nil];
     } else { // switch from desktop to fullscreen
         isFullscreen = YES;
         [self grabMouse];
         [self setContentDimensions];
-        if ([self respondsToSelector:@selector(enterFullScreenMode:withOptions:)]) { // test if "enterFullScreenMode:withOptions" is supported on host at runtime
-            [self enterFullScreenMode:[NSScreen mainScreen] withOptions:@{
+        [self enterFullScreenMode:[NSScreen mainScreen] withOptions:@{
                 NSFullScreenModeAllScreens: @NO,
                 NSFullScreenModeSetting: @{(NSString*)kCGDisplayModeIsStretched: @NO}}];
-        } else {
-            [NSMenu setMenuBarVisible:NO];
-            fullScreenWindow = [[NSWindow alloc] initWithContentRect:[[NSScreen mainScreen] frame]
-                styleMask:NSBorderlessWindowMask
-                backing:NSBackingStoreBuffered
-                defer:NO];
-            [fullScreenWindow setHasShadow:NO];
-            [fullScreenWindow setContentView:self];
-            [fullScreenWindow makeKeyAndOrderFront:self];
-        }
     }
 }
 
@@ -1048,12 +1015,12 @@ static void cocoa_refresh(DisplayChangeListener *dcl)
     COCOA_DEBUG("qemu_cocoa: cocoa_refresh\n");
 
     if (qemu_input_is_absolute()) {
-        if (![cocoaView isAbsoluteEnabled]) {
+        if (!cocoaView.absoluteEnabled) {
             if ([cocoaView isMouseGrabbed]) {
                 [cocoaView ungrabMouse];
             }
         }
-        [cocoaView setAbsoluteEnabled:YES];
+        cocoaView.absoluteEnabled = YES;
     }
 
     NSDate *distantPast;
