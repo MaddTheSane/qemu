@@ -376,7 +376,7 @@ QemuCocoaView *cocoaView;
         [self getRectsBeingDrawn:&rectList count:&rectCount];
         for (i = 0; i < rectCount; i++) {
             clipRect.origin.x = rectList[i].origin.x / cdx;
-            clipRect.origin.y = (float)screen.height - (rectList[i].origin.y + rectList[i].size.height) / cdy;
+            clipRect.origin.y = (CGFloat)screen.height - (rectList[i].origin.y + rectList[i].size.height) / cdy;
             clipRect.size.width = rectList[i].size.width / cdx;
             clipRect.size.height = rectList[i].size.height / cdy;
             clipImageRef = CGImageCreateWithImageInRect(
@@ -395,8 +395,8 @@ QemuCocoaView *cocoaView;
     COCOA_DEBUG("QemuCocoaView: setContentDimensions\n");
 
     if (isFullscreen) {
-        cdx = [[NSScreen mainScreen] frame].size.width / (float)screen.width;
-        cdy = [[NSScreen mainScreen] frame].size.height / (float)screen.height;
+        cdx = [[NSScreen mainScreen] frame].size.width / (CGFloat)screen.width;
+        cdy = [[NSScreen mainScreen] frame].size.height / (CGFloat)screen.height;
         cw = screen.width * cdx;
         ch = screen.height * cdy;
         cx = ([[NSScreen mainScreen] frame].size.width - cw) / 2.0;
@@ -463,7 +463,7 @@ QemuCocoaView *cocoaView;
     COCOA_DEBUG("QemuCocoaView: toggleFullScreen\n");
 
     if (isFullscreen) { // switch from fullscreen to desktop
-        isFullscreen = FALSE;
+        isFullscreen = NO;
         [self ungrabMouse];
         [self setContentDimensions];
         [self exitFullScreenModeWithOptions:nil];
@@ -703,10 +703,10 @@ QemuCocoaView *cocoaView;
     }
     [self hideCursor];
     if (!isAbsoluteEnabled) {
-        isMouseDeassociated = TRUE;
+        isMouseDeassociated = YES;
         CGAssociateMouseAndMouseCursorPosition(FALSE);
     }
-    isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
+    isMouseGrabbed = YES; // while isMouseGrabbed = YES, QemuCocoaApp sends all events to [cocoaView handleEvent:]
 }
 
 - (void) ungrabMouse
@@ -722,9 +722,9 @@ QemuCocoaView *cocoaView;
     [self unhideCursor];
     if (isMouseDeassociated) {
         CGAssociateMouseAndMouseCursorPosition(TRUE);
-        isMouseDeassociated = FALSE;
+        isMouseDeassociated = NO;
     }
-    isMouseGrabbed = FALSE;
+    isMouseGrabbed = NO;
 }
 
 @end
