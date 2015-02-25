@@ -110,3 +110,4 @@ tags
 TAGS
 *~
 /tests/qemu-iotests/common.env
+.DS_Store
