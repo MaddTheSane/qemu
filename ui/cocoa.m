@@ -242,7 +242,6 @@ static int cocoa_keycode_to_qemu(int keycode)
 */
 @interface QemuCocoaView : NSView
 {
-    NSWindow *fullScreenWindow;
     CGFloat cx,cy,cw,ch;
     CGDataProviderRef dataProviderRef;
     int modifiers_state[256];
@@ -445,7 +444,6 @@ QemuCocoaView *cocoaView;
 
     // update windows
     if (isFullscreen) {
-        [[fullScreenWindow contentView] setFrame:[[NSScreen mainScreen] frame]];
         [normalWindow setFrame:NSMakeRect([normalWindow frame].origin.x, [normalWindow frame].origin.y - h + oldh, w, h + [normalWindow frame].size.height - oldh) display:NO animate:NO];
     } else {
         if (qemu_name)
@@ -797,8 +795,8 @@ QemuCocoaView *cocoaView;
         NSOpenPanel *op = [[NSOpenPanel alloc] init];
         [op setPrompt:@"Boot image"];
         [op setMessage:@"Select the disk image you want to boot.\n\nHit the \"Cancel\" button to quit"];
-        NSArray *filetypes = [NSArray arrayWithObjects:@"img", @"iso", @"dmg",
-                                 @"qcow", @"qcow2", @"cloop", @"vmdk", nil];
+        NSArray *filetypes = @[@"img", @"iso", @"dmg",
+                                 @"qcow", @"qcow2", @"cloop", @"vmdk"];
         [op setAllowedFileTypes:filetypes];
         [op beginSheetModalForWindow:normalWindow
             completionHandler:^(NSInteger returnCode)
