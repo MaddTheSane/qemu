@@ -132,8 +132,7 @@ static int scsi_hot_add(Monitor *mon, DeviceState *adapter,
                                         dinfo->unit, false, -1, NULL,
                                         &local_err);
     if (!scsidev) {
-        error_report("%s", error_get_pretty(local_err));
-        error_free(local_err);
+        error_report_err(local_err);
         return -1;
     }
     dinfo->unit = scsidev->id;
@@ -267,7 +266,7 @@ static PCIDevice *qemu_pci_hot_add_storage(Monitor *mon,
     return dev;
 }
 
-void pci_device_hot_add(Monitor *mon, const QDict *qdict)
+void hmp_pci_add(Monitor *mon, const QDict *qdict)
 {
     PCIDevice *dev = NULL;
     const char *pci_addr = qdict_get_str(qdict, "pci_addr");
@@ -337,7 +336,7 @@ static int pci_device_hot_remove(Monitor *mon, const char *pci_addr)
     return 0;
 }
 
-void do_pci_device_hot_remove(Monitor *mon, const QDict *qdict)
+void hmp_pci_del(Monitor *mon, const QDict *qdict)
 {
     pci_device_hot_remove(mon, qdict_get_str(qdict, "pci_addr"));
 }
