@@ -139,6 +139,7 @@ static int64_t load_kernel(void)
     rom_add_blob_fixed("params", params_buf, params_size,
                        (16 << 20) - 264);
 
+    g_free(params_buf);
     return entry;
 }
 
@@ -205,8 +206,7 @@ void mips_r4k_init(MachineState *machine)
                 ((unsigned int)ram_size / (1 << 20)));
         exit(1);
     }
-    memory_region_init_ram(ram, NULL, "mips_r4k.ram", ram_size, &error_abort);
-    vmstate_register_ram_global(ram);
+    memory_region_allocate_system_memory(ram, NULL, "mips_r4k.ram", ram_size);
 
     memory_region_add_subregion(address_space_mem, 0, ram);
 
@@ -284,11 +284,7 @@ void mips_r4k_init(MachineState *machine)
 
     pit = pit_init(isa_bus, 0x40, 0, NULL);
 
-    for(i = 0; i < MAX_SERIAL_PORTS; i++) {
-        if (serial_hds[i]) {
-            serial_isa_init(isa_bus, i, serial_hds[i]);
-        }
-    }
+    serial_hds_isa_init(isa_bus, MAX_SERIAL_PORTS);
 
     isa_vga_init(isa_bus);
 

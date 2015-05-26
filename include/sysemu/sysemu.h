@@ -114,6 +114,7 @@ extern int graphic_width;
 extern int graphic_height;
 extern int graphic_depth;
 extern DisplayType display_type;
+extern int display_opengl;
 extern const char *keyboard_layout;
 extern int win2k_install_hack;
 extern int alt_grab;
@@ -144,24 +145,6 @@ extern int mem_prealloc;
  */
 #define MAX_CPUMASK_BITS 255
 
-extern int nb_numa_nodes;   /* Number of NUMA nodes */
-extern int max_numa_nodeid; /* Highest specified NUMA node ID, plus one.
-                             * For all nodes, nodeid < max_numa_nodeid
-                             */
-
-typedef struct node_info {
-    uint64_t node_mem;
-    DECLARE_BITMAP(node_cpu, MAX_CPUMASK_BITS);
-    struct HostMemoryBackend *node_memdev;
-    bool present;
-} NodeInfo;
-extern NodeInfo numa_info[MAX_NODES];
-void set_numa_nodes(void);
-void set_numa_modes(void);
-void query_numa_node_mem(uint64_t node_mem[]);
-extern QemuOptsList qemu_numa_opts;
-int numa_init_func(QemuOpts *opts, void *opaque);
-
 #define MAX_OPTION_ROMS 16
 typedef struct QEMUOptionRom {
     const char *name;
@@ -173,11 +156,6 @@ extern int nb_option_roms;
 #define MAX_PROM_ENVS 128
 extern const char *prom_envs[MAX_PROM_ENVS];
 extern unsigned int nb_prom_envs;
-
-/* pci-hotplug */
-void hmp_pci_add(Monitor *mon, const QDict *qdict);
-int pci_drive_hot_add(Monitor *mon, const QDict *qdict, DriveInfo *dinfo);
-void hmp_pci_del(Monitor *mon, const QDict *qdict);
 
 /* generic hotplug */
 void hmp_drive_add(Monitor *mon, const QDict *qdict);

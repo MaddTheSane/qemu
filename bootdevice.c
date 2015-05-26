@@ -1,7 +1,7 @@
 /*
  * QEMU Boot Device Implement
  *
- * Copyright (c) 2014 HUAWEI TECHNOLOGIES CO.,LTD.
+ * Copyright (c) 2014 HUAWEI TECHNOLOGIES CO., LTD.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -105,7 +105,9 @@ void restore_boot_order(void *opaque)
         return;
     }
 
-    qemu_boot_set(normal_boot_order, NULL);
+    if (boot_set_handler) {
+        qemu_boot_set(normal_boot_order, &error_abort);
+    }
 
     qemu_unregister_reset(restore_boot_order, normal_boot_order);
     g_free(normal_boot_order);
@@ -221,10 +223,15 @@ char *get_boot_devices_list(size_t *size, bool ignore_suffixes)
         }
 
         if (!ignore_suffixes) {
-            d = qdev_get_own_fw_dev_path_from_handler(i->dev->parent_bus, i->dev);
-            if (d) {
-                assert(!i->suffix);
-                suffix = d;
+            if (i->dev) {
+                d = qdev_get_own_fw_dev_path_from_handler(i->dev->parent_bus,
+                                                          i->dev);
+                if (d) {
+                    assert(!i->suffix);
+                    suffix = d;
+                } else {
+                    suffix = g_strdup(i->suffix);
+                }
             } else {
                 suffix = g_strdup(i->suffix);
             }

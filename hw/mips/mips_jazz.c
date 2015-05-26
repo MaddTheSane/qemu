@@ -61,7 +61,8 @@ static void main_cpu_reset(void *opaque)
 static uint64_t rtc_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint8_t val;
-    address_space_read(&address_space_memory, 0x90000071, &val, 1);
+    address_space_read(&address_space_memory, 0x90000071,
+                       MEMTXATTRS_UNSPECIFIED, &val, 1);
     return val;
 }
 
@@ -69,7 +70,8 @@ static void rtc_write(void *opaque, hwaddr addr,
                       uint64_t val, unsigned size)
 {
     uint8_t buf = val & 0xff;
-    address_space_write(&address_space_memory, 0x90000071, &buf, 1);
+    address_space_write(&address_space_memory, 0x90000071,
+                        MEMTXATTRS_UNSPECIFIED, &buf, 1);
 }
 
 static const MemoryRegionOps rtc_ops = {
@@ -182,9 +184,8 @@ static void mips_jazz_init(MachineState *machine,
     cc->do_unassigned_access = mips_jazz_do_unassigned_access;
 
     /* allocate RAM */
-    memory_region_init_ram(ram, NULL, "mips_jazz.ram", machine->ram_size,
-                           &error_abort);
-    vmstate_register_ram_global(ram);
+    memory_region_allocate_system_memory(ram, NULL, "mips_jazz.ram",
+                                         machine->ram_size);
     memory_region_add_subregion(address_space, 0, ram);
 
     memory_region_init_ram(bios, NULL, "mips_jazz.bios", MAGNUM_BIOS_SIZE,

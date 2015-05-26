@@ -35,6 +35,7 @@
 #include "sysemu/char.h"
 #include "ui/qemu-spice.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/numa.h"
 #include "monitor/monitor.h"
 #include "qemu/readline.h"
 #include "ui/console.h"
@@ -72,6 +73,7 @@
 #include "block/qapi.h"
 #include "qapi/qmp-event.h"
 #include "qapi-event.h"
+#include "sysemu/block-backend.h"
 
 /* for hmp_info_irq/pic */
 #if defined(TARGET_SPARC)
@@ -264,10 +266,7 @@ void monitor_read_command(Monitor *mon, int show_prompt)
 int monitor_read_password(Monitor *mon, ReadLineFunc *readline_func,
                           void *opaque)
 {
-    if (monitor_ctrl_mode(mon)) {
-        qerror_report(QERR_MISSING_PARAMETER, "password");
-        return -EINVAL;
-    } else if (mon->rs) {
+    if (mon->rs) {
         readline_start(mon->rs, "Password: ", 1, readline_func, opaque);
         /* prompt is printed on return from the command handler */
         return 0;
@@ -1087,7 +1086,7 @@ static void hmp_info_trace_events(Monitor *mon, const QDict *qdict)
 }
 
 static int client_migrate_info(Monitor *mon, const QDict *qdict,
-                               MonitorCompletion cb, void *opaque)
+                               QObject **ret_data)
 {
     const char *protocol = qdict_get_str(qdict, "protocol");
     const char *hostname = qdict_get_str(qdict, "hostname");
@@ -1109,8 +1108,7 @@ static int client_migrate_info(Monitor *mon, const QDict *qdict,
             return -1;
         }
 
-        ret = qemu_spice_migrate_info(hostname, port, tls_port, subject,
-                                      cb, opaque);
+        ret = qemu_spice_migrate_info(hostname, port, tls_port, subject);
         if (ret != 0) {
             qerror_report(QERR_UNDEFINED_ERROR);
             return -1;
@@ -1386,7 +1384,8 @@ static void hmp_sum(Monitor *mon, const QDict *qdict)
 
     sum = 0;
     for(addr = start; addr < (start + size); addr++) {
-        uint8_t val = ldub_phys(&address_space_memory, addr);
+        uint8_t val = address_space_ldub(&address_space_memory, addr,
+                                         MEMTXATTRS_UNSPECIFIED, NULL);
         /* BSD sum algorithm ('sum' Unix command) */
         sum = (sum >> 1) | (sum << 15);
         sum += val;
@@ -1973,7 +1972,7 @@ static void hmp_info_numa(Monitor *mon, const QDict *qdict)
 
 #ifdef CONFIG_PROFILER
 
-int64_t qemu_time;
+int64_t tcg_time;
 int64_t dev_time;
 
 static void hmp_info_profile(Monitor *mon, const QDict *qdict)
@@ -1981,8 +1980,8 @@ static void hmp_info_profile(Monitor *mon, const QDict *qdict)
     monitor_printf(mon, "async time  %" PRId64 " (%0.3f)\n",
                    dev_time, dev_time / (double)get_ticks_per_sec());
     monitor_printf(mon, "qemu time   %" PRId64 " (%0.3f)\n",
-                   qemu_time, qemu_time / (double)get_ticks_per_sec());
-    qemu_time = 0;
+                   tcg_time, tcg_time / (double)get_ticks_per_sec());
+    tcg_time = 0;
     dev_time = 0;
 }
 #else
@@ -2860,6 +2859,13 @@ static mon_cmd_t info_cmds[] = {
         .mhandler.cmd = hmp_info_migrate_capabilities,
     },
     {
+        .name       = "migrate_parameters",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show current migration parameters",
+        .mhandler.cmd = hmp_info_migrate_parameters,
+    },
+    {
         .name       = "migrate_cache_size",
         .args_type  = "",
         .params     = "",
@@ -2886,6 +2892,13 @@ static mon_cmd_t info_cmds[] = {
         .params     = "",
         .help       = "show qdev device model list",
         .mhandler.cmd = hmp_info_qdm,
+    },
+    {
+        .name       = "qom-tree",
+        .args_type  = "path:s?",
+        .params     = "[path]",
+        .help       = "show QOM composition tree",
+        .mhandler.cmd = hmp_info_qom_tree,
     },
     {
         .name       = "roms",
@@ -4384,14 +4397,6 @@ static void ringbuf_completion(ReadLineState *rs, const char *str)
     qapi_free_ChardevInfoList(start);
 }
 
-void ringbuf_read_completion(ReadLineState *rs, int nb_args, const char *str)
-{
-    if (nb_args != 2) {
-        return;
-    }
-    ringbuf_completion(rs, str);
-}
-
 void ringbuf_write_completion(ReadLineState *rs, int nb_args, const char *str)
 {
     if (nb_args != 2) {
@@ -4466,11 +4471,12 @@ void set_link_completion(ReadLineState *rs, int nb_args, const char *str)
     len = strlen(str);
     readline_set_completion_index(rs, len);
     if (nb_args == 2) {
-        NetClientState *ncs[255];
+        NetClientState *ncs[MAX_QUEUE_NUM];
         int count, i;
         count = qemu_find_net_clients_except(NULL, ncs,
-                                             NET_CLIENT_OPTIONS_KIND_NONE, 255);
-        for (i = 0; i < count; i++) {
+                                             NET_CLIENT_OPTIONS_KIND_NONE,
+                                             MAX_QUEUE_NUM);
+        for (i = 0; i < MIN(count, MAX_QUEUE_NUM); i++) {
             const char *name = ncs[i]->name;
             if (!strncmp(str, name, len)) {
                 readline_add_completion(rs, name);
@@ -4485,7 +4491,7 @@ void set_link_completion(ReadLineState *rs, int nb_args, const char *str)
 void netdev_del_completion(ReadLineState *rs, int nb_args, const char *str)
 {
     int len, count, i;
-    NetClientState *ncs[255];
+    NetClientState *ncs[MAX_QUEUE_NUM];
 
     if (nb_args != 2) {
         return;
@@ -4494,8 +4500,8 @@ void netdev_del_completion(ReadLineState *rs, int nb_args, const char *str)
     len = strlen(str);
     readline_set_completion_index(rs, len);
     count = qemu_find_net_clients_except(NULL, ncs, NET_CLIENT_OPTIONS_KIND_NIC,
-                                         255);
-    for (i = 0; i < count; i++) {
+                                         MAX_QUEUE_NUM);
+    for (i = 0; i < MIN(count, MAX_QUEUE_NUM); i++) {
         QemuOpts *opts;
         const char *name = ncs[i]->name;
         if (strncmp(str, name, len)) {
@@ -4542,6 +4548,24 @@ void migrate_set_capability_completion(ReadLineState *rs, int nb_args,
     }
 }
 
+void migrate_set_parameter_completion(ReadLineState *rs, int nb_args,
+                                      const char *str)
+{
+    size_t len;
+
+    len = strlen(str);
+    readline_set_completion_index(rs, len);
+    if (nb_args == 2) {
+        int i;
+        for (i = 0; i < MIGRATION_PARAMETER_MAX; i++) {
+            const char *name = MigrationParameter_lookup[i];
+            if (!strncmp(str, name, len)) {
+                readline_add_completion(rs, name);
+            }
+        }
+    }
+}
+
 void host_net_add_completion(ReadLineState *rs, int nb_args, const char *str)
 {
     int i;
@@ -4560,15 +4584,16 @@ void host_net_add_completion(ReadLineState *rs, int nb_args, const char *str)
 
 void host_net_remove_completion(ReadLineState *rs, int nb_args, const char *str)
 {
-    NetClientState *ncs[255];
+    NetClientState *ncs[MAX_QUEUE_NUM];
     int count, i, len;
 
     len = strlen(str);
     readline_set_completion_index(rs, len);
     if (nb_args == 2) {
         count = qemu_find_net_clients_except(NULL, ncs,
-                                             NET_CLIENT_OPTIONS_KIND_NONE, 255);
-        for (i = 0; i < count; i++) {
+                                             NET_CLIENT_OPTIONS_KIND_NONE,
+                                             MAX_QUEUE_NUM);
+        for (i = 0; i < MIN(count, MAX_QUEUE_NUM); i++) {
             int id;
             char name[16];
 
@@ -4583,8 +4608,9 @@ void host_net_remove_completion(ReadLineState *rs, int nb_args, const char *str)
         return;
     } else if (nb_args == 3) {
         count = qemu_find_net_clients_except(NULL, ncs,
-                                             NET_CLIENT_OPTIONS_KIND_NIC, 255);
-        for (i = 0; i < count; i++) {
+                                             NET_CLIENT_OPTIONS_KIND_NIC,
+                                             MAX_QUEUE_NUM);
+        for (i = 0; i < MIN(count, MAX_QUEUE_NUM); i++) {
             int id;
             const char *name;
 
@@ -4682,11 +4708,13 @@ static void monitor_find_completion_by_table(Monitor *mon,
 
         if (cmd->sub_table) {
             /* do the job again */
-            return monitor_find_completion_by_table(mon, cmd->sub_table,
-                                                    &args[1], nb_args - 1);
+            monitor_find_completion_by_table(mon, cmd->sub_table,
+                                             &args[1], nb_args - 1);
+            return;
         }
         if (cmd->command_completion) {
-            return cmd->command_completion(mon->rs, nb_args, args[nb_args - 1]);
+            cmd->command_completion(mon->rs, nb_args, args[nb_args - 1]);
+            return;
         }
 
         ptype = next_arg_type(cmd->args_type);
@@ -4775,10 +4803,22 @@ static int monitor_can_read(void *opaque)
     return (mon->suspend_cnt == 0) ? 1 : 0;
 }
 
-static int invalid_qmp_mode(const Monitor *mon, const mon_cmd_t *cmd)
+static bool invalid_qmp_mode(const Monitor *mon, const mon_cmd_t *cmd)
 {
-    int is_cap = cmd->mhandler.cmd_new == do_qmp_capabilities;
-    return (qmp_cmd_mode(mon) ? is_cap : !is_cap);
+    bool is_cap = cmd->mhandler.cmd_new == do_qmp_capabilities;
+    if (is_cap && qmp_cmd_mode(mon)) {
+        qerror_report(ERROR_CLASS_COMMAND_NOT_FOUND,
+                      "Capabilities negotiation is already complete, command "
+                      "'%s' ignored", cmd->name);
+        return true;
+    }
+    if (!is_cap && !qmp_cmd_mode(mon)) {
+        qerror_report(ERROR_CLASS_COMMAND_NOT_FOUND,
+                      "Expecting capabilities negotiation with "
+                      "'qmp_capabilities' before command '%s'", cmd->name);
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -5072,9 +5112,12 @@ static void handle_qmp_command(JSONMessageParser *parser, QList *tokens)
     cmd_name = qdict_get_str(input, "execute");
     trace_handle_qmp_command(mon, cmd_name);
     cmd = qmp_find_cmd(cmd_name);
-    if (!cmd || invalid_qmp_mode(mon, cmd)) {
+    if (!cmd) {
         qerror_report(ERROR_CLASS_COMMAND_NOT_FOUND,
                       "The command %s has not been found", cmd_name);
+        goto err_out;
+    }
+    if (invalid_qmp_mode(mon, cmd)) {
         goto err_out;
     }
 
@@ -5369,31 +5412,11 @@ static void bdrv_password_cb(void *opaque, const char *password,
     monitor_read_command(mon, 1);
 }
 
-ReadLineState *monitor_get_rs(Monitor *mon)
-{
-    return mon->rs;
-}
-
 int monitor_read_bdrv_key_start(Monitor *mon, BlockDriverState *bs,
                                 BlockCompletionFunc *completion_cb,
                                 void *opaque)
 {
-    Error *local_err = NULL;
     int err;
-
-    bdrv_add_key(bs, NULL, &local_err);
-    if (!local_err) {
-        if (completion_cb)
-            completion_cb(opaque, 0);
-        return 0;
-    }
-
-    /* Need a key for @bs */
-
-    if (monitor_ctrl_mode(mon)) {
-        qerror_report_err(local_err);
-        return -1;
-    }
 
     monitor_printf(mon, "%s (%s) is encrypted.\n", bdrv_get_device_name(bs),
                    bdrv_get_encrypted_filename(bs));
@@ -5413,15 +5436,25 @@ int monitor_read_block_device_key(Monitor *mon, const char *device,
                                   BlockCompletionFunc *completion_cb,
                                   void *opaque)
 {
-    BlockDriverState *bs;
+    Error *err = NULL;
+    BlockBackend *blk;
 
-    bs = bdrv_find(device);
-    if (!bs) {
+    blk = blk_by_name(device);
+    if (!blk) {
         monitor_printf(mon, "Device not found %s\n", device);
         return -1;
     }
 
-    return monitor_read_bdrv_key_start(mon, bs, completion_cb, opaque);
+    bdrv_add_key(blk_bs(blk), NULL, &err);
+    if (err) {
+        error_free(err);
+        return monitor_read_bdrv_key_start(mon, blk_bs(blk), completion_cb, opaque);
+    }
+
+    if (completion_cb) {
+        completion_cb(opaque, 0);
+    }
+    return 0;
 }
 
 QemuOptsList qemu_mon_opts = {

@@ -215,7 +215,8 @@ static void nbd_config(BDRVNBDState *s, QDict *options, char **export,
     }
 
     if (!qemu_opt_get(s->socket_opts, "port")) {
-        qemu_opt_set_number(s->socket_opts, "port", NBD_DEFAULT_PORT);
+        qemu_opt_set_number(s->socket_opts, "port", NBD_DEFAULT_PORT,
+                            &error_abort);
     }
 
     *export = g_strdup(qdict_get_try_str(options, "export"));
@@ -247,7 +248,7 @@ static int nbd_establish_connection(BlockDriverState *bs, Error **errp)
     /* Failed to establish connection */
     if (sock < 0) {
         logout("Failed to establish connection to NBD server\n");
-        return -errno;
+        return -EIO;
     }
 
     return sock;
@@ -273,6 +274,7 @@ static int nbd_open(BlockDriverState *bs, QDict *options, int flags,
      */
     sock = nbd_establish_connection(bs, errp);
     if (sock < 0) {
+        g_free(export);
         return sock;
     }
 

@@ -613,7 +613,8 @@ static bool make_iommu_tlbe(hwaddr taddr, hwaddr mask, IOMMUTLBEntry *ret)
    translation, given the address of the PTE.  */
 static bool pte_translate(hwaddr pte_addr, IOMMUTLBEntry *ret)
 {
-    uint64_t pte = ldq_phys(&address_space_memory, pte_addr);
+    uint64_t pte = address_space_ldq(&address_space_memory, pte_addr,
+                                     MEMTXATTRS_UNSPECIFIED, NULL);
 
     /* Check valid bit.  */
     if ((pte & 1) == 0) {
@@ -844,9 +845,8 @@ PCIBus *typhoon_init(ram_addr_t ram_size, ISABus **isa_bus,
 
     /* Main memory region, 0x00.0000.0000.  Real hardware supports 32GB,
        but the address space hole reserved at this point is 8TB.  */
-    memory_region_init_ram(&s->ram_region, OBJECT(s), "ram", ram_size,
-                           &error_abort);
-    vmstate_register_ram_global(&s->ram_region);
+    memory_region_allocate_system_memory(&s->ram_region, OBJECT(s), "ram",
+                                         ram_size);
     memory_region_add_subregion(addr_space, 0, &s->ram_region);
 
     /* TIGbus, 0x801.0000.0000, 1GB.  */

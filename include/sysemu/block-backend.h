@@ -87,6 +87,8 @@ int blk_read_unthrottled(BlockBackend *blk, int64_t sector_num, uint8_t *buf,
                          int nb_sectors);
 int blk_write(BlockBackend *blk, int64_t sector_num, const uint8_t *buf,
               int nb_sectors);
+int blk_write_zeroes(BlockBackend *blk, int64_t sector_num,
+                     int nb_sectors, BdrvRequestFlags flags);
 BlockAIOCB *blk_aio_write_zeroes(BlockBackend *blk, int64_t sector_num,
                                  int nb_sectors, BdrvRequestFlags flags,
                                  BlockCompletionFunc *cb, void *opaque);
@@ -164,5 +166,7 @@ int blk_discard(BlockBackend *blk, int64_t sector_num, int nb_sectors);
 int blk_save_vmstate(BlockBackend *blk, const uint8_t *buf,
                      int64_t pos, int size);
 int blk_load_vmstate(BlockBackend *blk, uint8_t *buf, int64_t pos, int size);
+int blk_probe_blocksizes(BlockBackend *blk, BlockSizes *bsz);
+int blk_probe_geometry(BlockBackend *blk, HDGeometry *geo);
 
 #endif
