@@ -14,17 +14,20 @@
  */
 
 #include "qemu-common.h"
+#include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "migration/migration.h"
-#include "monitor/monitor.h"
 #include "migration/qemu-file.h"
 #include "sysemu/sysemu.h"
 #include "block/block.h"
+#include "qapi/qmp/qerror.h"
 #include "qemu/sockets.h"
 #include "migration/block.h"
 #include "qemu/thread.h"
 #include "qmp-commands.h"
 #include "trace.h"
+#include "qapi/util.h"
+#include "qapi-event.h"
 
 #define MAX_THROTTLE  (32 << 20)      /* Migration speed throttling */
 
@@ -53,6 +56,7 @@ static bool deferred_incoming;
    migrations at once.  For now we don't need to add
    dynamic creation of migration */
 
+/* For outgoing */
 MigrationState *migrate_get_current(void)
 {
     static MigrationState current_migration = {
@@ -69,6 +73,144 @@ MigrationState *migrate_get_current(void)
     };
 
     return &current_migration;
+}
+
+/* For incoming */
+static MigrationIncomingState *mis_current;
+
+MigrationIncomingState *migration_incoming_get_current(void)
+{
+    return mis_current;
+}
+
+MigrationIncomingState *migration_incoming_state_new(QEMUFile* f)
+{
+    mis_current = g_malloc0(sizeof(MigrationIncomingState));
+    mis_current->file = f;
+    QLIST_INIT(&mis_current->loadvm_handlers);
+
+    return mis_current;
+}
+
+void migration_incoming_state_destroy(void)
+{
+    loadvm_free_handlers(mis_current);
+    g_free(mis_current);
+    mis_current = NULL;
+}
+
+
+typedef struct {
+    bool optional;
+    uint32_t size;
+    uint8_t runstate[100];
+} GlobalState;
+
+static GlobalState global_state;
+
+static int global_state_store(void)
+{
+    if (!runstate_store((char *)global_state.runstate,
+                        sizeof(global_state.runstate))) {
+        error_report("runstate name too big: %s", global_state.runstate);
+        trace_migrate_state_too_big();
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static char *global_state_get_runstate(void)
+{
+    return (char *)global_state.runstate;
+}
+
+void global_state_set_optional(void)
+{
+    global_state.optional = true;
+}
+
+static bool global_state_needed(void *opaque)
+{
+    GlobalState *s = opaque;
+    char *runstate = (char *)s->runstate;
+
+    /* If it is not optional, it is mandatory */
+
+    if (s->optional == false) {
+        return true;
+    }
+
+    /* If state is running or paused, it is not needed */
+
+    if (strcmp(runstate, "running") == 0 ||
+        strcmp(runstate, "paused") == 0) {
+        return false;
+    }
+
+    /* for any other state it is needed */
+    return true;
+}
+
+static int global_state_post_load(void *opaque, int version_id)
+{
+    GlobalState *s = opaque;
+    int ret = 0;
+    char *runstate = (char *)s->runstate;
+
+    trace_migrate_global_state_post_load(runstate);
+
+    if (strcmp(runstate, "running") != 0) {
+        Error *local_err = NULL;
+        int r = qapi_enum_parse(RunState_lookup, runstate, RUN_STATE_MAX,
+                                -1, &local_err);
+
+        if (r == -1) {
+            if (local_err) {
+                error_report_err(local_err);
+            }
+            return -EINVAL;
+        }
+        ret = vm_stop_force_state(r);
+    }
+
+   return ret;
+}
+
+static void global_state_pre_save(void *opaque)
+{
+    GlobalState *s = opaque;
+
+    trace_migrate_global_state_pre_save((char *)s->runstate);
+    s->size = strlen((char *)s->runstate) + 1;
+}
+
+static const VMStateDescription vmstate_globalstate = {
+    .name = "globalstate",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = global_state_post_load,
+    .pre_save = global_state_pre_save,
+    .needed = global_state_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(size, GlobalState),
+        VMSTATE_BUFFER(runstate, GlobalState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+void register_global_state(void)
+{
+    /* We would use it independently that we receive it */
+    strcpy((char *)&global_state.runstate, "");
+    vmstate_register(NULL, 0, &vmstate_globalstate, &global_state);
+}
+
+static void migrate_generate_event(int new_state)
+{
+    if (migrate_use_events()) {
+        qapi_event_send_migration(new_state, &error_abort);
+        trace_migrate_set_state(new_state);
+    }
 }
 
 /*
@@ -88,6 +230,7 @@ void qemu_start_incoming_migration(const char *uri, Error **errp)
 {
     const char *p;
 
+    qapi_event_send_migration(MIGRATION_STATUS_SETUP, &error_abort);
     if (!strcmp(uri, "defer")) {
         deferred_incoming_migration(errp);
     } else if (strstart(uri, "tcp:", &p)) {
@@ -115,14 +258,21 @@ static void process_incoming_migration_co(void *opaque)
     Error *local_err = NULL;
     int ret;
 
+    migration_incoming_state_new(f);
+    migrate_generate_event(MIGRATION_STATUS_ACTIVE);
     ret = qemu_loadvm_state(f);
+
     qemu_fclose(f);
     free_xbzrle_decoded_buf();
+    migration_incoming_state_destroy();
+
     if (ret < 0) {
+        migrate_generate_event(MIGRATION_STATUS_FAILED);
         error_report("load of migration failed: %s", strerror(-ret));
         migrate_decompress_threads_join();
         exit(EXIT_FAILURE);
     }
+    migrate_generate_event(MIGRATION_STATUS_COMPLETED);
     qemu_announce_self();
 
     /* Make sure all file formats flush their mutable metadata */
@@ -133,10 +283,20 @@ static void process_incoming_migration_co(void *opaque)
         exit(EXIT_FAILURE);
     }
 
-    if (autostart) {
+    /* runstate == "" means that we haven't received it through the
+     * wire, so we obey autostart.  runstate == runing means that we
+     * need to run it, we need to make sure that we do it after
+     * everything else has finished.  Every other state change is done
+     * at the post_load function */
+
+    if (strcmp(global_state_get_runstate(), "running") == 0) {
         vm_start();
-    } else {
-        runstate_set(RUN_STATE_PAUSED);
+    } else if (strcmp(global_state_get_runstate(), "") == 0) {
+        if (autostart) {
+            vm_start();
+        } else {
+            runstate_set(RUN_STATE_PAUSED);
+        }
     }
     migrate_decompress_threads_join();
 }
@@ -307,7 +467,7 @@ void qmp_migrate_set_capabilities(MigrationCapabilityStatusList *params,
 
     if (s->state == MIGRATION_STATUS_ACTIVE ||
         s->state == MIGRATION_STATUS_SETUP) {
-        error_set(errp, QERR_MIGRATION_ACTIVE);
+        error_setg(errp, QERR_MIGRATION_ACTIVE);
         return;
     }
 
@@ -326,22 +486,22 @@ void qmp_migrate_set_parameters(bool has_compress_level,
     MigrationState *s = migrate_get_current();
 
     if (has_compress_level && (compress_level < 0 || compress_level > 9)) {
-        error_set(errp, QERR_INVALID_PARAMETER_VALUE, "compress_level",
-                  "is invalid, it should be in the range of 0 to 9");
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "compress_level",
+                   "is invalid, it should be in the range of 0 to 9");
         return;
     }
     if (has_compress_threads &&
             (compress_threads < 1 || compress_threads > 255)) {
-        error_set(errp, QERR_INVALID_PARAMETER_VALUE,
-                  "compress_threads",
-                  "is invalid, it should be in the range of 1 to 255");
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE,
+                   "compress_threads",
+                   "is invalid, it should be in the range of 1 to 255");
         return;
     }
     if (has_decompress_threads &&
             (decompress_threads < 1 || decompress_threads > 255)) {
-        error_set(errp, QERR_INVALID_PARAMETER_VALUE,
-                  "decompress_threads",
-                  "is invalid, it should be in the range of 1 to 255");
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE,
+                   "decompress_threads",
+                   "is invalid, it should be in the range of 1 to 255");
         return;
     }
 
@@ -361,8 +521,8 @@ void qmp_migrate_set_parameters(bool has_compress_level,
 
 static void migrate_set_state(MigrationState *s, int old_state, int new_state)
 {
-    if (atomic_cmpxchg(&s->state, old_state, new_state) == new_state) {
-        trace_migrate_set_state(new_state);
+    if (atomic_cmpxchg(&s->state, old_state, new_state) == old_state) {
+        migrate_generate_event(new_state);
     }
 }
 
@@ -401,8 +561,7 @@ void migrate_fd_error(MigrationState *s)
 {
     trace_migrate_fd_error();
     assert(s->file == NULL);
-    s->state = MIGRATION_STATUS_FAILED;
-    trace_migrate_set_state(MIGRATION_STATUS_FAILED);
+    migrate_set_state(s, MIGRATION_STATUS_SETUP, MIGRATION_STATUS_FAILED);
     notifier_list_notify(&migration_state_notifiers, s);
 }
 
@@ -486,8 +645,7 @@ static MigrationState *migrate_init(const MigrationParams *params)
     s->parameters[MIGRATION_PARAMETER_DECOMPRESS_THREADS] =
                decompress_thread_count;
     s->bandwidth_limit = bandwidth_limit;
-    s->state = MIGRATION_STATUS_SETUP;
-    trace_migrate_set_state(MIGRATION_STATUS_SETUP);
+    migrate_set_state(s, MIGRATION_STATUS_NONE, MIGRATION_STATUS_SETUP);
 
     s->total_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     return s;
@@ -543,10 +701,9 @@ void qmp_migrate(const char *uri, bool has_blk, bool blk,
     if (s->state == MIGRATION_STATUS_ACTIVE ||
         s->state == MIGRATION_STATUS_SETUP ||
         s->state == MIGRATION_STATUS_CANCELLING) {
-        error_set(errp, QERR_MIGRATION_ACTIVE);
+        error_setg(errp, QERR_MIGRATION_ACTIVE);
         return;
     }
-
     if (runstate_check(RUN_STATE_INMIGRATE)) {
         error_setg(errp, "Guest is waiting for an incoming migration");
         return;
@@ -560,6 +717,12 @@ void qmp_migrate(const char *uri, bool has_blk, bool blk,
         *errp = error_copy(migration_blockers->data);
         return;
     }
+
+    /* We are starting a new migration, so we want to start in a clean
+       state.  This change is only needed if previous migration
+       failed/was cancelled.  We don't use migrate_set_state() because
+       we are setting the initial state, not changing it. */
+    s->state = MIGRATION_STATUS_NONE;
 
     s = migrate_init(&params);
 
@@ -578,8 +741,9 @@ void qmp_migrate(const char *uri, bool has_blk, bool blk,
         fd_start_outgoing_migration(s, p, &local_err);
 #endif
     } else {
-        error_set(errp, QERR_INVALID_PARAMETER_VALUE, "uri", "a valid migration protocol");
-        s->state = MIGRATION_STATUS_FAILED;
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "uri",
+                   "a valid migration protocol");
+        migrate_set_state(s, MIGRATION_STATUS_SETUP, MIGRATION_STATUS_FAILED);
         return;
     }
 
@@ -602,22 +766,22 @@ void qmp_migrate_set_cache_size(int64_t value, Error **errp)
 
     /* Check for truncation */
     if (value != (size_t)value) {
-        error_set(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
-                  "exceeding address space");
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
+                   "exceeding address space");
         return;
     }
 
     /* Cache should not be larger than guest ram size */
     if (value > ram_bytes_total()) {
-        error_set(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
-                  "exceeds guest ram size ");
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
+                   "exceeds guest ram size ");
         return;
     }
 
     new_size = xbzrle_cache_resize(value);
     if (new_size < 0) {
-        error_set(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
-                  "is smaller than page size");
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
+                   "is smaller than page size");
         return;
     }
 
@@ -708,6 +872,15 @@ int migrate_decompress_threads(void)
     return s->parameters[MIGRATION_PARAMETER_DECOMPRESS_THREADS];
 }
 
+bool migrate_use_events(void)
+{
+    MigrationState *s;
+
+    s = migrate_get_current();
+
+    return s->enabled_capabilities[MIGRATION_CAPABILITY_EVENTS];
+}
+
 int migrate_use_xbzrle(void)
 {
     MigrationState *s;
@@ -738,6 +911,7 @@ static void *migration_thread(void *opaque)
     int64_t start_time = initial_time;
     bool old_vm_running = false;
 
+    qemu_savevm_state_header(s->file);
     qemu_savevm_state_begin(s->file, &s->params);
 
     s->setup_time = qemu_clock_get_ms(QEMU_CLOCK_HOST) - setup_start;
@@ -760,10 +934,13 @@ static void *migration_thread(void *opaque)
                 qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
                 old_vm_running = runstate_is_running();
 
-                ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
-                if (ret >= 0) {
-                    qemu_file_set_rate_limit(s->file, INT64_MAX);
-                    qemu_savevm_state_complete(s->file);
+                ret = global_state_store();
+                if (!ret) {
+                    ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
+                    if (ret >= 0) {
+                        qemu_file_set_rate_limit(s->file, INT64_MAX);
+                        qemu_savevm_state_complete(s->file);
+                    }
                 }
                 qemu_mutex_unlock_iothread();
 
@@ -838,9 +1015,6 @@ static void *migration_thread(void *opaque)
 
 void migrate_fd_connect(MigrationState *s)
 {
-    s->state = MIGRATION_STATUS_SETUP;
-    trace_migrate_set_state(MIGRATION_STATUS_SETUP);
-
     /* This is a best 1st approximation. ns to ms */
     s->expected_downtime = max_downtime/1000000;
     s->cleanup_bh = qemu_bh_new(migrate_fd_cleanup, s);
