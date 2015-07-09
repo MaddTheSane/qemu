@@ -839,8 +839,8 @@ QemuCocoaView *cocoaView;
         [pauseLabel sizeToFit];
 
         // set the supported image file types that can be opened
-        supportedImageFileTypes = @[@"img", @"iso", @"dmg",
-                                 @"qcow", @"qcow2", @"cloop", @"vmdk"];
+        supportedImageFileTypes = [@[@"img", @"iso", @"dmg",
+                                 @"qcow", @"qcow2", @"cloop", @"vmdk"] retain];
     }
     return self;
 }
