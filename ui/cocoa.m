@@ -249,6 +249,7 @@ static void QEMU_Alert(NSString *message)
     alert = [NSAlert new];
     [alert setMessageText: message];
     [alert runModal];
+    [alert release];
 }
 
 /* Handles any errors that happen with a device transaction */
@@ -508,10 +509,9 @@ QemuCocoaView *cocoaView;
         [normalWindow orderOut: nil]; /* Hide the window */
         [self grabMouse];
         [self setContentDimensions];
-            [self enterFullScreenMode:[NSScreen mainScreen] withOptions:[NSDictionary dictionaryWithObjectsAndKeys:
-                @NO, NSFullScreenModeAllScreens,
-                [NSDictionary dictionaryWithObjectsAndKeys:@NO, kCGDisplayModeIsStretched, nil], NSFullScreenModeSetting,
-                 nil]];
+            [self enterFullScreenMode:[NSScreen mainScreen] withOptions:@{
+                NSFullScreenModeAllScreens: @NO,
+                NSFullScreenModeSetting: @{(id)kCGDisplayModeIsStretched: @NO}}];
     }
 }
 
@@ -1072,7 +1072,7 @@ QemuCocoaView *cocoaView;
 
         Error *err = NULL;
         qmp_change_blockdev([drive cStringUsingEncoding: NSASCIIStringEncoding],
-                            [file cStringUsingEncoding: NSASCIIStringEncoding],
+                            [file fileSystemRepresentation],
                             "raw",
                             &err);
         handleAnyDeviceErrors(err);
