@@ -72,14 +72,6 @@ generic_print_address (bfd_vma addr, struct disassemble_info *info)
     (*info->fprintf_func) (info->stream, "0x%" PRIx64, addr);
 }
 
-/* Print address in hex, truncated to the width of a target virtual address. */
-static void
-generic_print_target_address(bfd_vma addr, struct disassemble_info *info)
-{
-    uint64_t mask = ~0ULL >> (64 - TARGET_VIRT_ADDR_SPACE_BITS);
-    generic_print_address(addr & mask, info);
-}
-
 /* Print address in hex, truncated to the width of a host virtual address. */
 static void
 generic_print_host_address(bfd_vma addr, struct disassemble_info *info)
@@ -201,7 +193,7 @@ void target_disas(FILE *out, CPUState *cpu, target_ulong code,
     s.info.read_memory_func = target_read_memory;
     s.info.buffer_vma = code;
     s.info.buffer_length = size;
-    s.info.print_address_func = generic_print_target_address;
+    s.info.print_address_func = generic_print_address;
 
 #ifdef TARGET_WORDS_BIGENDIAN
     s.info.endian = BFD_ENDIAN_BIG;
@@ -400,16 +392,6 @@ monitor_read_memory (bfd_vma memaddr, bfd_byte *myaddr, int length,
     return 0;
 }
 
-static int GCC_FMT_ATTR(2, 3)
-monitor_fprintf(FILE *stream, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    monitor_vprintf((Monitor *)stream, fmt, ap);
-    va_end(ap);
-    return 0;
-}
-
 /* Disassembler for the monitor.
    See target_disas for a description of flags. */
 void monitor_disas(Monitor *mon, CPUState *cpu,
@@ -424,7 +406,7 @@ void monitor_disas(Monitor *mon, CPUState *cpu,
     s.cpu = cpu;
     monitor_disas_is_physical = is_physical;
     s.info.read_memory_func = monitor_read_memory;
-    s.info.print_address_func = generic_print_target_address;
+    s.info.print_address_func = generic_print_address;
 
     s.info.buffer_vma = pc;
 

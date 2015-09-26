@@ -24,6 +24,8 @@
 #ifndef HW_IDE_AHCI_H
 #define HW_IDE_AHCI_H
 
+#include <hw/sysbus.h>
+
 #define AHCI_MEM_BAR_SIZE         0x1000
 #define AHCI_MAX_PORTS            32
 #define AHCI_MAX_SG               168 /* hardware max is 64K */
@@ -127,7 +129,7 @@
 #define PORT_CMD_SPIN_UP          (1 << 1) /* Spin up device */
 #define PORT_CMD_START            (1 << 0) /* Enable port DMA engine */
 
-#define PORT_CMD_ICC_MASK         (0xf << 28) /* i/f ICC state mask */
+#define PORT_CMD_ICC_MASK        (0xfU << 28) /* i/f ICC state mask */
 #define PORT_CMD_ICC_ACTIVE       (0x1 << 28) /* Put i/f in active state */
 #define PORT_CMD_ICC_PARTIAL      (0x2 << 28) /* Put i/f in partial state */
 #define PORT_CMD_ICC_SLUMBER      (0x6 << 28) /* Put i/f in slumber state */
@@ -285,6 +287,8 @@ struct AHCIDevice {
 };
 
 typedef struct AHCIState {
+    DeviceState *container;
+
     AHCIDevice *dev;
     AHCIControlRegs control_regs;
     MemoryRegion mem;
@@ -368,5 +372,17 @@ void ahci_uninit(AHCIState *s);
 void ahci_reset(AHCIState *s);
 
 void ahci_ide_create_devs(PCIDevice *dev, DriveInfo **hd);
+
+#define TYPE_SYSBUS_AHCI "sysbus-ahci"
+#define SYSBUS_AHCI(obj) OBJECT_CHECK(SysbusAHCIState, (obj), TYPE_SYSBUS_AHCI)
+
+typedef struct SysbusAHCIState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+
+    AHCIState ahci;
+    uint32_t num_ports;
+} SysbusAHCIState;
 
 #endif /* HW_IDE_AHCI_H */

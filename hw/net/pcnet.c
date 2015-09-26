@@ -670,8 +670,7 @@ static inline hwaddr pcnet_rdra_addr(PCNetState *s, int idx)
 static inline int64_t pcnet_get_next_poll_time(PCNetState *s, int64_t current_time)
 {
     int64_t next_time = current_time +
-        muldiv64(65536 - (CSR_SPND(s) ? 0 : CSR_POLL(s)),
-                 get_ticks_per_sec(), 33000000L);
+                        (65536 - (CSR_SPND(s) ? 0 : CSR_POLL(s))) * 30;
     if (next_time <= current_time)
         next_time = current_time + 1;
     return next_time;
@@ -993,15 +992,6 @@ static int pcnet_tdte_poll(PCNetState *s)
     }
 
     return !!(CSR_CXST(s) & 0x8000);
-}
-
-int pcnet_can_receive(NetClientState *nc)
-{
-    PCNetState *s = qemu_get_nic_opaque(nc);
-    if (CSR_STOP(s) || CSR_SPND(s))
-        return 0;
-
-    return sizeof(s->buffer)-16;
 }
 
 #define MIN_BUF_SIZE 60

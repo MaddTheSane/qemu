@@ -1095,7 +1095,8 @@ static uint64_t virtio_pci_common_read(void *opaque, hwaddr addr,
         break;
     case VIRTIO_PCI_COMMON_DF:
         if (proxy->dfselect <= 1) {
-            val = vdev->host_features >> (32 * proxy->dfselect);
+            val = (vdev->host_features & ~VIRTIO_LEGACY_FEATURES) >>
+                (32 * proxy->dfselect);
         }
         break;
     case VIRTIO_PCI_COMMON_GFSELECT:
@@ -1413,6 +1414,13 @@ static void virtio_pci_modern_region_map(VirtIOPCIProxy *proxy,
     virtio_pci_add_mem_cap(proxy, cap);
 }
 
+static void virtio_pci_modern_region_unmap(VirtIOPCIProxy *proxy,
+                                           VirtIOPCIRegion *region)
+{
+    memory_region_del_subregion(&proxy->modern_bar,
+                                &region->mr);
+}
+
 /* This is called by virtio-bus just after the device is plugged. */
 static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
 {
@@ -1497,9 +1505,7 @@ static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
     if (legacy) {
         size = VIRTIO_PCI_REGION_SIZE(&proxy->pci_dev)
             + virtio_bus_get_vdev_config_len(bus);
-        if (size & (size - 1)) {
-            size = 1 << qemu_fls(size);
-        }
+        size = pow2ceil(size);
 
         memory_region_init_io(&proxy->bar, OBJECT(proxy),
                               &virtio_pci_config_ops,
@@ -1519,8 +1525,16 @@ static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
 static void virtio_pci_device_unplugged(DeviceState *d)
 {
     VirtIOPCIProxy *proxy = VIRTIO_PCI(d);
+    bool modern = !(proxy->flags & VIRTIO_PCI_FLAG_DISABLE_MODERN);
 
     virtio_pci_stop_ioeventfd(proxy);
+
+    if (modern) {
+        virtio_pci_modern_region_unmap(proxy, &proxy->common);
+        virtio_pci_modern_region_unmap(proxy, &proxy->isr);
+        virtio_pci_modern_region_unmap(proxy, &proxy->device);
+        virtio_pci_modern_region_unmap(proxy, &proxy->notify);
+    }
 }
 
 static void virtio_pci_realize(PCIDevice *pci_dev, Error **errp)
@@ -1993,10 +2007,6 @@ static const TypeInfo virtio_net_pci_info = {
 
 /* virtio-rng-pci */
 
-static Property virtio_rng_pci_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
-
 static void virtio_rng_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 {
     VirtIORngPCI *vrng = VIRTIO_RNG_PCI(vpci_dev);
@@ -2023,7 +2033,6 @@ static void virtio_rng_pci_class_init(ObjectClass *klass, void *data)
 
     k->realize = virtio_rng_pci_realize;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
-    dc->props = virtio_rng_pci_properties;
 
     pcidev_k->vendor_id = PCI_VENDOR_ID_REDHAT_QUMRANET;
     pcidev_k->device_id = PCI_DEVICE_ID_VIRTIO_RNG;

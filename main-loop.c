@@ -114,6 +114,14 @@ static int qemu_signal_init(void)
 #endif
 
 static AioContext *qemu_aio_context;
+static QEMUBH *qemu_notify_bh;
+
+static void notify_event_cb(void *opaque)
+{
+    /* No need to do anything; this bottom half is only used to
+     * kick the kernel out of ppoll/poll/WaitForMultipleObjects.
+     */
+}
 
 AioContext *qemu_get_aio_context(void)
 {
@@ -125,7 +133,7 @@ void qemu_notify_event(void)
     if (!qemu_aio_context) {
         return;
     }
-    aio_notify(qemu_aio_context);
+    qemu_bh_schedule(qemu_notify_bh);
 }
 
 static GArray *gpollfds;
@@ -144,12 +152,16 @@ int qemu_init_main_loop(Error **errp)
     }
 
     qemu_aio_context = aio_context_new(&local_error);
+    qemu_notify_bh = qemu_bh_new(notify_event_cb, NULL);
     if (!qemu_aio_context) {
         error_propagate(errp, local_error);
         return -EMFILE;
     }
     gpollfds = g_array_new(FALSE, FALSE, sizeof(GPollFD));
     src = aio_get_g_source(qemu_aio_context);
+    g_source_attach(src, NULL);
+    g_source_unref(src);
+    src = iohandler_get_g_source();
     g_source_attach(src, NULL);
     g_source_unref(src);
     return 0;
@@ -478,7 +490,6 @@ int main_loop_wait(int nonblocking)
 #ifdef CONFIG_SLIRP
     slirp_pollfds_fill(gpollfds, &timeout);
 #endif
-    qemu_iohandler_fill(gpollfds);
 
     if (timeout == UINT32_MAX) {
         timeout_ns = -1;
@@ -491,7 +502,6 @@ int main_loop_wait(int nonblocking)
                                           &main_loop_tlg));
 
     ret = os_host_main_loop_wait(timeout_ns);
-    qemu_iohandler_poll(gpollfds, ret);
 #ifdef CONFIG_SLIRP
     slirp_pollfds_poll(gpollfds, (ret < 0));
 #endif

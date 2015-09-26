@@ -722,7 +722,8 @@ static void virtio_blk_set_config(VirtIODevice *vdev, const uint8_t *config)
     aio_context_release(blk_get_aio_context(s->blk));
 }
 
-static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features)
+static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features,
+                                        Error **errp)
 {
     VirtIOBlock *s = VIRTIO_BLK(vdev);
 
@@ -730,7 +731,15 @@ static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features)
     virtio_add_feature(&features, VIRTIO_BLK_F_GEOMETRY);
     virtio_add_feature(&features, VIRTIO_BLK_F_TOPOLOGY);
     virtio_add_feature(&features, VIRTIO_BLK_F_BLK_SIZE);
-    virtio_add_feature(&features, VIRTIO_BLK_F_SCSI);
+    if (virtio_has_feature(features, VIRTIO_F_VERSION_1)) {
+        if (s->conf.scsi) {
+            error_setg(errp, "Please set scsi=off for virtio-blk devices in order to use virtio 1.0");
+            return 0;
+        }
+    } else {
+        virtio_clear_feature(&features, VIRTIO_F_ANY_LAYOUT);
+        virtio_add_feature(&features, VIRTIO_BLK_F_SCSI);
+    }
 
     if (s->conf.config_wce) {
         virtio_add_feature(&features, VIRTIO_BLK_F_CONFIG_WCE);
@@ -773,10 +782,11 @@ static void virtio_blk_set_status(VirtIODevice *vdev, uint8_t status)
      *
      * s->blk would erroneously be placed in writethrough mode.
      */
-    if (!virtio_has_feature(vdev, VIRTIO_BLK_F_CONFIG_WCE)) {
+    if (!virtio_vdev_has_feature(vdev, VIRTIO_BLK_F_CONFIG_WCE)) {
         aio_context_acquire(blk_get_aio_context(s->blk));
         blk_set_enable_write_cache(s->blk,
-                                   virtio_has_feature(vdev, VIRTIO_BLK_F_WCE));
+                                   virtio_vdev_has_feature(vdev,
+                                                           VIRTIO_BLK_F_WCE));
         aio_context_release(blk_get_aio_context(s->blk));
     }
 }

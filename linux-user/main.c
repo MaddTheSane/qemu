@@ -37,13 +37,12 @@
 char *exec_path;
 
 int singlestep;
-const char *filename;
-const char *argv0;
-int gdbstub_port;
-envlist_t *envlist;
+static const char *filename;
+static const char *argv0;
+static int gdbstub_port;
+static envlist_t *envlist;
 static const char *cpu_model;
 unsigned long mmap_min_addr;
-#if defined(CONFIG_USE_GUEST_BASE)
 unsigned long guest_base;
 int have_guest_base;
 #if (TARGET_LONG_BITS == 32) && (HOST_LONG_BITS == 64)
@@ -62,7 +61,6 @@ unsigned long reserved_va = 0xf7000000;
 # endif
 #else
 unsigned long reserved_va;
-#endif
 #endif
 
 static void usage(void);
@@ -107,7 +105,7 @@ static int pending_cpus;
 /* Make sure everything is in a consistent state for calling fork().  */
 void fork_start(void)
 {
-    pthread_mutex_lock(&tcg_ctx.tb_ctx.tb_lock);
+    qemu_mutex_lock(&tcg_ctx.tb_ctx.tb_lock);
     pthread_mutex_lock(&exclusive_lock);
     mmap_fork_start();
 }
@@ -129,11 +127,11 @@ void fork_end(int child)
         pthread_mutex_init(&cpu_list_mutex, NULL);
         pthread_cond_init(&exclusive_cond, NULL);
         pthread_cond_init(&exclusive_resume, NULL);
-        pthread_mutex_init(&tcg_ctx.tb_ctx.tb_lock, NULL);
+        qemu_mutex_init(&tcg_ctx.tb_ctx.tb_lock);
         gdbserver_fork(thread_cpu);
     } else {
         pthread_mutex_unlock(&exclusive_lock);
-        pthread_mutex_unlock(&tcg_ctx.tb_ctx.tb_lock);
+        qemu_mutex_unlock(&tcg_ctx.tb_ctx.tb_lock);
     }
 }
 
@@ -1054,6 +1052,9 @@ void cpu_loop(CPUARMState *env)
                 queue_signal(env, info.si_signo, &info);
             }
             break;
+        case EXCP_SEMIHOST:
+            env->xregs[0] = do_arm_semihosting(env);
+            break;
         default:
             fprintf(stderr, "qemu: unhandled CPU exception 0x%x - aborting\n",
                     trapnr);
@@ -1649,7 +1650,7 @@ void cpu_loop(CPUPPCState *env)
             info.si_signo = TARGET_SIGBUS;
             info.si_errno = 0;
             info.si_code = TARGET_BUS_ADRALN;
-            info._sifields._sigfault._addr = env->nip - 4;
+            info._sifields._sigfault._addr = env->nip;
             queue_signal(env, info.si_signo, &info);
             break;
         case POWERPC_EXCP_PROGRAM:  /* Program exception                     */
@@ -2577,7 +2578,7 @@ done_syscall:
                         code = (trap_instr >> 6) & 0x3f;
                     }
                 } else {
-                    ret = get_user_ual(trap_instr, env->active_tc.PC);
+                    ret = get_user_u32(trap_instr, env->active_tc.PC);
                     if (ret != 0) {
                         goto error;
                     }
@@ -2611,7 +2612,7 @@ done_syscall:
 
                     trap_instr = (instr[0] << 16) | instr[1];
                 } else {
-                    ret = get_user_ual(trap_instr, env->active_tc.PC);
+                    ret = get_user_u32(trap_instr, env->active_tc.PC);
                 }
 
                 if (ret != 0) {
@@ -3411,6 +3412,233 @@ void cpu_loop(CPUS390XState *env)
 
 #endif /* TARGET_S390X */
 
+#ifdef TARGET_TILEGX
+
+static void gen_sigsegv_maperr(CPUTLGState *env, target_ulong addr)
+{
+    target_siginfo_t info;
+
+    info.si_signo = TARGET_SIGSEGV;
+    info.si_errno = 0;
+    info.si_code = TARGET_SEGV_MAPERR;
+    info._sifields._sigfault._addr = addr;
+    queue_signal(env, info.si_signo, &info);
+}
+
+static void gen_sigill_reg(CPUTLGState *env)
+{
+    target_siginfo_t info;
+
+    info.si_signo = TARGET_SIGILL;
+    info.si_errno = 0;
+    info.si_code = TARGET_ILL_PRVREG;
+    info._sifields._sigfault._addr = env->pc;
+    queue_signal(env, info.si_signo, &info);
+}
+
+static void set_regval(CPUTLGState *env, uint8_t reg, uint64_t val)
+{
+    if (unlikely(reg >= TILEGX_R_COUNT)) {
+        switch (reg) {
+        case TILEGX_R_SN:
+        case TILEGX_R_ZERO:
+            return;
+        case TILEGX_R_IDN0:
+        case TILEGX_R_IDN1:
+        case TILEGX_R_UDN0:
+        case TILEGX_R_UDN1:
+        case TILEGX_R_UDN2:
+        case TILEGX_R_UDN3:
+            gen_sigill_reg(env);
+            return;
+        default:
+            g_assert_not_reached();
+        }
+    }
+    env->regs[reg] = val;
+}
+
+/*
+ * Compare the 8-byte contents of the CmpValue SPR with the 8-byte value in
+ * memory at the address held in the first source register. If the values are
+ * not equal, then no memory operation is performed. If the values are equal,
+ * the 8-byte quantity from the second source register is written into memory
+ * at the address held in the first source register. In either case, the result
+ * of the instruction is the value read from memory. The compare and write to
+ * memory are atomic and thus can be used for synchronization purposes. This
+ * instruction only operates for addresses aligned to a 8-byte boundary.
+ * Unaligned memory access causes an Unaligned Data Reference interrupt.
+ *
+ * Functional Description (64-bit)
+ *       uint64_t memVal = memoryReadDoubleWord (rf[SrcA]);
+ *       rf[Dest] = memVal;
+ *       if (memVal == SPR[CmpValueSPR])
+ *           memoryWriteDoubleWord (rf[SrcA], rf[SrcB]);
+ *
+ * Functional Description (32-bit)
+ *       uint64_t memVal = signExtend32 (memoryReadWord (rf[SrcA]));
+ *       rf[Dest] = memVal;
+ *       if (memVal == signExtend32 (SPR[CmpValueSPR]))
+ *           memoryWriteWord (rf[SrcA], rf[SrcB]);
+ *
+ *
+ * This function also processes exch and exch4 which need not process SPR.
+ */
+static void do_exch(CPUTLGState *env, bool quad, bool cmp)
+{
+    target_ulong addr;
+    target_long val, sprval;
+
+    start_exclusive();
+
+    addr = env->atomic_srca;
+    if (quad ? get_user_s64(val, addr) : get_user_s32(val, addr)) {
+        goto sigsegv_maperr;
+    }
+
+    if (cmp) {
+        if (quad) {
+            sprval = env->spregs[TILEGX_SPR_CMPEXCH];
+        } else {
+            sprval = sextract64(env->spregs[TILEGX_SPR_CMPEXCH], 0, 32);
+        }
+    }
+
+    if (!cmp || val == sprval) {
+        target_long valb = env->atomic_srcb;
+        if (quad ? put_user_u64(valb, addr) : put_user_u32(valb, addr)) {
+            goto sigsegv_maperr;
+        }
+    }
+
+    set_regval(env, env->atomic_dstr, val);
+    end_exclusive();
+    return;
+
+ sigsegv_maperr:
+    end_exclusive();
+    gen_sigsegv_maperr(env, addr);
+}
+
+static void do_fetch(CPUTLGState *env, int trapnr, bool quad)
+{
+    int8_t write = 1;
+    target_ulong addr;
+    target_long val, valb;
+
+    start_exclusive();
+
+    addr = env->atomic_srca;
+    valb = env->atomic_srcb;
+    if (quad ? get_user_s64(val, addr) : get_user_s32(val, addr)) {
+        goto sigsegv_maperr;
+    }
+
+    switch (trapnr) {
+    case TILEGX_EXCP_OPCODE_FETCHADD:
+    case TILEGX_EXCP_OPCODE_FETCHADD4:
+        valb += val;
+        break;
+    case TILEGX_EXCP_OPCODE_FETCHADDGEZ:
+        valb += val;
+        if (valb < 0) {
+            write = 0;
+        }
+        break;
+    case TILEGX_EXCP_OPCODE_FETCHADDGEZ4:
+        valb += val;
+        if ((int32_t)valb < 0) {
+            write = 0;
+        }
+        break;
+    case TILEGX_EXCP_OPCODE_FETCHAND:
+    case TILEGX_EXCP_OPCODE_FETCHAND4:
+        valb &= val;
+        break;
+    case TILEGX_EXCP_OPCODE_FETCHOR:
+    case TILEGX_EXCP_OPCODE_FETCHOR4:
+        valb |= val;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (write) {
+        if (quad ? put_user_u64(valb, addr) : put_user_u32(valb, addr)) {
+            goto sigsegv_maperr;
+        }
+    }
+
+    set_regval(env, env->atomic_dstr, val);
+    end_exclusive();
+    return;
+
+ sigsegv_maperr:
+    end_exclusive();
+    gen_sigsegv_maperr(env, addr);
+}
+
+void cpu_loop(CPUTLGState *env)
+{
+    CPUState *cs = CPU(tilegx_env_get_cpu(env));
+    int trapnr;
+
+    while (1) {
+        cpu_exec_start(cs);
+        trapnr = cpu_tilegx_exec(cs);
+        cpu_exec_end(cs);
+        switch (trapnr) {
+        case TILEGX_EXCP_SYSCALL:
+            env->regs[TILEGX_R_RE] = do_syscall(env, env->regs[TILEGX_R_NR],
+                                                env->regs[0], env->regs[1],
+                                                env->regs[2], env->regs[3],
+                                                env->regs[4], env->regs[5],
+                                                env->regs[6], env->regs[7]);
+            env->regs[TILEGX_R_ERR] = TILEGX_IS_ERRNO(env->regs[TILEGX_R_RE])
+                                                      ? - env->regs[TILEGX_R_RE]
+                                                      : 0;
+            break;
+        case TILEGX_EXCP_OPCODE_EXCH:
+            do_exch(env, true, false);
+            break;
+        case TILEGX_EXCP_OPCODE_EXCH4:
+            do_exch(env, false, false);
+            break;
+        case TILEGX_EXCP_OPCODE_CMPEXCH:
+            do_exch(env, true, true);
+            break;
+        case TILEGX_EXCP_OPCODE_CMPEXCH4:
+            do_exch(env, false, true);
+            break;
+        case TILEGX_EXCP_OPCODE_FETCHADD:
+        case TILEGX_EXCP_OPCODE_FETCHADDGEZ:
+        case TILEGX_EXCP_OPCODE_FETCHAND:
+        case TILEGX_EXCP_OPCODE_FETCHOR:
+            do_fetch(env, trapnr, true);
+            break;
+        case TILEGX_EXCP_OPCODE_FETCHADD4:
+        case TILEGX_EXCP_OPCODE_FETCHADDGEZ4:
+        case TILEGX_EXCP_OPCODE_FETCHAND4:
+        case TILEGX_EXCP_OPCODE_FETCHOR4:
+            do_fetch(env, trapnr, false);
+            break;
+        case TILEGX_EXCP_REG_IDN_ACCESS:
+        case TILEGX_EXCP_REG_UDN_ACCESS:
+            gen_sigill_reg(env);
+            break;
+        case TILEGX_EXCP_SEGV:
+            gen_sigsegv_maperr(env, env->excaddr);
+            break;
+        default:
+            fprintf(stderr, "trapnr is %d[0x%x].\n", trapnr, trapnr);
+            g_assert_not_reached();
+        }
+        process_pending_signals(env);
+    }
+}
+
+#endif
+
 THREAD CPUState *thread_cpu;
 
 void task_settid(TaskState *ts)
@@ -3584,7 +3812,6 @@ static void handle_arg_cpu(const char *arg)
     }
 }
 
-#if defined(CONFIG_USE_GUEST_BASE)
 static void handle_arg_guest_base(const char *arg)
 {
     guest_base = strtol(arg, NULL, 0);
@@ -3626,7 +3853,6 @@ static void handle_arg_reserved_va(const char *arg)
         exit(1);
     }
 }
-#endif
 
 static void handle_arg_singlestep(const char *arg)
 {
@@ -3673,12 +3899,10 @@ static const struct qemu_argument arg_table[] = {
      "argv0",      "forces target process argv[0] to be 'argv0'"},
     {"r",          "QEMU_UNAME",       true,  handle_arg_uname,
      "uname",      "set qemu uname release string to 'uname'"},
-#if defined(CONFIG_USE_GUEST_BASE)
     {"B",          "QEMU_GUEST_BASE",  true,  handle_arg_guest_base,
      "address",    "set guest_base address to 'address'"},
     {"R",          "QEMU_RESERVED_VA", true,  handle_arg_reserved_va,
      "size",       "reserve 'size' bytes for guest virtual address space"},
-#endif
     {"d",          "QEMU_LOG",         true,  handle_arg_log,
      "item[,...]", "enable logging of specified items "
      "(use '-d help' for a list of items)"},
@@ -3954,7 +4178,6 @@ int main(int argc, char **argv, char **envp)
     target_environ = envlist_to_environ(envlist, NULL);
     envlist_free(envlist);
 
-#if defined(CONFIG_USE_GUEST_BASE)
     /*
      * Now that page sizes are configured in cpu_init() we can do
      * proper page alignment for guest_base.
@@ -3976,7 +4199,6 @@ int main(int argc, char **argv, char **envp)
             mmap_next_start = reserved_va;
         }
     }
-#endif /* CONFIG_USE_GUEST_BASE */
 
     /*
      * Read in mmap_min_addr kernel parameter.  This value is used
@@ -4050,9 +4272,7 @@ int main(int argc, char **argv, char **envp)
     free(target_environ);
 
     if (qemu_log_enabled()) {
-#if defined(CONFIG_USE_GUEST_BASE)
         qemu_log("guest_base  0x%lx\n", guest_base);
-#endif
         log_page_dump();
 
         qemu_log("start_brk   0x" TARGET_ABI_FMT_lx "\n", info->start_brk);
@@ -4072,12 +4292,10 @@ int main(int argc, char **argv, char **envp)
     syscall_init();
     signal_init();
 
-#if defined(CONFIG_USE_GUEST_BASE)
     /* Now that we've loaded the binary, GUEST_BASE is fixed.  Delay
        generating the prologue until now so that the prologue can take
        the real value of GUEST_BASE into account.  */
     tcg_prologue_init(&tcg_ctx);
-#endif
 
 #if defined(TARGET_I386)
     env->cr[0] = CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK;
@@ -4385,6 +4603,17 @@ int main(int argc, char **argv, char **envp)
             }
             env->psw.mask = regs->psw.mask;
             env->psw.addr = regs->psw.addr;
+    }
+#elif defined(TARGET_TILEGX)
+    {
+        int i;
+        for (i = 0; i < TILEGX_R_COUNT; i++) {
+            env->regs[i] = regs->regs[i];
+        }
+        for (i = 0; i < TILEGX_SPR_COUNT; i++) {
+            env->spregs[i] = 0;
+        }
+        env->pc = regs->pc;
     }
 #else
 #error unsupported target CPU

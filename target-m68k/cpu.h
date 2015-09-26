@@ -32,8 +32,6 @@
 
 #define MAX_QREGS 32
 
-#define ELF_MACHINE	EM_68K
-
 #define EXCP_ACCESS         2   /* Access (MMU) error.  */
 #define EXCP_ADDRESS        3   /* Address error.  */
 #define EXCP_ILLEGAL        4   /* Illegal instruction.  */
@@ -223,7 +221,7 @@ void register_m68k_insns (CPUM68KState *env);
 #define MMU_MODE0_SUFFIX _kernel
 #define MMU_MODE1_SUFFIX _user
 #define MMU_USER_IDX 1
-static inline int cpu_mmu_index (CPUM68KState *env)
+static inline int cpu_mmu_index (CPUM68KState *env, bool ifetch)
 {
     return (env->sr & SR_S) == 0 ? 1 : 0;
 }

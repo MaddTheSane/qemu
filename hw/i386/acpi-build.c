@@ -169,6 +169,7 @@ static void acpi_get_pm_info(AcpiPmInfo *pm)
     Object *obj = NULL;
     QObject *o;
 
+    pm->cpu_hp_io_base = 0;
     pm->pcihp_io_base = 0;
     pm->pcihp_io_len = 0;
     if (piix) {
@@ -1108,8 +1109,8 @@ build_ssdt(GArray *table_data, GArray *linker,
         aml_append(field, aml_named_field("PEPT", 8));
         aml_append(dev, field);
 
-        /* device present, functioning, decoding, not shown in UI */
-        aml_append(dev, aml_name_decl("_STA", aml_int(0xB)));
+        /* device present, functioning, decoding, shown in UI */
+        aml_append(dev, aml_name_decl("_STA", aml_int(0xF)));
 
         method = aml_method("RDPT", 0);
         aml_append(method, aml_store(aml_name("PEPT"), aml_local(0)));

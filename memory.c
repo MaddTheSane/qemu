@@ -859,11 +859,6 @@ static void memory_region_destructor_ram(MemoryRegion *mr)
     qemu_ram_free(mr->ram_addr);
 }
 
-static void memory_region_destructor_alias(MemoryRegion *mr)
-{
-    memory_region_unref(mr->alias);
-}
-
 static void memory_region_destructor_ram_from_ptr(MemoryRegion *mr)
 {
     qemu_ram_free_from_ptr(mr->ram_addr);
@@ -1187,7 +1182,7 @@ void memory_region_init_io(MemoryRegion *mr,
                            uint64_t size)
 {
     memory_region_init(mr, owner, name, size);
-    mr->ops = ops;
+    mr->ops = ops ? ops : &unassigned_mem_ops;
     mr->opaque = opaque;
     mr->terminates = true;
 }
@@ -1256,7 +1251,7 @@ void memory_region_init_ram_ptr(MemoryRegion *mr,
 
     /* qemu_ram_alloc_from_ptr cannot fail with ptr != NULL.  */
     assert(ptr != NULL);
-    mr->ram_addr = qemu_ram_alloc_from_ptr(size, ptr, mr, &error_abort);
+    mr->ram_addr = qemu_ram_alloc_from_ptr(size, ptr, mr, &error_fatal);
 }
 
 void memory_region_set_skip_dump(MemoryRegion *mr)
@@ -1272,8 +1267,6 @@ void memory_region_init_alias(MemoryRegion *mr,
                               uint64_t size)
 {
     memory_region_init(mr, owner, name, size);
-    memory_region_ref(orig);
-    mr->destructor = memory_region_destructor_alias;
     mr->alias = orig;
     mr->alias_offset = offset;
 }
@@ -1305,14 +1298,6 @@ void memory_region_init_iommu(MemoryRegion *mr,
     mr->iommu_ops = ops,
     mr->terminates = true;  /* then re-forwards */
     notifier_list_init(&mr->iommu_notify);
-}
-
-void memory_region_init_reservation(MemoryRegion *mr,
-                                    Object *owner,
-                                    const char *name,
-                                    uint64_t size)
-{
-    memory_region_init_io(mr, owner, &unassigned_mem_ops, mr, name, size);
 }
 
 static void memory_region_finalize(Object *obj)
@@ -1433,8 +1418,15 @@ void memory_region_notify_iommu(MemoryRegion *mr,
 void memory_region_set_log(MemoryRegion *mr, bool log, unsigned client)
 {
     uint8_t mask = 1 << client;
+    uint8_t old_logging;
 
     assert(client == DIRTY_MEMORY_VGA);
+    old_logging = mr->vga_logging_count;
+    mr->vga_logging_count += log ? 1 : -1;
+    if (!!old_logging == !!mr->vga_logging_count) {
+        return;
+    }
+
     memory_region_transaction_begin();
     mr->dirty_log_mask = (mr->dirty_log_mask & ~mask) | (log * mask);
     memory_region_update_pending |= mr->enabled;
@@ -1887,23 +1879,16 @@ static FlatRange *flatview_lookup(FlatView *view, AddrRange addr)
                    sizeof(FlatRange), cmp_flatrange_addr);
 }
 
-bool memory_region_present(MemoryRegion *container, hwaddr addr)
-{
-    MemoryRegion *mr = memory_region_find(container, addr, 1).mr;
-    if (!mr || (mr == container)) {
-        return false;
-    }
-    memory_region_unref(mr);
-    return true;
-}
-
 bool memory_region_is_mapped(MemoryRegion *mr)
 {
     return mr->container ? true : false;
 }
 
-MemoryRegionSection memory_region_find(MemoryRegion *mr,
-                                       hwaddr addr, uint64_t size)
+/* Same as memory_region_find, but it does not add a reference to the
+ * returned region.  It must be called from an RCU critical section.
+ */
+static MemoryRegionSection memory_region_find_rcu(MemoryRegion *mr,
+                                                  hwaddr addr, uint64_t size)
 {
     MemoryRegionSection ret = { .mr = NULL };
     MemoryRegion *root;
@@ -1924,11 +1909,10 @@ MemoryRegionSection memory_region_find(MemoryRegion *mr,
     }
     range = addrrange_make(int128_make64(addr), int128_make64(size));
 
-    rcu_read_lock();
     view = atomic_rcu_read(&as->current_map);
     fr = flatview_lookup(view, range);
     if (!fr) {
-        goto out;
+        return ret;
     }
 
     while (fr > view->ranges && addrrange_intersects(fr[-1].addr, range)) {
@@ -1944,10 +1928,30 @@ MemoryRegionSection memory_region_find(MemoryRegion *mr,
     ret.size = range.size;
     ret.offset_within_address_space = int128_get64(range.start);
     ret.readonly = fr->readonly;
-    memory_region_ref(ret.mr);
-out:
+    return ret;
+}
+
+MemoryRegionSection memory_region_find(MemoryRegion *mr,
+                                       hwaddr addr, uint64_t size)
+{
+    MemoryRegionSection ret;
+    rcu_read_lock();
+    ret = memory_region_find_rcu(mr, addr, size);
+    if (ret.mr) {
+        memory_region_ref(ret.mr);
+    }
     rcu_read_unlock();
     return ret;
+}
+
+bool memory_region_present(MemoryRegion *container, hwaddr addr)
+{
+    MemoryRegion *mr;
+
+    rcu_read_lock();
+    mr = memory_region_find_rcu(container, addr, 1).mr;
+    rcu_read_unlock();
+    return mr && mr != container;
 }
 
 void address_space_sync_dirty_bitmap(AddressSpace *as)

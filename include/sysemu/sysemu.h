@@ -69,6 +69,7 @@ int qemu_reset_requested_get(void);
 void qemu_system_killed(int signal, pid_t pid);
 void qemu_devices_reset(void);
 void qemu_system_reset(bool report);
+void qemu_system_guest_panicked(void);
 
 void qemu_add_exit_notifier(Notifier *notify);
 void qemu_remove_exit_notifier(Notifier *notify);
@@ -194,7 +195,7 @@ void device_add_bootindex_property(Object *obj, int32_t *bootindex,
 void restore_boot_order(void *opaque);
 void validate_bootdevices(const char *devices, Error **errp);
 
-/* handler to set the boot_device order for a specific type of QEMUMachine */
+/* handler to set the boot_device order for a specific type of MachineClass */
 typedef void QEMUBootSetHandler(void *opaque, const char *boot_order,
                                 Error **errp);
 void qemu_register_boot_set(QEMUBootSetHandler *func, void *opaque);

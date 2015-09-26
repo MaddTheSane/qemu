@@ -336,15 +336,6 @@ static uint32_t PREP_io_800_readb (void *opaque, uint32_t addr)
 
 #define NVRAM_SIZE        0x2000
 
-static void cpu_request_exit(void *opaque, int irq, int level)
-{
-    CPUState *cpu = current_cpu;
-
-    if (cpu && level) {
-        cpu_exit(cpu);
-    }
-}
-
 static void ppc_prep_reset(void *opaque)
 {
     PowerPCCPU *cpu = opaque;
@@ -610,7 +601,7 @@ static void ppc_prep_init(MachineState *machine)
         bios_name = BIOS_FILENAME;
     }
     qdev_prop_set_string(dev, "bios-name", bios_name);
-    qdev_prop_set_uint32(dev, "elf-machine", ELF_MACHINE);
+    qdev_prop_set_uint32(dev, "elf-machine", PPC_ELF_MACHINE);
     pcihost = PCI_HOST_BRIDGE(dev);
     object_property_add_child(qdev_get_machine(), "raven", OBJECT(dev), NULL);
     qdev_init_nofail(dev);
@@ -626,8 +617,6 @@ static void ppc_prep_init(MachineState *machine)
     cpu = POWERPC_CPU(first_cpu);
     qdev_connect_gpio_out(&pci->qdev, 0,
                           cpu->env.irq_inputs[PPC6xx_INPUT_INT]);
-    qdev_connect_gpio_out(&pci->qdev, 1,
-                          qemu_allocate_irq(cpu_request_exit, NULL, 0));
     sysbus_connect_irq(&pcihost->busdev, 0, qdev_get_gpio_in(&pci->qdev, 9));
     sysbus_connect_irq(&pcihost->busdev, 1, qdev_get_gpio_in(&pci->qdev, 11));
     sysbus_connect_irq(&pcihost->busdev, 2, qdev_get_gpio_in(&pci->qdev, 9));
@@ -698,17 +687,12 @@ static void ppc_prep_init(MachineState *machine)
                          graphic_width, graphic_height, graphic_depth);
 }
 
-static QEMUMachine prep_machine = {
-    .name = "prep",
-    .desc = "PowerPC PREP platform",
-    .init = ppc_prep_init,
-    .max_cpus = MAX_CPUS,
-    .default_boot_order = "cad",
-};
-
-static void prep_machine_init(void)
+static void prep_machine_init(MachineClass *mc)
 {
-    qemu_register_machine(&prep_machine);
+    mc->desc = "PowerPC PREP platform";
+    mc->init = ppc_prep_init;
+    mc->max_cpus = MAX_CPUS;
+    mc->default_boot_order = "cad";
 }
 
-machine_init(prep_machine_init);
+DEFINE_MACHINE("prep", prep_machine_init)

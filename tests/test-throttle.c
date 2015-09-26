@@ -40,19 +40,19 @@ static void test_leak_bucket(void)
     bkt.level = 1.5;
 
     /* leak an op work of time */
-    throttle_leak_bucket(&bkt, NSEC_PER_SEC / 150);
+    throttle_leak_bucket(&bkt, NANOSECONDS_PER_SECOND / 150);
     g_assert(bkt.avg == 150);
     g_assert(bkt.max == 15);
     g_assert(double_cmp(bkt.level, 0.5));
 
     /* leak again emptying the bucket */
-    throttle_leak_bucket(&bkt, NSEC_PER_SEC / 150);
+    throttle_leak_bucket(&bkt, NANOSECONDS_PER_SECOND / 150);
     g_assert(bkt.avg == 150);
     g_assert(bkt.max == 15);
     g_assert(double_cmp(bkt.level, 0));
 
     /* check that the bucket level won't go lower */
-    throttle_leak_bucket(&bkt, NSEC_PER_SEC / 150);
+    throttle_leak_bucket(&bkt, NANOSECONDS_PER_SECOND / 150);
     g_assert(bkt.avg == 150);
     g_assert(bkt.max == 15);
     g_assert(double_cmp(bkt.level, 0));
@@ -90,7 +90,7 @@ static void test_compute_wait(void)
     bkt.level = 15.5;
     wait = throttle_compute_wait(&bkt);
     /* time required to do half an operation */
-    result = (int64_t)  NSEC_PER_SEC / 150 / 2;
+    result = (int64_t)  NANOSECONDS_PER_SECOND / 150 / 2;
     g_assert(wait == result);
 }
 
@@ -327,6 +327,26 @@ static void test_is_valid(void)
     test_is_valid_for_value(0, true);
     /* positives numers are valids */
     test_is_valid_for_value(1, true);
+}
+
+static void test_max_is_missing_limit(void)
+{
+    int i;
+
+    for (i = 0; i < BUCKETS_COUNT; i++) {
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.buckets[i].max = 100;
+        cfg.buckets[i].avg = 0;
+        g_assert(throttle_max_is_missing_limit(&cfg));
+
+        cfg.buckets[i].max = 0;
+        cfg.buckets[i].avg = 0;
+        g_assert(!throttle_max_is_missing_limit(&cfg));
+
+        cfg.buckets[i].max = 0;
+        cfg.buckets[i].avg = 100;
+        g_assert(!throttle_max_is_missing_limit(&cfg));
+    }
 }
 
 static void test_have_timer(void)
@@ -591,6 +611,7 @@ int main(int argc, char **argv)
     g_test_add_func("/throttle/config/enabled",     test_enabled);
     g_test_add_func("/throttle/config/conflicting", test_conflicting_config);
     g_test_add_func("/throttle/config/is_valid",    test_is_valid);
+    g_test_add_func("/throttle/config/max",         test_max_is_missing_limit);
     g_test_add_func("/throttle/config_functions",   test_config_functions);
     g_test_add_func("/throttle/accounting",         test_accounting);
     g_test_add_func("/throttle/groups",             test_groups);

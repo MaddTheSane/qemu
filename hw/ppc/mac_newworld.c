@@ -207,7 +207,7 @@ static void ppc_core99_init(MachineState *machine)
 
     /* allocate and load BIOS */
     memory_region_init_ram(bios, NULL, "ppc_core99.bios", BIOS_SIZE,
-                           &error_abort);
+                           &error_fatal);
     vmstate_register_ram_global(bios);
 
     if (bios_name == NULL)
@@ -219,7 +219,7 @@ static void ppc_core99_init(MachineState *machine)
     /* Load OpenBIOS (ELF) */
     if (filename) {
         bios_size = load_elf(filename, NULL, NULL, NULL,
-                             NULL, NULL, 1, ELF_MACHINE, 0);
+                             NULL, NULL, 1, PPC_ELF_MACHINE, 0);
 
         g_free(filename);
     } else {
@@ -242,7 +242,7 @@ static void ppc_core99_init(MachineState *machine)
         kernel_base = KERNEL_LOAD_ADDR;
 
         kernel_size = load_elf(kernel_filename, translate_kernel_address, NULL,
-                               NULL, &lowaddr, NULL, 1, ELF_MACHINE, 0);
+                               NULL, &lowaddr, NULL, 1, PPC_ELF_MACHINE, 0);
         if (kernel_size < 0)
             kernel_size = load_aout(kernel_filename, kernel_base,
                                     ram_size - kernel_base, bswap_needed,
@@ -508,7 +508,6 @@ static void core99_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->name = "mac99";
     mc->desc = "Mac99 based PowerMAC";
     mc->init = ppc_core99_init;
     mc->max_cpus = MAX_CPUS;
@@ -517,7 +516,7 @@ static void core99_machine_class_init(ObjectClass *oc, void *data)
 }
 
 static const TypeInfo core99_machine_info = {
-    .name          = "mac99-machine",
+    .name          = MACHINE_TYPE_NAME("mac99"),
     .parent        = TYPE_MACHINE,
     .class_init    = core99_machine_class_init,
 };

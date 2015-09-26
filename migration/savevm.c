@@ -551,9 +551,7 @@ void unregister_savevm(DeviceState *dev, const char *idstr, void *opaque)
     QTAILQ_FOREACH_SAFE(se, &savevm_state.handlers, entry, new_se) {
         if (strcmp(se->idstr, id) == 0 && se->opaque == opaque) {
             QTAILQ_REMOVE(&savevm_state.handlers, se, entry);
-            if (se->compat) {
-                g_free(se->compat);
-            }
+            g_free(se->compat);
             g_free(se->ops);
             g_free(se);
         }
@@ -612,9 +610,7 @@ void vmstate_unregister(DeviceState *dev, const VMStateDescription *vmsd,
     QTAILQ_FOREACH_SAFE(se, &savevm_state.handlers, entry, new_se) {
         if (se->vmsd == vmsd && se->opaque == opaque) {
             QTAILQ_REMOVE(&savevm_state.handlers, se, entry);
-            if (se->compat) {
-                g_free(se->compat);
-            }
+            g_free(se->compat);
             g_free(se);
         }
     }
@@ -1315,6 +1311,12 @@ void hmp_savevm(Monitor *mon, const QDict *qdict)
     }
 
     saved_vm_running = runstate_is_running();
+
+    ret = global_state_store();
+    if (ret) {
+        monitor_printf(mon, "Error saving global state\n");
+        return;
+    }
     vm_stop(RUN_STATE_SAVE_VM);
 
     memset(sn, 0, sizeof(*sn));
@@ -1388,6 +1390,7 @@ void qmp_xen_save_devices_state(const char *filename, Error **errp)
 
     saved_vm_running = runstate_is_running();
     vm_stop(RUN_STATE_SAVE_VM);
+    global_state_store_running();
 
     f = qemu_fopen(filename, "wb");
     if (!f) {

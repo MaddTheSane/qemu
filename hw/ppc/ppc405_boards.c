@@ -215,7 +215,8 @@ static void ref405ep_init(MachineState *machine)
                         33333333, &pic, kernel_filename == NULL ? 0 : 1);
     /* allocate SRAM */
     sram_size = 512 * 1024;
-    memory_region_init_ram(sram, NULL, "ef405ep.sram", sram_size, &error_abort);
+    memory_region_init_ram(sram, NULL, "ef405ep.sram", sram_size,
+                           &error_fatal);
     vmstate_register_ram_global(sram);
     memory_region_add_subregion(sysmem, 0xFFF00000, sram);
     /* allocate and load BIOS */
@@ -250,7 +251,7 @@ static void ref405ep_init(MachineState *machine)
 #endif
         bios = g_new(MemoryRegion, 1);
         memory_region_init_ram(bios, NULL, "ef405ep.bios", BIOS_SIZE,
-                               &error_abort);
+                               &error_fatal);
         vmstate_register_ram_global(bios);
 
         if (bios_name == NULL)
@@ -368,10 +369,18 @@ static void ref405ep_init(MachineState *machine)
 #endif
 }
 
-static QEMUMachine ref405ep_machine = {
-    .name = "ref405ep",
-    .desc = "ref405ep",
-    .init = ref405ep_init,
+static void ref405ep_class_init(ObjectClass *oc, void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "ref405ep";
+    mc->init = ref405ep_init;
+}
+
+static const TypeInfo ref405ep_type = {
+    .name = MACHINE_TYPE_NAME("ref405ep"),
+    .parent = TYPE_MACHINE,
+    .class_init = ref405ep_class_init,
 };
 
 /*****************************************************************************/
@@ -579,7 +588,7 @@ static void taihu_405ep_init(MachineState *machine)
             bios_name = BIOS_FILENAME;
         bios = g_new(MemoryRegion, 1);
         memory_region_init_ram(bios, NULL, "taihu_405ep.bios", BIOS_SIZE,
-                               &error_abort);
+                               &error_fatal);
         vmstate_register_ram_global(bios);
         filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
         if (filename) {
@@ -664,16 +673,24 @@ static void taihu_405ep_init(MachineState *machine)
 #endif
 }
 
-static QEMUMachine taihu_machine = {
-    .name = "taihu",
-    .desc = "taihu",
-    .init = taihu_405ep_init,
+static void taihu_class_init(ObjectClass *oc, void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "taihu";
+    mc->init = taihu_405ep_init;
+}
+
+static const TypeInfo taihu_type = {
+    .name = MACHINE_TYPE_NAME("taihu"),
+    .parent = TYPE_MACHINE,
+    .class_init = taihu_class_init,
 };
 
 static void ppc405_machine_init(void)
 {
-    qemu_register_machine(&ref405ep_machine);
-    qemu_register_machine(&taihu_machine);
+    type_register_static(&ref405ep_type);
+    type_register_static(&taihu_type);
 }
 
-machine_init(ppc405_machine_init);
+machine_init(ppc405_machine_init)

@@ -21,7 +21,6 @@
 #define CPU_OPENRISC_H
 
 #define TARGET_LONG_BITS 32
-#define ELF_MACHINE    EM_OPENRISC
 
 #define CPUArchState struct CPUOpenRISCState
 
@@ -403,7 +402,7 @@ static inline void cpu_get_tb_cpu_state(CPUOpenRISCState *env,
     *flags = (env->flags & D_FLAG);
 }
 
-static inline int cpu_mmu_index(CPUOpenRISCState *env)
+static inline int cpu_mmu_index(CPUOpenRISCState *env, bool ifetch)
 {
     if (!(env->sr & SR_IME)) {
         return MMU_NOMMU_IDX;

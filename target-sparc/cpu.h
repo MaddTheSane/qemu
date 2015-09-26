@@ -31,12 +31,6 @@
 
 #include "fpu/softfloat.h"
 
-#if !defined(TARGET_SPARC64)
-#define ELF_MACHINE     EM_SPARC
-#else
-#define ELF_MACHINE     EM_SPARCV9
-#endif
-
 /*#define EXCP_INTERRUPT 0x100*/
 
 /* trap definitions */
@@ -642,7 +636,7 @@ static inline int cpu_supervisor_mode(CPUSPARCState *env1)
 }
 #endif
 
-static inline int cpu_mmu_index(CPUSPARCState *env1)
+static inline int cpu_mmu_index(CPUSPARCState *env1, bool ifetch)
 {
 #if defined(CONFIG_USER_ONLY)
     return MMU_USER_IDX;

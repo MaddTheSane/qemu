@@ -5,6 +5,9 @@
 # QAPI common definitions
 { 'include': 'qapi/common.json' }
 
+# QAPI crypto definitions
+{ 'include': 'qapi/crypto.json' }
+
 # QAPI block definitions
 { 'include': 'qapi/block.json' }
 
@@ -14,8 +17,11 @@
 # Tracing commands
 { 'include': 'qapi/trace.json' }
 
+# QAPI introspection
+{ 'include': 'qapi/introspect.json' }
+
 ##
-# LostTickPolicy:
+# @LostTickPolicy:
 #
 # Policy for handling lost ticks in timer devices.
 #
@@ -1632,13 +1638,10 @@
 #        1) A primitive type such as 'u8', 'u16', 'bool', 'str', or 'double'.
 #           These types are mapped to the appropriate JSON type.
 #
-#        2) A legacy type in the form 'legacy<subtype>' where subtype is the
-#           legacy qdev typename.  These types are always treated as strings.
-#
-#        3) A child type in the form 'child<subtype>' where subtype is a qdev
+#        2) A child type in the form 'child<subtype>' where subtype is a qdev
 #           device type name.  Child properties create the composition tree.
 #
-#        4) A link type in the form 'link<subtype>' where subtype is a qdev
+#        3) A link type in the form 'link<subtype>' where subtype is a qdev
 #           device type name.  Link properties form the device model graph.
 #
 # Since: 1.2
@@ -1689,17 +1692,16 @@
 #
 # @property: The property name to read
 #
-# Returns: The property value.  The type depends on the property type.  legacy<>
-#          properties are returned as #str.  child<> and link<> properties are
-#          returns as #str pathnames.  All integer property types (u8, u16, etc)
-#          are returned as #int.
+# Returns: The property value.  The type depends on the property
+#          type. child<> and link<> properties are returned as #str
+#          pathnames.  All integer property types (u8, u16, etc) are
+#          returned as #int.
 #
 # Since: 1.2
 ##
 { 'command': 'qom-get',
   'data': { 'path': 'str', 'property': 'str' },
-  'returns': '**',
-  'gen': false }
+  'returns': 'any' }
 
 ##
 # @qom-set:
@@ -1716,8 +1718,7 @@
 # Since: 1.2
 ##
 { 'command': 'qom-set',
-  'data': { 'path': 'str', 'property': 'str', 'value': '**' },
-  'gen': false }
+  'data': { 'path': 'str', 'property': 'str', 'value': 'any' } }
 
 ##
 # @set_password:
@@ -1950,7 +1951,7 @@
 #
 # Remove a device from a guest
 #
-# @id: the name of the device
+# @id: the name or QOM path of the device
 #
 # Returns: Nothing on success
 #          If @id is not a valid device, DeviceNotFound
@@ -2058,6 +2059,20 @@
   'returns': 'DumpGuestMemoryCapability' }
 
 ##
+# @dump-skeys
+#
+# Dump guest's storage keys
+#
+# @filename: the path to the file to dump to
+#
+# This command is only supported on s390 architecture.
+#
+# Since: 2.5
+##
+{ 'command': 'dump-skeys',
+  'data': { 'filename': 'str' } }
+
+##
 # @netdev_add:
 #
 # Add a network backend.
@@ -2067,11 +2082,12 @@
 #
 # @id: the name of the new network backend
 #
-# @props: #optional a list of properties to be passed to the backend in
-#         the format 'name=value', like 'ifname=tap0,script=no'
+# Additional arguments depend on the type.
 #
-# Notes: The semantics of @props is not well defined.  Future commands will be
-#        introduced that provide stronger typing for backend creation.
+# TODO This command effectively bypasses QAPI completely due to its
+# "additional arguments" business.  It shouldn't have been added to
+# the schema in this form.  It should be qapified properly, or
+# replaced by a properly qapified command.
 #
 # Since: 0.14.0
 #
@@ -2079,8 +2095,8 @@
 #          If @type is not a valid network backend, DeviceNotFound
 ##
 { 'command': 'netdev_add',
-  'data': {'type': 'str', 'id': 'str', '*props': '**'},
-  'gen': false }
+  'data': {'type': 'str', 'id': 'str'},
+  'gen': false }                # so we can get the additional arguments
 
 ##
 # @netdev_del:
@@ -2113,8 +2129,7 @@
 # Since: 2.0
 ##
 { 'command': 'object-add',
-  'data': {'qom-type': 'str', 'id': 'str', '*props': '**'},
-  'gen': false }
+  'data': {'qom-type': 'str', 'id': 'str', '*props': 'any'} }
 
 ##
 # @object-del:
@@ -2467,7 +2482,7 @@
 # @vhostforce: #optional vhost on for non-MSIX virtio guests (default: false).
 #
 # @queues: #optional number of queues to be created for multiqueue vhost-user
-#          (default: 1) (Since 2.4)
+#          (default: 1) (Since 2.5)
 #
 # Since 2.1
 ##
@@ -2475,7 +2490,7 @@
   'data': {
     'chardev':        'str',
     '*vhostforce':    'bool',
-    '*queues':        'uint32' } }
+    '*queues':        'int' } }
 
 ##
 # @NetClientOptions

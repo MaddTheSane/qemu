@@ -865,12 +865,6 @@ static int quorum_open(BlockDriverState *bs, QDict *options, int flags,
     int i;
     int ret = 0;
 
-    if (!qcrypto_hash_supports(QCRYPTO_HASH_ALG_SHA256)) {
-        error_setg(errp,
-                   "SHA256 hash support is required for quorum device");
-        return -EINVAL;
-    }
-
     qdict_flatten(options);
 
     /* count how many different children are present */
@@ -895,6 +889,12 @@ static int quorum_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     s->threshold = qemu_opt_get_number(opts, QUORUM_OPT_VOTE_THRESHOLD, 0);
+    /* and validate it against s->num_children */
+    ret = quorum_valid_threshold(s->threshold, s->num_children, &local_err);
+    if (ret < 0) {
+        goto exit;
+    }
+
     ret = parse_read_pattern(qemu_opt_get(opts, QUORUM_OPT_READ_PATTERN));
     if (ret < 0) {
         error_setg(&local_err, "Please set read-pattern as fifo or quorum");
@@ -903,12 +903,6 @@ static int quorum_open(BlockDriverState *bs, QDict *options, int flags,
     s->read_pattern = ret;
 
     if (s->read_pattern == QUORUM_READ_PATTERN_QUORUM) {
-        /* and validate it against s->num_children */
-        ret = quorum_valid_threshold(s->threshold, s->num_children, &local_err);
-        if (ret < 0) {
-            goto exit;
-        }
-
         /* is the driver in blkverify mode */
         if (qemu_opt_get_bool(opts, QUORUM_OPT_BLKVERIFY, false) &&
             s->num_children == 2 && s->threshold == 2) {
@@ -1061,6 +1055,10 @@ static BlockDriver bdrv_quorum = {
 
 static void bdrv_quorum_init(void)
 {
+    if (!qcrypto_hash_supports(QCRYPTO_HASH_ALG_SHA256)) {
+        /* SHA256 hash support is required for quorum device */
+        return;
+    }
     bdrv_register(&bdrv_quorum);
 }
 

@@ -58,6 +58,8 @@ typedef struct PCIESlot PCIESlot;
 typedef struct PCIExpressDevice PCIExpressDevice;
 typedef struct PCIExpressHost PCIExpressHost;
 typedef struct PCIHostState PCIHostState;
+typedef struct PCMachineState PCMachineState;
+typedef struct PCMachineClass PCMachineClass;
 typedef struct PCMCIACardState PCMCIACardState;
 typedef struct PixelFormat PixelFormat;
 typedef struct PropertyInfo PropertyInfo;
@@ -65,7 +67,9 @@ typedef struct Property Property;
 typedef struct QEMUBH QEMUBH;
 typedef struct QemuConsole QemuConsole;
 typedef struct QEMUFile QEMUFile;
-typedef struct QEMUMachine QEMUMachine;
+typedef struct QemuOpt QemuOpt;
+typedef struct QemuOpts QemuOpts;
+typedef struct QemuOptsList QemuOptsList;
 typedef struct QEMUSGList QEMUSGList;
 typedef struct QEMUSizedBuffer QEMUSizedBuffer;
 typedef struct QEMUTimerListGroup QEMUTimerListGroup;
@@ -78,5 +82,6 @@ typedef struct SSIBus SSIBus;
 typedef struct uWireSlave uWireSlave;
 typedef struct VirtIODevice VirtIODevice;
 typedef struct Visitor Visitor;
+typedef struct MonitorDef MonitorDef;
 
 #endif /* QEMU_TYPEDEFS_H */

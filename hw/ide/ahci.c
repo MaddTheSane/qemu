@@ -25,7 +25,6 @@
 #include <hw/pci/msi.h>
 #include <hw/i386/pc.h>
 #include <hw/pci/pci.h>
-#include <hw/sysbus.h>
 
 #include "qemu/error-report.h"
 #include "sysemu/block-backend.h"
@@ -47,10 +46,9 @@ do { \
 static void check_cmd(AHCIState *s, int port);
 static int handle_cmd(AHCIState *s, int port, uint8_t slot);
 static void ahci_reset_port(AHCIState *s, int port);
-static void ahci_write_fis_d2h(AHCIDevice *ad, uint8_t *cmd_fis);
+static bool ahci_write_fis_d2h(AHCIDevice *ad);
 static void ahci_init_d2h(AHCIDevice *ad);
 static int ahci_dma_prepare_buf(IDEDMA *dma, int32_t limit);
-static void ahci_commit_buf(IDEDMA *dma, uint32_t tx_bytes);
 static bool ahci_map_clb_address(AHCIDevice *ad);
 static bool ahci_map_fis_address(AHCIDevice *ad);
 static void ahci_unmap_clb_address(AHCIDevice *ad);
@@ -122,9 +120,9 @@ static uint32_t  ahci_port_read(AHCIState *s, int port, int offset)
 
 static void ahci_irq_raise(AHCIState *s, AHCIDevice *dev)
 {
-    AHCIPCIState *d = container_of(s, AHCIPCIState, ahci);
-    PCIDevice *pci_dev =
-        (PCIDevice *)object_dynamic_cast(OBJECT(d), TYPE_PCI_DEVICE);
+    DeviceState *dev_state = s->container;
+    PCIDevice *pci_dev = (PCIDevice *) object_dynamic_cast(OBJECT(dev_state),
+                                                           TYPE_PCI_DEVICE);
 
     DPRINTF(0, "raise irq\n");
 
@@ -137,9 +135,9 @@ static void ahci_irq_raise(AHCIState *s, AHCIDevice *dev)
 
 static void ahci_irq_lower(AHCIState *s, AHCIDevice *dev)
 {
-    AHCIPCIState *d = container_of(s, AHCIPCIState, ahci);
-    PCIDevice *pci_dev =
-        (PCIDevice *)object_dynamic_cast(OBJECT(d), TYPE_PCI_DEVICE);
+    DeviceState *dev_state = s->container;
+    PCIDevice *pci_dev = (PCIDevice *) object_dynamic_cast(OBJECT(dev_state),
+                                                           TYPE_PCI_DEVICE);
 
     DPRINTF(0, "lower irq\n");
 
@@ -279,8 +277,13 @@ static void  ahci_port_write(AHCIState *s, int port, int offset, uint32_t val)
             break;
         case PORT_CMD:
             /* Block any Read-only fields from being set;
-             * including LIST_ON and FIS_ON. */
-            pr->cmd = (pr->cmd & PORT_CMD_RO_MASK) | (val & ~PORT_CMD_RO_MASK);
+             * including LIST_ON and FIS_ON.
+             * The spec requires to set ICC bits to zero after the ICC change
+             * is done. We don't support ICC state changes, therefore always
+             * force the ICC bits to zero.
+             */
+            pr->cmd = (pr->cmd & PORT_CMD_RO_MASK) |
+                      (val & ~(PORT_CMD_RO_MASK|PORT_CMD_ICC_MASK));
 
             /* Check FIS RX and CLB engines, allow transition to false: */
             ahci_cond_start_engines(&s->dev[port], true);
@@ -292,7 +295,6 @@ static void  ahci_port_write(AHCIState *s, int port, int offset, uint32_t val)
             if ((pr->cmd & PORT_CMD_FIS_ON) &&
                 !s->dev[port].init_d2h_sent) {
                 ahci_init_d2h(&s->dev[port]);
-                s->dev[port].init_d2h_sent = true;
             }
 
             check_cmd(s, port);
@@ -535,20 +537,33 @@ static void ahci_check_cmd_bh(void *opaque)
 
 static void ahci_init_d2h(AHCIDevice *ad)
 {
-    uint8_t init_fis[20];
     IDEState *ide_state = &ad->port.ifs[0];
+    AHCIPortRegs *pr = &ad->port_regs;
 
-    memset(init_fis, 0, sizeof(init_fis));
-
-    init_fis[4] = 1;
-    init_fis[12] = 1;
-
-    if (ide_state->drive_kind == IDE_CD) {
-        init_fis[5] = ide_state->lcyl;
-        init_fis[6] = ide_state->hcyl;
+    if (ad->init_d2h_sent) {
+        return;
     }
 
-    ahci_write_fis_d2h(ad, init_fis);
+    if (ahci_write_fis_d2h(ad)) {
+        ad->init_d2h_sent = true;
+        /* We're emulating receiving the first Reg H2D Fis from the device;
+         * Update the SIG register, but otherwise proceed as normal. */
+        pr->sig = (ide_state->hcyl << 24) |
+            (ide_state->lcyl << 16) |
+            (ide_state->sector << 8) |
+            (ide_state->nsector & 0xFF);
+    }
+}
+
+static void ahci_set_signature(AHCIDevice *ad, uint32_t sig)
+{
+    IDEState *s = &ad->port.ifs[0];
+    s->hcyl = sig >> 24 & 0xFF;
+    s->lcyl = sig >> 16 & 0xFF;
+    s->sector = sig >> 8 & 0xFF;
+    s->nsector = sig & 0xFF;
+
+    DPRINTF(ad->port_no, "set hcyl:lcyl:sect:nsect = 0x%08x\n", sig);
 }
 
 static void ahci_reset_port(AHCIState *s, int port)
@@ -599,17 +614,11 @@ static void ahci_reset_port(AHCIState *s, int port)
     }
 
     s->dev[port].port_state = STATE_RUN;
-    if (!ide_state->blk) {
-        pr->sig = 0;
-        ide_state->status = SEEK_STAT | WRERR_STAT;
-    } else if (ide_state->drive_kind == IDE_CD) {
-        pr->sig = SATA_SIGNATURE_CDROM;
-        ide_state->lcyl = 0x14;
-        ide_state->hcyl = 0xeb;
-        DPRINTF(port, "set lcyl = %d\n", ide_state->lcyl);
+    if (ide_state->drive_kind == IDE_CD) {
+        ahci_set_signature(d, SATA_SIGNATURE_CDROM);\
         ide_state->status = SEEK_STAT | WRERR_STAT | READY_STAT;
     } else {
-        pr->sig = SATA_SIGNATURE_DISK;
+        ahci_set_signature(d, SATA_SIGNATURE_DISK);
         ide_state->status = SEEK_STAT | WRERR_STAT;
     }
 
@@ -745,7 +754,7 @@ static void ahci_write_fis_pio(AHCIDevice *ad, uint16_t len)
     ahci_trigger_irq(ad->hba, ad, PORT_IRQ_PIOS_FIS);
 }
 
-static void ahci_write_fis_d2h(AHCIDevice *ad, uint8_t *cmd_fis)
+static bool ahci_write_fis_d2h(AHCIDevice *ad)
 {
     AHCIPortRegs *pr = &ad->port_regs;
     uint8_t *d2h_fis;
@@ -753,7 +762,7 @@ static void ahci_write_fis_d2h(AHCIDevice *ad, uint8_t *cmd_fis)
     IDEState *s = &ad->port.ifs[0];
 
     if (!ad->res_fis || !(pr->cmd & PORT_CMD_FIS_RX)) {
-        return;
+        return false;
     }
 
     d2h_fis = &ad->res_fis[RES_FIS_RFIS];
@@ -786,6 +795,7 @@ static void ahci_write_fis_d2h(AHCIDevice *ad, uint8_t *cmd_fis)
     }
 
     ahci_trigger_irq(ad->hba, ad, PORT_IRQ_D2H_REG_FIS);
+    return true;
 }
 
 static int prdt_tbl_entry_size(const AHCI_SG *tbl)
@@ -872,7 +882,7 @@ static int ahci_populate_sglist(AHCIDevice *ad, QEMUSGList *sglist,
                                 limit - sglist->size));
             if (sglist->size > INT32_MAX) {
                 error_report("AHCI Physical Region Descriptor Table describes "
-                             "more than 2 GiB.\n");
+                             "more than 2 GiB.");
                 qemu_sglist_destroy(sglist);
                 r = -1;
                 goto out;
@@ -1285,7 +1295,7 @@ out:
     s->data_ptr = s->data_end;
 
     /* Update number of transferred bytes, destroy sglist */
-    ahci_commit_buf(dma, size);
+    dma_buf_commit(s, size);
 
     s->end_transfer_func(s);
 
@@ -1327,9 +1337,8 @@ static void ahci_restart(IDEDMA *dma)
 }
 
 /**
- * Called in DMA R/W chains to read the PRDT, utilizing ahci_populate_sglist.
- * Not currently invoked by PIO R/W chains,
- * which invoke ahci_populate_sglist via ahci_start_transfer.
+ * Called in DMA and PIO R/W chains to read the PRDT.
+ * Not shared with NCQ pathways.
  */
 static int32_t ahci_dma_prepare_buf(IDEDMA *dma, int32_t limit)
 {
@@ -1348,21 +1357,16 @@ static int32_t ahci_dma_prepare_buf(IDEDMA *dma, int32_t limit)
 }
 
 /**
- * Destroys the scatter-gather list,
- * and updates the command header with a bytes-read value.
- * called explicitly via ahci_dma_rw_buf (ATAPI DMA),
- * and ahci_start_transfer (PIO R/W),
- * and called via callback from ide_dma_cb for DMA R/W paths.
+ * Updates the command header with a bytes-read value.
+ * Called via dma_buf_commit, for both DMA and PIO paths.
+ * sglist destruction is handled within dma_buf_commit.
  */
 static void ahci_commit_buf(IDEDMA *dma, uint32_t tx_bytes)
 {
     AHCIDevice *ad = DO_UPCAST(AHCIDevice, dma, dma);
-    IDEState *s = &ad->port.ifs[0];
 
     tx_bytes += le32_to_cpu(ad->cur_cmd->status);
     ad->cur_cmd->status = cpu_to_le32(tx_bytes);
-
-    qemu_sglist_destroy(&s->sg);
 }
 
 static int ahci_dma_rw_buf(IDEDMA *dma, int is_write)
@@ -1383,10 +1387,9 @@ static int ahci_dma_rw_buf(IDEDMA *dma, int is_write)
     }
 
     /* free sglist, update byte count */
-    ahci_commit_buf(dma, l);
+    dma_buf_commit(s, l);
 
     s->io_buffer_index += l;
-    s->io_buffer_offset += l;
 
     DPRINTF(ad->port_no, "len=%#x\n", l);
 
@@ -1400,7 +1403,7 @@ static void ahci_cmd_done(IDEDMA *dma)
     DPRINTF(ad->port_no, "cmd done\n");
 
     /* update d2h status */
-    ahci_write_fis_d2h(ad, NULL);
+    ahci_write_fis_d2h(ad);
 
     if (!ad->check_bh) {
         /* maybe we still have something to process, check later */
@@ -1432,6 +1435,7 @@ void ahci_init(AHCIState *s, DeviceState *qdev, AddressSpace *as, int ports)
     s->as = as;
     s->ports = ports;
     s->dev = g_new0(AHCIDevice, ports);
+    s->container = qdev;
     ahci_reg_init(s);
     /* XXX BAR size should be 1k, but that breaks, so bump it to 4k for now */
     memory_region_init_io(&s->mem, OBJECT(qdev), &ahci_mem_ops, s,
@@ -1619,18 +1623,6 @@ const VMStateDescription vmstate_ahci = {
         VMSTATE_END_OF_LIST()
     },
 };
-
-#define TYPE_SYSBUS_AHCI "sysbus-ahci"
-#define SYSBUS_AHCI(obj) OBJECT_CHECK(SysbusAHCIState, (obj), TYPE_SYSBUS_AHCI)
-
-typedef struct SysbusAHCIState {
-    /*< private >*/
-    SysBusDevice parent_obj;
-    /*< public >*/
-
-    AHCIState ahci;
-    uint32_t num_ports;
-} SysbusAHCIState;
 
 static const VMStateDescription vmstate_sysbus_ahci = {
     .name = "sysbus-ahci",

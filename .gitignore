@@ -17,7 +17,8 @@
 /trace/generated-tcg-tracers.h
 /trace/generated-ust-provider.h
 /trace/generated-ust.c
-/libcacard/trace/generated-tracers.c
+/ui/shader/texture-blit-frag.h
+/ui/shader/texture-blit-vert.h
 *-timestamp
 /*-softmmu
 /*-darwin-user
@@ -32,6 +33,7 @@
 /qapi-visit.[ch]
 /qapi-event.[ch]
 /qmp-commands.h
+/qmp-introspect.[ch]
 /qmp-marshal.c
 /qemu-doc.html
 /qemu-tech.html
@@ -47,6 +49,7 @@
 /qemu-ga
 /qemu-bridge-helper
 /qemu-monitor.texi
+/qemu-monitor-info.texi
 /qmp-commands.txt
 /vscclient
 /fsdev/virtfs-proxy-helper
@@ -56,6 +59,7 @@
 *.cp
 *.dvi
 *.exe
+*.msi
 *.dll
 *.so
 *.mo

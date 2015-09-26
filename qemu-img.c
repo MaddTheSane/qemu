@@ -338,7 +338,8 @@ static int img_create(int argc, char **argv)
     if (optind < argc) {
         int64_t sval;
         char *end;
-        sval = strtosz_suffix(argv[optind++], &end, STRTOSZ_DEFSUFFIX_B);
+        sval = qemu_strtosz_suffix(argv[optind++], &end,
+                                   QEMU_STRTOSZ_DEFSUFFIX_B);
         if (sval < 0 || *end) {
             if (sval == -ERANGE) {
                 error_report("Image size must be less than 8 EiB!");
@@ -1607,7 +1608,7 @@ static int img_convert(int argc, char **argv)
         {
             int64_t sval;
             char *end;
-            sval = strtosz_suffix(optarg, &end, STRTOSZ_DEFSUFFIX_B);
+            sval = qemu_strtosz_suffix(optarg, &end, QEMU_STRTOSZ_DEFSUFFIX_B);
             if (sval < 0 || *end) {
                 error_report("Invalid minimum zero buffer size for sparse output specified");
                 ret = -1;
@@ -2931,7 +2932,7 @@ static int img_amend(int argc, char **argv)
                 if (!is_valid_option_list(optarg)) {
                     error_report("Invalid option list: %s", optarg);
                     ret = -1;
-                    goto out;
+                    goto out_no_progress;
                 }
                 if (!options) {
                     options = g_strdup(optarg);
@@ -3031,6 +3032,7 @@ static int img_amend(int argc, char **argv)
 out:
     qemu_progress_end();
 
+out_no_progress:
     blk_unref(blk);
     qemu_opts_del(opts);
     qemu_opts_free(create_opts);

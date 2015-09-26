@@ -68,7 +68,7 @@ int main(int argc, char **argv)
 #include "hw/isa/isa.h"
 #include "hw/bt.h"
 #include "sysemu/watchdog.h"
-#include "hw/i386/smbios.h"
+#include "hw/smbios/smbios.h"
 #include "hw/xen/xen.h"
 #include "hw/qdev.h"
 #include "hw/loader.h"
@@ -534,10 +534,8 @@ const char *qemu_get_vm_name(void)
 
 static void res_free(void)
 {
-    if (boot_splash_filedata != NULL) {
-        g_free(boot_splash_filedata);
-        boot_splash_filedata = NULL;
-    }
+    g_free(boot_splash_filedata);
+    boot_splash_filedata = NULL;
 }
 
 static int default_driver_check(void *opaque, QemuOpts *opts, Error **errp)
@@ -1338,6 +1336,13 @@ static inline void semihosting_arg_fallback(const char *file, const char *cmd)
     }
 }
 
+/* Now we still need this for compatibility with XEN. */
+bool has_igd_gfx_passthru;
+static void igd_gfx_passthru(void)
+{
+    has_igd_gfx_passthru = current_machine->igd_gfx_passthru;
+}
+
 /***********************************************************/
 /* USB devices */
 
@@ -1423,43 +1428,6 @@ void hmp_usb_del(Monitor *mon, const QDict *qdict)
 /* machine registration */
 
 MachineState *current_machine;
-
-/*
- * Transitional class registration/init used for converting from
- * legacy QEMUMachine to MachineClass.
- */
-static void qemu_machine_class_init(ObjectClass *oc, void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
-    QEMUMachine *qm = data;
-    mc->name = qm->name;
-    mc->desc = qm->desc;
-    mc->init = qm->init;
-    mc->kvm_type = qm->kvm_type;
-    mc->block_default_type = qm->block_default_type;
-    mc->max_cpus = qm->max_cpus;
-    mc->no_sdcard = qm->no_sdcard;
-    mc->has_dynamic_sysbus = qm->has_dynamic_sysbus;
-    mc->is_default = qm->is_default;
-    mc->default_machine_opts = qm->default_machine_opts;
-    mc->default_boot_order = qm->default_boot_order;
-}
-
-int qemu_register_machine(QEMUMachine *m)
-{
-    char *name = g_strconcat(m->name, TYPE_MACHINE_SUFFIX, NULL);
-    TypeInfo ti = {
-        .name       = name,
-        .parent     = TYPE_MACHINE,
-        .class_init = qemu_machine_class_init,
-        .class_data = (void *)m,
-    };
-
-    type_register(&ti);
-    g_free(name);
-
-    return 0;
-}
 
 static MachineClass *find_machine(const char *name)
 {
@@ -1738,6 +1706,15 @@ void qemu_system_reset(bool report)
         qapi_event_send_reset(&error_abort);
     }
     cpu_synchronize_all_post_reset();
+}
+
+void qemu_system_guest_panicked(void)
+{
+    if (current_cpu) {
+        current_cpu->crash_occurred = true;
+    }
+    qapi_event_send_guest_panicked(GUEST_PANIC_ACTION_PAUSE, &error_abort);
+    vm_stop(RUN_STATE_GUEST_PANICKED);
 }
 
 void qemu_system_reset_request(void)
@@ -2061,7 +2038,6 @@ static void select_vgahw (const char *p)
 
 static DisplayType select_display(const char *p)
 {
-    Error *err = NULL;
     const char *opts;
     DisplayType display = DT_DEFAULT;
 
@@ -2130,6 +2106,7 @@ static DisplayType select_display(const char *p)
     } else if (strstart(p, "vnc", &opts)) {
 #ifdef CONFIG_VNC
         if (*opts == '=') {
+            Error *err = NULL;
             if (vnc_parse(opts + 1, &err) == NULL) {
                 error_report_err(err);
                 exit(1);
@@ -4528,6 +4505,9 @@ int main(int argc, char **argv, char **envp)
             exit(1);
     }
 
+    /* Check if IGD GFX passthrough. */
+    igd_gfx_passthru();
+
     /* init generic devices */
     if (qemu_opts_foreach(qemu_find_opts("device"),
                           device_init_func, NULL, NULL)) {
@@ -4615,6 +4595,7 @@ int main(int argc, char **argv, char **envp)
     }
 
     qemu_system_reset(VMRESET_SILENT);
+    register_global_state();
     if (loadvm) {
         if (load_vmstate(loadvm) < 0) {
             autostart = 0;
@@ -4628,7 +4609,6 @@ int main(int argc, char **argv, char **envp)
         return 0;
     }
 
-    register_global_state();
     if (incoming) {
         Error *local_err = NULL;
         qemu_start_incoming_migration(incoming, &local_err);

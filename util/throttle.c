@@ -36,7 +36,7 @@ void throttle_leak_bucket(LeakyBucket *bkt, int64_t delta_ns)
     double leak;
 
     /* compute how much to leak */
-    leak = (bkt->avg * (double) delta_ns) / NSEC_PER_SEC;
+    leak = (bkt->avg * (double) delta_ns) / NANOSECONDS_PER_SECOND;
 
     /* make the bucket leak */
     bkt->level = MAX(bkt->level - leak, 0);
@@ -72,7 +72,7 @@ static void throttle_do_leak(ThrottleState *ts, int64_t now)
  */
 static int64_t throttle_do_compute_wait(double limit, double extra)
 {
-    double wait = extra * NSEC_PER_SEC;
+    double wait = extra * NANOSECONDS_PER_SECOND;
     wait /= limit;
     return wait;
 }
@@ -298,6 +298,21 @@ bool throttle_is_valid(ThrottleConfig *cfg)
     }
 
     return !invalid;
+}
+
+/* check if bps_max/iops_max is used without bps/iops
+ * @cfg: the throttling configuration to inspect
+ */
+bool throttle_max_is_missing_limit(ThrottleConfig *cfg)
+{
+    int i;
+
+    for (i = 0; i < BUCKETS_COUNT; i++) {
+        if (cfg->buckets[i].max && !cfg->buckets[i].avg) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* fix bucket parameters */
