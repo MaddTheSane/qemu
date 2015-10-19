@@ -1,6 +1,7 @@
 .DS_Store
 config-host.*
 dyngen
+*.dSYM
 i386
 *-softmmu
 *-darwin-user
