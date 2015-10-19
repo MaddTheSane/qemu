@@ -64,11 +64,7 @@ register unsigned long T2 asm(AREG3);
 #define FT1 (env->ft1)
 #define FT2 (env->ft2)
 
-#if defined (DEBUG_OP)
-# define RETURN() __asm__ __volatile__("nop" : : : "memory");
-#else
-# define RETURN() __asm__ __volatile__("" : : : "memory");
-#endif
+#define RETURN() FORCE_RET()
 
 static always_inline target_ulong rotl8 (target_ulong i, int n)
 {
