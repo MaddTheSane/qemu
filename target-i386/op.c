@@ -1581,6 +1581,7 @@ void OPPROTO op_clc(void)
     eflags = cc_table[CC_OP].compute_all();
     eflags &= ~CC_C;
     CC_SRC = eflags;
+    FORCE_RET();
 }
 
 void OPPROTO op_stc(void)
@@ -1597,6 +1598,7 @@ void OPPROTO op_cmc(void)
     eflags = cc_table[CC_OP].compute_all();
     eflags ^= CC_C;
     CC_SRC = eflags;
+    FORCE_RET();
 }
 
 void OPPROTO op_salc(void)
