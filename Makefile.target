@@ -82,6 +82,10 @@ endif
 else
 QEMU_SYSTEM=qemu-fast
 endif
+ifeq ($(TARGET_ARCH), x86_64)
+# XXX globally save %ebx, %esi, %edi on entry to generated function
+OP_CFLAGS+= -fcall-used-ebx -fcall-used-esi -fcall-used-edi
+endif
 
 ifdef CONFIG_USER_ONLY
 PROGS=$(QEMU_USER)
