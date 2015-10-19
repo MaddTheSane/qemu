@@ -62,7 +62,7 @@ typedef struct QCommand
 
 
 
-@protocol QDistributedObjectServerProto
+@protocol QDistributedObjectServerProto <NSObject>
 - (BOOL) qemuRegister:(id)sender;
 - (BOOL) qemuUnRegister:(id)sender;
 - (BOOL) sendMessage:(NSData*)data;
@@ -78,7 +78,7 @@ typedef struct QCommand
 @interface QDistributedObject : NSObject <QDistributedObjectServerProto> {
     id document;
 }
-- (id) initWithSender:(id)sender;
+- (instancetype) initWithSender:(id)sender;
 - (BOOL) qemuRegister:(id)sender;
 - (BOOL) qemuUnRegister:(id)sender;
 - (BOOL) sendMessage:(NSData*)data;
@@ -455,11 +455,11 @@ Q_DEBUG("qemu_cocoa: cocoa_display_init");
 */
 
 /* to be implemented by qemu */
-@protocol QDistributedObjectClientProto
+@protocol QDistributedObjectClientProto <NSObject>
 - (void) do_test:(int)test;
 @end
 
-@interface QemuCocoaAppController : NSObject <QDistributedObjectClientProto>
+@interface QemuCocoaAppController : NSObject <QDistributedObjectClientProto, NSApplicationDelegate>
 {
 }
 - (void)applicationDidFinishLaunching: (NSNotification *) note;
@@ -546,7 +546,7 @@ int main (int argc, const char * argv[]) {
         gArgc = argc;
         gArgv = argv;
 
-        NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+        @autoreleasepool {
         [NSApplication sharedApplication];
 
         QemuCocoaAppController *appController = [[QemuCocoaAppController alloc] init];
@@ -556,7 +556,7 @@ int main (int argc, const char * argv[]) {
         [NSApp run];
 
         [appController release];
-        [pool release];
+        }
 
     }
 
