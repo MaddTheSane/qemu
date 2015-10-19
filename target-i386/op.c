@@ -21,19 +21,69 @@
 #define ASM_SOFTMMU
 #include "exec.h"
 
-#if defined(__APPLE__)
-/* XXX avoid indirect symbols, correct address patched at code generation time.  */
-static const uint8_t parity_table[256];
-static const uint8_t rclw_table[32];
-static const uint8_t rclb_table[32];
-static const CPU86_LDouble f15rk[7];
-#else
-extern const uint8_t parity_table[256];
-extern const uint8_t rclw_table[32];
-extern const uint8_t rclb_table[32];
-extern const CPU86_LDouble f15rk[7];
-#endif
+const uint8_t parity_table[256] = {
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    CC_P, 0, 0, CC_P, 0, CC_P, CC_P, 0,
+    0, CC_P, CC_P, 0, CC_P, 0, 0, CC_P,
+};
 
+/* modulo 17 table */
+const uint8_t rclw_table[32] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 
+    8, 9,10,11,12,13,14,15,
+   16, 0, 1, 2, 3, 4, 5, 6,
+    7, 8, 9,10,11,12,13,14,
+};
+
+/* modulo 9 table */
+const uint8_t rclb_table[32] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 
+    8, 0, 1, 2, 3, 4, 5, 6,
+    7, 8, 0, 1, 2, 3, 4, 5, 
+    6, 7, 8, 0, 1, 2, 3, 4,
+};
+
+const CPU86_LDouble f15rk[7] =
+{
+    0.00000000000000000000L,
+    1.00000000000000000000L,
+    3.14159265358979323851L,  /*pi*/
+    0.30102999566398119523L,  /*lg2*/
+    0.69314718055994530943L,  /*ln2*/
+    1.44269504088896340739L,  /*l2e*/
+    3.32192809488736234781L,  /*l2t*/
+};
+
+    
 /* n must be a constant to be efficient */
 static inline target_long lshift(target_long x, int n)
 {
