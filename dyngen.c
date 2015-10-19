@@ -1445,6 +1445,9 @@ int arm_emit_ldr_info(const char *name, unsigned long start_offset,
 #define FLAG_TARGET   (1 << 3)
 /* This is a magic instruction that needs fixing up.  */
 #define FLAG_EXIT     (1 << 4)
+/* This instruction clobbers the stack pointer.  */
+/* XXX only supports push, pop, add/sub $imm,%esp  */
+#define FLAG_STACK    (1 << 5)
 #define MAX_EXITS     5
 
 static void
@@ -1485,6 +1488,7 @@ trace_i386_insn (const char *name, uint8_t *start_p, char *flags, int insn,
     int is_jmp;
     int is_exit;
     int is_pcrel;
+    int is_stack;
     int immed;
     int seen_rexw;
     int32_t disp;
@@ -1507,6 +1511,7 @@ trace_i386_insn (const char *name, uint8_t *start_p, char *flags, int insn,
     is_exit = 0;
     seen_rexw = 0;
     is_pcrel = 0;
+    is_stack = 0;
 
     while (is_prefix) {
         op = ptr[insn_size];
@@ -1553,6 +1558,7 @@ trace_i386_insn (const char *name, uint8_t *start_p, char *flags, int insn,
                     switch (op & 0x7) {
                     case 0: /* push fs/gs */
                     case 1: /* pop fs/gs */
+                        is_stack = 1;
                     case 2: /* cpuid/rsm */
                         modrm = 0;
                         break;
@@ -1625,6 +1631,7 @@ trace_i386_insn (const char *name, uint8_t *start_p, char *flags, int insn,
 #endif
         case 5: /* push/pop general register.  */
             modrm = 0;
+            is_stack = 1;
             break;
 
         case 6:
@@ -1632,6 +1639,7 @@ trace_i386_insn (const char *name, uint8_t *start_p, char *flags, int insn,
             case 0: /* pusha */
             case 1: /* popa */
                 modrm = 0;
+                is_stack = 1;
                 break;
             case 2: /* bound */
             case 3: /* arpl */
@@ -1651,10 +1659,12 @@ trace_i386_insn (const char *name, uint8_t *start_p, char *flags, int insn,
             case 8: /* push immediate */
                 immed = op_size;
                 modrm = 0;
+                is_stack = 1;
                 break;
             case 10: /* push 8-bit immediate */
                 immed = 1;
                 modrm = 0;
+                is_stack = 1;
                 break;
             case 9: /* imul immediate */
                 immed = op_size;
@@ -1684,8 +1694,22 @@ trace_i386_insn (const char *name, uint8_t *start_p, char *flags, int insn,
                     immed = op_size;
                 else
                     immed = 1;
+                if (op == 0x81 || op == 0x83) {
+                    /* add, sub */
+                    op = ptr[insn_size];
+                    switch ((op >> 3) & 7) {
+                    case 0:
+                    case 5:
+                        is_stack = (op & 7) == 4;
+                        break;
+                    }
+                }
             }
-            /* else test, xchg, mov, lea or pop general.  */
+            else if ((op & 0xf) == 0xf) {
+                /* pop general.  */
+                is_stack = 1;
+            }
+            /* else test, xchg, mov, lea.  */
             break;
 
         case 9:
@@ -1935,6 +1959,9 @@ trace_i386_insn (const char *name, uint8_t *start_p, char *flags, int insn,
     if (is_exit)
       flags[insn] |= FLAG_EXIT;
 
+    if (is_stack)
+      flags[insn] |= FLAG_STACK;
+
     if (!(is_jmp || is_ret || is_exit))
       flags[insn + insn_size] |= FLAG_INSN;
 }
@@ -1955,6 +1982,7 @@ static int trace_i386_op(const char * name, uint8_t *start_p, int *plen,
     int num_exits;
     int len;
     int last_insn;
+    int stack_clobbered;
 
     len = *plen;
     flags = malloc(len + 1);
@@ -1978,6 +2006,7 @@ static int trace_i386_op(const char * name, uint8_t *start_p, int *plen,
     retpos = -1;
     num_exits = 0;
     last_insn = 0;
+    stack_clobbered = 0;
     for (insn = 0; insn < len; insn++) {
         if (flags[insn] & FLAG_RET) {
             /* ??? In theory it should be possible to handle multiple return
@@ -1987,6 +2016,8 @@ static int trace_i386_op(const char * name, uint8_t *start_p, int *plen,
             retpos = insn;
         }
         if (flags[insn] & FLAG_EXIT) {
+            if (stack_clobbered)
+                error("Stack clobbered in %s", name);
             if (num_exits == MAX_EXITS)
                 error("Too many block exits in %s", name);
             exit_addrs[num_exits] = insn;
@@ -1994,6 +2025,8 @@ static int trace_i386_op(const char * name, uint8_t *start_p, int *plen,
         }
         if (flags[insn] & FLAG_INSN)
             last_insn = insn;
+        if (flags[insn] & FLAG_STACK)
+            stack_clobbered = 1;
     }
 
     exit_addrs[num_exits] = -1;
