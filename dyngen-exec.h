@@ -261,8 +261,15 @@ extern int __op_jmp0, __op_jmp1, __op_jmp2, __op_jmp3;
 #define EXIT_TB() asm volatile ("hlt")
 /* Dyngen will replace cli with 0x9e (jmp). 
    We generate the offset manually.  */
+#if defined(__APPLE__)
+/* XXX Different relocations are generated for MacOS X for Intel
+   (please as from cctools).  */
+#define GOTO_LABEL_PARAM(n) \
+  asm volatile ("cli;.long " ASM_NAME(__op_gen_label) #n)
+#else
 #define GOTO_LABEL_PARAM(n) \
   asm volatile ("cli;.long " ASM_NAME(__op_gen_label) #n " - 1f;1:")
+#endif
 #elif defined(__x86_64__)
 /* The same as i386.  */
 #define EXIT_TB() asm volatile ("hlt")

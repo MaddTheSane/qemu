@@ -466,8 +466,6 @@ static inline void helper_fstt(CPU86_LDouble f, target_ulong ptr)
 
 #define FPUC_EM 0x3f
 
-extern const CPU86_LDouble f15rk[7];
-
 void helper_fldt_ST0_A0(void);
 void helper_fstt_ST0_A0(void);
 void fpu_raise_exception(void);
@@ -512,10 +510,6 @@ void helper_clgi(void);
 void helper_skinit(void);
 void helper_invlpga(void);
 void vmexit(uint64_t exit_code, uint64_t exit_info_1);
-
-extern const uint8_t parity_table[256];
-extern const uint8_t rclw_table[32];
-extern const uint8_t rclb_table[32];
 
 static inline uint32_t compute_eflags(void)
 {

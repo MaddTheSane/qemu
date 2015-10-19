@@ -21,6 +21,19 @@
 #define ASM_SOFTMMU
 #include "exec.h"
 
+#if defined(__APPLE__)
+/* XXX avoid indirect symbols, correct address patched at code generation time.  */
+static const uint8_t parity_table[256];
+static const uint8_t rclw_table[32];
+static const uint8_t rclb_table[32];
+static const CPU86_LDouble f15rk[7];
+#else
+extern const uint8_t parity_table[256];
+extern const uint8_t rclw_table[32];
+extern const uint8_t rclb_table[32];
+extern const CPU86_LDouble f15rk[7];
+#endif
+
 /* n must be a constant to be efficient */
 static inline target_long lshift(target_long x, int n)
 {

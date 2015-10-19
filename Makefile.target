@@ -38,6 +38,9 @@ CPPFLAGS+=-I$(SRC_PATH)/linux-user -I$(SRC_PATH)/linux-user/$(TARGET_ABI_DIR)
 endif
 BASE_CFLAGS=
 BASE_LDFLAGS=
+ifeq ($(CONFIG_DARWIN),yes)
+CFLAGS+=-mdynamic-no-pic
+endif
 #CFLAGS+=-Werror
 LIBS=
 HELPER_CFLAGS=$(CFLAGS)

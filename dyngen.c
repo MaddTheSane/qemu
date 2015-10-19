@@ -199,6 +199,20 @@ typedef struct coff_rel {
 #include <mach-o/reloc.h>
 #include <mach-o/ppc/reloc.h>
 
+#ifdef HOST_PPC
+
+#define MACH_CPU_TYPE CPU_TYPE_POWERPC
+#define mach_check_cputype(x) ((x) == CPU_TYPE_POWERPC)
+
+#elif defined(HOST_I386)
+
+#define MACH_CPU_TYPE CPU_TYPE_I386
+#define mach_check_cputype(x) ((x) == CPU_TYPE_I386)
+
+#else
+#error unsupported CPU - please update the code
+#endif
+
 # define check_mach_header(x) (x.magic == MH_MAGIC)
 typedef int32_t host_long;
 typedef uint32_t host_ulong;
@@ -955,22 +969,23 @@ static const char * find_reloc_name_in_sec_ptr(int address, struct section * sec
 {
     unsigned int tocindex, symindex, size;
     const char *name = 0;
+	int section_type;
 
     /* Sanity check */
     if(!( address >= sec_hdr->addr && address < (sec_hdr->addr + sec_hdr->size) ) )
         return (char*)0;
 
-	if( sec_hdr->flags & S_SYMBOL_STUBS ){
+	section_type = sec_hdr->flags & SECTION_TYPE;
+	if( section_type == S_SYMBOL_STUBS ){
 		size = sec_hdr->reserved2;
 		if(size == 0)
 		    error("size = 0");
-
 	}
-	else if( sec_hdr->flags & S_LAZY_SYMBOL_POINTERS ||
-	            sec_hdr->flags & S_NON_LAZY_SYMBOL_POINTERS)
+	else if( section_type == S_LAZY_SYMBOL_POINTERS ||
+			 section_type == S_NON_LAZY_SYMBOL_POINTERS)
 		size = sizeof(unsigned long);
 	else
-		return 0;
+		return NULL;
 
     /* Compute our index in toc */
 	tocindex = (address - sec_hdr->addr)/size;
@@ -1004,8 +1019,27 @@ static const char * get_reloc_name(EXE_RELOC * rel, int * sslide)
 	/* init the slide value */
 	*sslide = 0;
 
-	if(R_SCATTERED & rel->r_address)
-		return (char *)find_reloc_name_given_its_address(sca_rel->r_value);
+	if (R_SCATTERED & rel->r_address) {
+        char *name = (char *)find_reloc_name_given_its_address(sca_rel->r_value);
+
+        /* search it in the full symbol list, if not found */
+        if (!name) {
+            int i;
+            for (i = 0; i < nb_syms; i++) {
+                EXE_SYM *sym = &symtab[i];
+                if (sym->st_value == sca_rel->r_value) {
+                    name = get_sym_name(sym);
+                    switch (sca_rel->r_type) {
+                    case GENERIC_RELOC_VANILLA:
+                        *sslide = *(uint32_t *)(text + sca_rel->r_address) - sca_rel->r_value;
+                        break;
+                    }
+                    break;
+                }
+            }
+        }
+        return name;
+    }
 
 	if(rel->r_extern)
 	{
@@ -1037,14 +1071,21 @@ static const char * get_reloc_name(EXE_RELOC * rel, int * sslide)
 			sectoffset = ( *(uint32_t *)(text + rel->r_address) & 0x03fffffc );
 			if (sectoffset & 0x02000000) sectoffset |= 0xfc000000;
 			break;
+        case GENERIC_RELOC_VANILLA:
+            sectoffset  = *(uint32_t *)(text + rel->r_address);
+            break;
 		default:
-			error("switch(rel->type) not found");
+			error("switch(rel->type=%d) not found", rel->r_type);
 	}
 
-	if(rel->r_pcrel)
+	if(rel->r_pcrel) {
 		sectoffset += rel->r_address;
+#ifdef HOST_I386
+        sectoffset += (1 << rel->r_length);
+#endif
+    }
 
-	if (rel->r_type == PPC_RELOC_BR24)
+	if (rel->r_type == PPC_RELOC_BR24 || rel->r_pcrel)
 		name = (char *)find_reloc_name_in_sec_ptr((int)sectoffset, &section_hdr[sectnum-1]);
 
 	/* search it in the full symbol list, if not found */
@@ -1096,7 +1137,7 @@ int load_object(const char *filename)
         error("bad Mach header");
     }
 
-    if (mach_hdr.cputype != CPU_TYPE_POWERPC)
+    if (!mach_check_cputype(mach_hdr.cputype))
         error("Unsupported CPU");
 
     if (mach_hdr.filetype != MH_OBJECT)
@@ -2509,6 +2550,82 @@ void gen_code(const char *name, host_ulong offset, host_ulong size,
         /* patch relocations */
 #if defined(HOST_I386)
             {
+#ifdef CONFIG_FORMAT_MACH
+                struct scattered_relocation_info *scarel;
+                struct relocation_info * rel;
+				char final_sym_name[256];
+				const char *sym_name;
+				const char *p;
+				int slide, sslide;
+				int i;
+	
+				for (i = 0, rel = relocs; i < nb_relocs; i++, rel++) {
+					unsigned int offset, length, value = 0;
+					unsigned int type, pcrel, isym = 0;
+					unsigned int usesym = 0;
+				
+					if (R_SCATTERED & rel->r_address) {
+						scarel = (struct scattered_relocation_info*)rel;
+						offset = (unsigned int)scarel->r_address;
+						length = scarel->r_length;
+						pcrel = scarel->r_pcrel;
+						type = scarel->r_type;
+						value = scarel->r_value;
+					}
+                    else {
+						value = isym = rel->r_symbolnum;
+						usesym = (rel->r_extern);
+						offset = rel->r_address;
+						length = rel->r_length;
+						pcrel = rel->r_pcrel;
+						type = rel->r_type;
+					}
+				
+					slide = offset - start_offset;
+		
+					if (!(offset >= start_offset && offset < start_offset + size)) 
+						continue;  /* not in our range */
+
+					sym_name = get_reloc_name(rel, &sslide);
+					
+					if (usesym && symtab[isym].n_type & N_STAB)
+						continue; /* don't handle STAB (debug sym) */
+					
+					if (sym_name && strstart(sym_name, "__op_jmp", &p)) {
+						int n;
+						n = strtol(p, NULL, 10);
+						fprintf(outfile, "    jmp_offsets[%d] = %d + (gen_code_ptr - gen_code_buf);\n", n, slide);
+						continue; /* Nothing more to do */
+					}
+					
+					if (!sym_name) {
+						fprintf(outfile, "/* #warning relocation not handled in %s (value 0x%x, %s, offset 0x%x, length 0x%x, %s, type 0x%x) */\n",
+                                name, value, usesym ? "use sym" : "don't use sym", offset, length, pcrel ? "pcrel":"", type);
+						continue; /* dunno how to handle without final_sym_name */
+					}
+
+                    get_reloc_expr(final_sym_name, sizeof(final_sym_name),
+                                   sym_name);
+
+                    if (length != 2)
+                        error("unsupported %d-bit relocation", 8 * (1 << length));
+
+					switch (type) {
+					case GENERIC_RELOC_VANILLA:
+                        if (pcrel || strstart(sym_name,"__op_gen_label",&p)) {
+                            fprintf(outfile, "    *(uint32_t *)(gen_code_ptr + %d) = %s - (long)(gen_code_ptr + %d) - 4;\n",
+                                    slide, final_sym_name, slide);
+                        }
+                        else {
+                            fprintf(outfile, "    *(uint32_t *)(gen_code_ptr + %d) = (%s + %d);\n", 
+                                    slide, final_sym_name, sslide);
+                        }
+                        break;
+                    default:
+                        error("unsupported i386 relocation (%d)", type);
+                    }
+                }
+#else
                 char relname[256];
                 int type;
                 int addend;
@@ -2580,6 +2697,7 @@ void gen_code(const char *name, host_ulong offset, host_ulong size,
 #endif
                 }
                }
+#endif
                 /* Replace the marker instructions with the actual opcodes.  */
                 for (i = 0; exit_addrs[i] != -1; i++) {
                     int op;
