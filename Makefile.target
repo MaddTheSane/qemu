@@ -121,7 +121,7 @@ OP_CFLAGS+=$(call cc-option, -fno-section-anchors, "")
 
 ifeq ($(ARCH),i386)
 HELPER_CFLAGS+=-fomit-frame-pointer
-OP_CFLAGS+=-mpreferred-stack-boundary=2 -fomit-frame-pointer
+OP_CFLAGS+=-fomit-frame-pointer
 ifdef TARGET_GPROF
 USE_I386_LD=y
 endif
