@@ -500,6 +500,7 @@ int bdrv_commit(BlockDriverState *bs)
 int bdrv_read(BlockDriverState *bs, int64_t sector_num,
               uint8_t *buf, int nb_sectors)
 {
+    bs->activityLED = 1;
     BlockDriver *drv = bs->drv;
 
     if (!drv)
@@ -540,6 +541,7 @@ int bdrv_read(BlockDriverState *bs, int64_t sector_num,
 int bdrv_write(BlockDriverState *bs, int64_t sector_num,
                const uint8_t *buf, int nb_sectors)
 {
+    bs->activityLED = 1;
     BlockDriver *drv = bs->drv;
     if (!bs->drv)
         return -ENOMEDIUM;
@@ -1092,6 +1094,7 @@ BlockDriverAIOCB *bdrv_aio_read(BlockDriverState *bs, int64_t sector_num,
                                 uint8_t *buf, int nb_sectors,
                                 BlockDriverCompletionFunc *cb, void *opaque)
 {
+    bs->activityLED = 1;
     BlockDriver *drv = bs->drv;
     BlockDriverAIOCB *ret;
 
@@ -1121,6 +1124,7 @@ BlockDriverAIOCB *bdrv_aio_write(BlockDriverState *bs, int64_t sector_num,
                                  const uint8_t *buf, int nb_sectors,
                                  BlockDriverCompletionFunc *cb, void *opaque)
 {
+    bs->activityLED = 1;
     BlockDriver *drv = bs->drv;
     BlockDriverAIOCB *ret;
 
