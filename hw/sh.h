@@ -4,6 +4,9 @@
 
 #include "sh_intc.h"
 
+#define A7ADDR(x) ((x) & 0x1fffffff)
+#define P4ADDR(x) ((x) | 0xe0000000)
+
 /* sh7750.c */
 struct SH7750State;
 
@@ -28,16 +31,24 @@ int sh7750_register_io_device(struct SH7750State *s,
 #define TMU012_FEAT_3CHAN  (1 << 1)
 #define TMU012_FEAT_EXTCLK (1 << 2)
 void tmu012_init(target_phys_addr_t base, int feat, uint32_t freq,
-		 struct intc_source *ch0_irq, struct intc_source *ch1_irq,
-		 struct intc_source *ch2_irq0, struct intc_source *ch2_irq1);
+		 qemu_irq ch0_irq, qemu_irq ch1_irq,
+		 qemu_irq ch2_irq0, qemu_irq ch2_irq1);
 
 
 /* sh_serial.c */
 #define SH_SERIAL_FEAT_SCIF (1 << 0)
 void sh_serial_init (target_phys_addr_t base, int feat,
-		     uint32_t freq, CharDriverState *chr);
+		     uint32_t freq, CharDriverState *chr,
+		     qemu_irq eri_source,
+		     qemu_irq rxi_source,
+		     qemu_irq txi_source,
+		     qemu_irq tei_source,
+		     qemu_irq bri_source);
+
+/* sh7750.c */
+qemu_irq sh7750_irl(struct SH7750State *s);
 
 /* tc58128.c */
-int tc58128_init(struct SH7750State *s, char *zone1, char *zone2);
+int tc58128_init(struct SH7750State *s, const char *zone1, const char *zone2);
 
 #endif

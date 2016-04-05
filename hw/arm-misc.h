@@ -27,18 +27,20 @@ struct arm_boot_info {
     const char *kernel_cmdline;
     const char *initrd_filename;
     target_phys_addr_t loader_start;
+    target_phys_addr_t smp_loader_start;
+    target_phys_addr_t smp_priv_base;
     int nb_cpus;
     int board_id;
     int (*atag_board)(struct arm_boot_info *info, void *p);
+    /* Used internally by arm_boot.c */
+    int is_linux;
+    target_phys_addr_t initrd_size;
+    target_phys_addr_t entry;
 };
 void arm_load_kernel(CPUState *env, struct arm_boot_info *info);
 
-/* armv7m_nvic.c */
-int system_clock_scale;
-qemu_irq *armv7m_nvic_init(CPUState *env);
-
-/* stellaris_enent.c */
-void stellaris_enet_init(NICInfo *nd, uint32_t base, qemu_irq irq);
+/* Multiplication factor to convert from system clock ticks to qemu timer
+   ticks.  */
+extern int system_clock_scale;
 
 #endif /* !ARM_MISC_H */
-

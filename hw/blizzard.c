@@ -14,10 +14,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
- * MA 02111-1307 USA
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "qemu-common.h"
@@ -29,7 +27,7 @@
 
 typedef void (*blizzard_fn_t)(uint8_t *, const uint8_t *, unsigned int);
 
-struct blizzard_s {
+typedef struct {
     uint8_t reg;
     uint32_t addr;
     int swallow;
@@ -121,7 +119,7 @@ struct blizzard_s {
         int pitch;
         blizzard_fn_t line_fn;
     } data;
-};
+} BlizzardState;
 
 /* Bytes(!) per pixel */
 static const int blizzard_iformat_bpp[0x10] = {
@@ -145,7 +143,7 @@ static inline void blizzard_rgb2yuv(int r, int g, int b,
     *v = 0x80 + ((0xe0e * r - 0x0bc7 * g - 0x247 * b) >> 13);
 }
 
-static void blizzard_window(struct blizzard_s *s)
+static void blizzard_window(BlizzardState *s)
 {
     uint8_t *src, *dst;
     int bypp[2];
@@ -165,7 +163,7 @@ static void blizzard_window(struct blizzard_s *s)
         s->my[1] = s->data.y + s->data.dy;
 
     bypp[0] = s->bpp;
-    bypp[1] = (s->state->depth + 7) >> 3;
+    bypp[1] = (ds_get_bits_per_pixel(s->state) + 7) >> 3;
     bypl[0] = bypp[0] * s->data.pitch;
     bypl[1] = bypp[1] * s->x;
     bypl[2] = bypp[0] * s->data.dx;
@@ -176,7 +174,7 @@ static void blizzard_window(struct blizzard_s *s)
         fn(dst, src, bypl[2]);
 }
 
-static int blizzard_transfer_setup(struct blizzard_s *s)
+static int blizzard_transfer_setup(BlizzardState *s)
 {
     if (s->source > 3 || !s->bpp ||
                     s->ix[1] < s->ix[0] || s->iy[1] < s->iy[0])
@@ -191,7 +189,7 @@ static int blizzard_transfer_setup(struct blizzard_s *s)
     s->data.len = s->bpp * s->data.dx * s->data.dy;
     s->data.pitch = s->data.dx;
     if (s->data.len > s->data.buflen) {
-        s->data.buf = realloc(s->data.buf, s->data.len);
+        s->data.buf = qemu_realloc(s->data.buf, s->data.len);
         s->data.buflen = s->data.len;
     }
     s->data.ptr = s->data.buf;
@@ -200,7 +198,7 @@ static int blizzard_transfer_setup(struct blizzard_s *s)
     return 1;
 }
 
-static void blizzard_reset(struct blizzard_s *s)
+static void blizzard_reset(BlizzardState *s)
 {
     s->reg = 0;
     s->swallow = 0;
@@ -281,14 +279,14 @@ static void blizzard_reset(struct blizzard_s *s)
 }
 
 static inline void blizzard_invalidate_display(void *opaque) {
-    struct blizzard_s *s = (struct blizzard_s *) opaque;
+    BlizzardState *s = (BlizzardState *) opaque;
 
     s->invalidate = 1;
 }
 
 static uint16_t blizzard_reg_read(void *opaque, uint8_t reg)
 {
-    struct blizzard_s *s = (struct blizzard_s *) opaque;
+    BlizzardState *s = (BlizzardState *) opaque;
 
     switch (reg) {
     case 0x00:	/* Revision Code */
@@ -491,7 +489,7 @@ static uint16_t blizzard_reg_read(void *opaque, uint8_t reg)
 
 static void blizzard_reg_write(void *opaque, uint8_t reg, uint16_t value)
 {
-    struct blizzard_s *s = (struct blizzard_s *) opaque;
+    BlizzardState *s = (BlizzardState *) opaque;
 
     switch (reg) {
     case 0x04:	/* PLL M-Divider */
@@ -832,7 +830,7 @@ static void blizzard_reg_write(void *opaque, uint8_t reg, uint16_t value)
 
 uint16_t s1d13745_read(void *opaque, int dc)
 {
-    struct blizzard_s *s = (struct blizzard_s *) opaque;
+    BlizzardState *s = (BlizzardState *) opaque;
     uint16_t value = blizzard_reg_read(s, s->reg);
 
     if (s->swallow -- > 0)
@@ -845,7 +843,7 @@ uint16_t s1d13745_read(void *opaque, int dc)
 
 void s1d13745_write(void *opaque, int dc, uint16_t value)
 {
-    struct blizzard_s *s = (struct blizzard_s *) opaque;
+    BlizzardState *s = (BlizzardState *) opaque;
 
     if (s->swallow -- > 0)
         return;
@@ -861,7 +859,7 @@ void s1d13745_write(void *opaque, int dc, uint16_t value)
 void s1d13745_write_block(void *opaque, int dc,
                 void *buf, size_t len, int pitch)
 {
-    struct blizzard_s *s = (struct blizzard_s *) opaque;
+    BlizzardState *s = (BlizzardState *) opaque;
 
     while (len > 0) {
         if (s->reg == 0x90 && dc &&
@@ -887,24 +885,24 @@ void s1d13745_write_block(void *opaque, int dc,
 
 static void blizzard_update_display(void *opaque)
 {
-    struct blizzard_s *s = (struct blizzard_s *) opaque;
+    BlizzardState *s = (BlizzardState *) opaque;
     int y, bypp, bypl, bwidth;
     uint8_t *src, *dst;
 
     if (!s->enable)
         return;
 
-    if (s->x != s->state->width || s->y != s->state->height) {
+    if (s->x != ds_get_width(s->state) || s->y != ds_get_height(s->state)) {
         s->invalidate = 1;
-        dpy_resize(s->state, s->x, s->y);
+        qemu_console_resize(s->state, s->x, s->y);
     }
 
     if (s->invalidate) {
         s->invalidate = 0;
 
         if (s->blank) {
-            bypp = (s->state->depth + 7) >> 3;
-            memset(s->state->data, 0, bypp * s->x * s->y);
+            bypp = (ds_get_bits_per_pixel(s->state) + 7) >> 3;
+            memset(ds_get_data(s->state), 0, bypp * s->x * s->y);
             return;
         }
 
@@ -917,12 +915,12 @@ static void blizzard_update_display(void *opaque)
     if (s->mx[1] <= s->mx[0])
         return;
 
-    bypp = (s->state->depth + 7) >> 3;
+    bypp = (ds_get_bits_per_pixel(s->state) + 7) >> 3;
     bypl = bypp * s->x;
     bwidth = bypp * (s->mx[1] - s->mx[0]);
     y = s->my[0];
     src = s->fb + bypl * y + bypp * s->mx[0];
-    dst = s->state->data + bypl * y + bypp * s->mx[0];
+    dst = ds_get_data(s->state) + bypl * y + bypp * s->mx[0];
     for (; y < s->my[1]; y ++, src += bypl, dst += bypl)
         memcpy(dst, src, bwidth);
 
@@ -936,11 +934,11 @@ static void blizzard_update_display(void *opaque)
 }
 
 static void blizzard_screen_dump(void *opaque, const char *filename) {
-    struct blizzard_s *s = (struct blizzard_s *) opaque;
+    BlizzardState *s = (BlizzardState *) opaque;
 
     blizzard_update_display(opaque);
-    if (s && s->state->data)
-        ppm_save(filename, s->state->data, s->x, s->y, s->state->linesize);
+    if (s && ds_get_data(s->state))
+        ppm_save(filename, s->state->surface);
 }
 
 #define DEPTH 8
@@ -954,14 +952,17 @@ static void blizzard_screen_dump(void *opaque, const char *filename) {
 #define DEPTH 32
 #include "blizzard_template.h"
 
-void *s1d13745_init(qemu_irq gpio_int, DisplayState *ds)
+void *s1d13745_init(qemu_irq gpio_int)
 {
-    struct blizzard_s *s = (struct blizzard_s *) qemu_mallocz(sizeof(*s));
+    BlizzardState *s = (BlizzardState *) qemu_mallocz(sizeof(*s));
 
-    s->state = ds;
     s->fb = qemu_malloc(0x180000);
 
-    switch (s->state->depth) {
+    s->state = graphic_console_init(blizzard_update_display,
+                                 blizzard_invalidate_display,
+                                 blizzard_screen_dump, NULL, s);
+
+    switch (ds_get_bits_per_pixel(s->state)) {
     case 0:
         s->line_fn_tab[0] = s->line_fn_tab[1] =
                 qemu_mallocz(sizeof(blizzard_fn_t) * 0x10);
@@ -992,10 +993,6 @@ void *s1d13745_init(qemu_irq gpio_int, DisplayState *ds)
     }
 
     blizzard_reset(s);
-
-    graphic_console_init(s->state, blizzard_update_display,
-                    blizzard_invalidate_display, blizzard_screen_dump,
-                    NULL, s);
 
     return s;
 }

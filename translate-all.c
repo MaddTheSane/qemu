@@ -14,8 +14,7 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include <stdarg.h>
 #include <stdlib.h>
@@ -38,6 +37,7 @@ uint16_t gen_opc_buf[OPC_BUF_SIZE];
 TCGArg gen_opparam_buf[OPPARAM_BUF_SIZE];
 
 target_ulong gen_opc_pc[OPC_BUF_SIZE];
+uint16_t gen_opc_icount[OPC_BUF_SIZE];
 uint8_t gen_opc_instr_start[OPC_BUF_SIZE];
 #if defined(TARGET_I386)
 uint8_t gen_opc_cc_op[OPC_BUF_SIZE];
@@ -46,23 +46,6 @@ target_ulong gen_opc_npc[OPC_BUF_SIZE];
 target_ulong gen_opc_jump_pc[2];
 #elif defined(TARGET_MIPS) || defined(TARGET_SH4)
 uint32_t gen_opc_hflags[OPC_BUF_SIZE];
-#endif
-
-int code_copy_enabled = 1;
-
-#ifdef CONFIG_PROFILER
-int64_t dyngen_tb_count1;
-int64_t dyngen_tb_count;
-int64_t dyngen_op_count;
-int64_t dyngen_old_op_count;
-int64_t dyngen_tcg_del_op_count;
-int dyngen_op_count_max;
-int64_t dyngen_code_in_len;
-int64_t dyngen_code_out_len;
-int64_t dyngen_interm_time;
-int64_t dyngen_code_time;
-int64_t dyngen_restore_count;
-int64_t dyngen_restore_time;
 #endif
 
 /* XXX: suppress that */
@@ -104,15 +87,14 @@ int cpu_gen_code(CPUState *env, TranslationBlock *tb, int *gen_code_size_ptr)
 #endif
 
 #ifdef CONFIG_PROFILER
-    dyngen_tb_count1++; /* includes aborted translations because of
-                           exceptions */
+    s->tb_count1++; /* includes aborted translations because of
+                       exceptions */
     ti = profile_getclock();
 #endif
     tcg_func_start(s);
 
-    if (gen_intermediate_code(env, tb) < 0)
-        return -1;
-    
+    gen_intermediate_code(env, tb);
+
     /* generate machine code */
     gen_code_buf = tb->tc_ptr;
     tb->tb_next_offset[0] = 0xffff;
@@ -131,24 +113,24 @@ int cpu_gen_code(CPUState *env, TranslationBlock *tb, int *gen_code_size_ptr)
 #endif
 
 #ifdef CONFIG_PROFILER
-    dyngen_tb_count++;
-    dyngen_interm_time += profile_getclock() - ti;
-    dyngen_code_time -= profile_getclock();
+    s->tb_count++;
+    s->interm_time += profile_getclock() - ti;
+    s->code_time -= profile_getclock();
 #endif
-    gen_code_size = dyngen_code(s, gen_code_buf);
+    gen_code_size = tcg_gen_code(s, gen_code_buf);
     *gen_code_size_ptr = gen_code_size;
 #ifdef CONFIG_PROFILER
-    dyngen_code_time += profile_getclock();
-    dyngen_code_in_len += tb->size;
-    dyngen_code_out_len += gen_code_size;
+    s->code_time += profile_getclock();
+    s->code_in_len += tb->size;
+    s->code_out_len += gen_code_size;
 #endif
 
 #ifdef DEBUG_DISAS
-    if (loglevel & CPU_LOG_TB_OUT_ASM) {
-        fprintf(logfile, "OUT: [size=%d]\n", *gen_code_size_ptr);
-        disas(logfile, tb->tc_ptr, *gen_code_size_ptr);
-        fprintf(logfile, "\n");
-        fflush(logfile);
+    if (qemu_loglevel_mask(CPU_LOG_TB_OUT_ASM)) {
+        qemu_log("OUT: [size=%d]\n", *gen_code_size_ptr);
+        log_disas(tb->tc_ptr, *gen_code_size_ptr);
+        qemu_log("\n");
+        qemu_log_flush();
     }
 #endif
     return 0;
@@ -172,8 +154,14 @@ int cpu_restore_state(TranslationBlock *tb,
 #endif
     tcg_func_start(s);
 
-    if (gen_intermediate_code_pc(env, tb) < 0)
-        return -1;
+    gen_intermediate_code_pc(env, tb);
+
+    if (use_icount) {
+        /* Reset the cycle counter to the start of the block.  */
+        env->icount_decr.u16.low += tb->icount;
+        /* Clear the IO flag.  */
+        env->can_do_io = 0;
+    }
 
     /* find opc index corresponding to search_pc */
     tc_ptr = (unsigned long)tb->tc_ptr;
@@ -188,18 +176,19 @@ int cpu_restore_state(TranslationBlock *tb,
     s->tb_jmp_offset = NULL;
     s->tb_next = tb->tb_next;
 #endif
-    j = dyngen_code_search_pc(s, (uint8_t *)tc_ptr, searched_pc - tc_ptr);
+    j = tcg_gen_code_search_pc(s, (uint8_t *)tc_ptr, searched_pc - tc_ptr);
     if (j < 0)
         return -1;
     /* now find start of instruction before */
     while (gen_opc_instr_start[j] == 0)
         j--;
+    env->icount_decr.u16.low -= gen_opc_icount[j];
 
     gen_pc_load(env, tb, searched_pc, j, puc);
 
 #ifdef CONFIG_PROFILER
-    dyngen_restore_time += profile_getclock() - ti;
-    dyngen_restore_count++;
+    s->restore_time += profile_getclock() - ti;
+    s->restore_count++;
 #endif
     return 0;
 }

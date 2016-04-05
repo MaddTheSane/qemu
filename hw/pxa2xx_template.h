@@ -23,16 +23,17 @@
 # error unknown bit depth
 #endif
 
-#ifdef WORDS_BIGENDIAN
+#ifdef HOST_WORDS_BIGENDIAN
 # define SWAP_WORDS	1
 #endif
 
 #define FN_2(x)		FN(x + 1) FN(x)
 #define FN_4(x)		FN_2(x + 2) FN_2(x)
 
-static void glue(pxa2xx_draw_line2_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line2_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
+    uint32_t *palette = opaque;
     uint32_t data;
     while (width > 0) {
         data = *(uint32_t *) src;
@@ -54,9 +55,10 @@ static void glue(pxa2xx_draw_line2_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line4_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line4_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
+    uint32_t *palette = opaque;
     uint32_t data;
     while (width > 0) {
         data = *(uint32_t *) src;
@@ -78,9 +80,10 @@ static void glue(pxa2xx_draw_line4_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line8_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line8_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
+    uint32_t *palette = opaque;
     uint32_t data;
     while (width > 0) {
         data = *(uint32_t *) src;
@@ -102,7 +105,7 @@ static void glue(pxa2xx_draw_line8_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line16_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line16_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data;
@@ -130,7 +133,7 @@ static void glue(pxa2xx_draw_line16_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line16t_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line16t_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data;
@@ -156,6 +159,7 @@ static void glue(pxa2xx_draw_line16t_, BITS)(uint32_t *palette,
         g = (data & 0x1f) << 3;
         data >>= 5;
         r = (data & 0x1f) << 3;
+        data >>= 5;
         if (data & 1)
             SKIP_PIXEL(dest);
         else
@@ -165,7 +169,7 @@ static void glue(pxa2xx_draw_line16t_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line18_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line18_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data;
@@ -187,7 +191,7 @@ static void glue(pxa2xx_draw_line18_, BITS)(uint32_t *palette,
 }
 
 /* The wicked packed format */
-static void glue(pxa2xx_draw_line18p_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line18p_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data[3];
@@ -235,7 +239,7 @@ static void glue(pxa2xx_draw_line18p_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line19_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line19_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data;
@@ -261,7 +265,7 @@ static void glue(pxa2xx_draw_line19_, BITS)(uint32_t *palette,
 }
 
 /* The wicked packed format */
-static void glue(pxa2xx_draw_line19p_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line19p_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data[3];
@@ -325,7 +329,7 @@ static void glue(pxa2xx_draw_line19p_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line24_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line24_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data;
@@ -346,7 +350,7 @@ static void glue(pxa2xx_draw_line24_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line24t_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line24t_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data;
@@ -371,7 +375,7 @@ static void glue(pxa2xx_draw_line24t_, BITS)(uint32_t *palette,
     }
 }
 
-static void glue(pxa2xx_draw_line25_, BITS)(uint32_t *palette,
+static void glue(pxa2xx_draw_line25_, BITS)(void *opaque,
                 uint8_t *dest, const uint8_t *src, int width, int deststep)
 {
     uint32_t data;
@@ -399,7 +403,7 @@ static void glue(pxa2xx_draw_line25_, BITS)(uint32_t *palette,
 /* Overlay planes disabled, no transparency */
 static drawfn glue(pxa2xx_draw_fn_, BITS)[16] =
 {
-    [0 ... 0xf]       = 0,
+    [0 ... 0xf]       = NULL,
     [pxa_lcdc_2bpp]   = glue(pxa2xx_draw_line2_, BITS),
     [pxa_lcdc_4bpp]   = glue(pxa2xx_draw_line4_, BITS),
     [pxa_lcdc_8bpp]   = glue(pxa2xx_draw_line8_, BITS),
@@ -412,7 +416,7 @@ static drawfn glue(pxa2xx_draw_fn_, BITS)[16] =
 /* Overlay planes enabled, transparency used */
 static drawfn glue(glue(pxa2xx_draw_fn_, BITS), t)[16] =
 {
-    [0 ... 0xf]       = 0,
+    [0 ... 0xf]       = NULL,
     [pxa_lcdc_4bpp]   = glue(pxa2xx_draw_line4_, BITS),
     [pxa_lcdc_8bpp]   = glue(pxa2xx_draw_line8_, BITS),
     [pxa_lcdc_16bpp]  = glue(pxa2xx_draw_line16t_, BITS),

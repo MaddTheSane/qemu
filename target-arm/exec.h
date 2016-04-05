@@ -14,15 +14,12 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "config.h"
 #include "dyngen-exec.h"
 
 register struct CPUARMState *env asm(AREG0);
-register uint32_t T0 asm(AREG1);
-register uint32_t T1 asm(AREG2);
 
 #define M0   env->iwmmxt.val
 
@@ -37,8 +34,11 @@ static inline void regs_to_env(void)
 {
 }
 
-int cpu_arm_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
-                              int mmu_idx, int is_softmmu);
+static inline int cpu_has_work(CPUState *env)
+{
+    return (env->interrupt_request &
+            (CPU_INTERRUPT_FIQ | CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB));
+}
 
 static inline int cpu_halted(CPUState *env) {
     if (!env->halted)
@@ -46,8 +46,7 @@ static inline int cpu_halted(CPUState *env) {
     /* An interrupt wakes the CPU even if the I and F CPSR bits are
        set.  We use EXITTB to silently wake CPU without causing an
        actual interrupt.  */
-    if (env->interrupt_request &
-        (CPU_INTERRUPT_FIQ | CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB)) {
+    if (cpu_has_work(env)) {
         env->halted = 0;
         return 0;
     }
@@ -58,8 +57,4 @@ static inline int cpu_halted(CPUState *env) {
 #include "softmmu_exec.h"
 #endif
 
-void cpu_loop_exit(void);
-
 void raise_exception(int);
-
-uint32_t helper_neon_mul_p8(uint32_t op1, uint32_t op2);

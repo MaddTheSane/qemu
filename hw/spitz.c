@@ -13,22 +13,18 @@
 #include "sysemu.h"
 #include "pcmcia.h"
 #include "i2c.h"
+#include "ssi.h"
 #include "flash.h"
 #include "qemu-timer.h"
 #include "devices.h"
+#include "sharpsl.h"
 #include "console.h"
 #include "block.h"
 #include "audio/audio.h"
 #include "boards.h"
 
-#define spitz_printf(format, ...)	\
-    fprintf(stderr, "%s: " format, __FUNCTION__, ##__VA_ARGS__)
 #undef REG_FMT
-#if TARGET_PHYS_ADDR_BITS == 32
-#define REG_FMT			"0x%02x"
-#else
 #define REG_FMT			"0x%02lx"
-#endif
 
 /* Spitz Flash */
 #define FLASH_BASE		0x0c000000
@@ -48,18 +44,16 @@
 #define FLASHCTL_RYBY		(1 << 5)
 #define FLASHCTL_NCE		(FLASHCTL_CE0 | FLASHCTL_CE1)
 
-struct sl_nand_s {
-    target_phys_addr_t target_base;
-    struct nand_flash_s *nand;
+typedef struct {
+    NANDFlashState *nand;
     uint8_t ctl;
-    struct ecc_state_s ecc;
-};
+    ECCState ecc;
+} SLNANDState;
 
 static uint32_t sl_readb(void *opaque, target_phys_addr_t addr)
 {
-    struct sl_nand_s *s = (struct sl_nand_s *) opaque;
+    SLNANDState *s = (SLNANDState *) opaque;
     int ryby;
-    addr -= s->target_base;
 
     switch (addr) {
 #define BSHR(byte, from, to)	((s->ecc.lp[byte] >> (from - to)) & (1 << to))
@@ -89,15 +83,14 @@ static uint32_t sl_readb(void *opaque, target_phys_addr_t addr)
         return ecc_digest(&s->ecc, nand_getio(s->nand));
 
     default:
-        spitz_printf("Bad register offset " REG_FMT "\n", addr);
+        zaurus_printf("Bad register offset " REG_FMT "\n", (unsigned long)addr);
     }
     return 0;
 }
 
 static uint32_t sl_readl(void *opaque, target_phys_addr_t addr)
 {
-    struct sl_nand_s *s = (struct sl_nand_s *) opaque;
-    addr -= s->target_base;
+    SLNANDState *s = (SLNANDState *) opaque;
 
     if (addr == FLASH_FLASHIO)
         return ecc_digest(&s->ecc, nand_getio(s->nand)) |
@@ -109,8 +102,7 @@ static uint32_t sl_readl(void *opaque, target_phys_addr_t addr)
 static void sl_writeb(void *opaque, target_phys_addr_t addr,
                 uint32_t value)
 {
-    struct sl_nand_s *s = (struct sl_nand_s *) opaque;
-    addr -= s->target_base;
+    SLNANDState *s = (SLNANDState *) opaque;
 
     switch (addr) {
     case FLASH_ECCCLRR:
@@ -133,13 +125,13 @@ static void sl_writeb(void *opaque, target_phys_addr_t addr,
         break;
 
     default:
-        spitz_printf("Bad register offset " REG_FMT "\n", addr);
+        zaurus_printf("Bad register offset " REG_FMT "\n", (unsigned long)addr);
     }
 }
 
 static void sl_save(QEMUFile *f, void *opaque)
 {
-    struct sl_nand_s *s = (struct sl_nand_s *) opaque;
+    SLNANDState *s = (SLNANDState *) opaque;
 
     qemu_put_8s(f, &s->ctl);
     ecc_put(f, &s->ecc);
@@ -147,7 +139,7 @@ static void sl_save(QEMUFile *f, void *opaque)
 
 static int sl_load(QEMUFile *f, void *opaque, int version_id)
 {
-    struct sl_nand_s *s = (struct sl_nand_s *) opaque;
+    SLNANDState *s = (SLNANDState *) opaque;
 
     qemu_get_8s(f, &s->ctl);
     ecc_get(f, &s->ecc);
@@ -160,32 +152,31 @@ enum {
     FLASH_1024M,
 };
 
-static void sl_flash_register(struct pxa2xx_state_s *cpu, int size)
+static void sl_flash_register(PXA2xxState *cpu, int size)
 {
     int iomemtype;
-    struct sl_nand_s *s;
-    CPUReadMemoryFunc *sl_readfn[] = {
+    SLNANDState *s;
+    CPUReadMemoryFunc * const sl_readfn[] = {
         sl_readb,
         sl_readb,
         sl_readl,
     };
-    CPUWriteMemoryFunc *sl_writefn[] = {
+    CPUWriteMemoryFunc * const sl_writefn[] = {
         sl_writeb,
         sl_writeb,
         sl_writeb,
     };
 
-    s = (struct sl_nand_s *) qemu_mallocz(sizeof(struct sl_nand_s));
-    s->target_base = FLASH_BASE;
+    s = (SLNANDState *) qemu_mallocz(sizeof(SLNANDState));
     s->ctl = 0;
     if (size == FLASH_128M)
         s->nand = nand_init(NAND_MFR_SAMSUNG, 0x73);
     else if (size == FLASH_1024M)
         s->nand = nand_init(NAND_MFR_SAMSUNG, 0xf1);
 
-    iomemtype = cpu_register_io_memory(0, sl_readfn,
+    iomemtype = cpu_register_io_memory(sl_readfn,
                     sl_writefn, s);
-    cpu_register_physical_memory(s->target_base, 0x40, iomemtype);
+    cpu_register_physical_memory(FLASH_BASE, 0x40, iomemtype);
 
     register_savevm("sl_flash", 0, 0, sl_save, sl_load, s);
 }
@@ -228,7 +219,7 @@ static const int spitz_gpiomap[5] = {
 };
 static int spitz_gpio_invert[5] = { 0, 0, 0, 0, 0, };
 
-struct spitz_keyboard_s {
+typedef struct {
     qemu_irq sense[SPITZ_KEY_SENSE_NUM];
     qemu_irq *strobe;
     qemu_irq gpiomap[5];
@@ -243,9 +234,9 @@ struct spitz_keyboard_s {
     uint8_t fifo[16];
     int fifopos, fifolen;
     QEMUTimer *kbdtimer;
-};
+} SpitzKeyboardState;
 
-static void spitz_keyboard_sense_update(struct spitz_keyboard_s *s)
+static void spitz_keyboard_sense_update(SpitzKeyboardState *s)
 {
     int i;
     uint16_t strobe, sense = 0;
@@ -264,7 +255,7 @@ static void spitz_keyboard_sense_update(struct spitz_keyboard_s *s)
 
 static void spitz_keyboard_strobe(void *opaque, int line, int level)
 {
-    struct spitz_keyboard_s *s = (struct spitz_keyboard_s *) opaque;
+    SpitzKeyboardState *s = (SpitzKeyboardState *) opaque;
 
     if (level)
         s->strobe_state |= 1 << line;
@@ -273,7 +264,7 @@ static void spitz_keyboard_strobe(void *opaque, int line, int level)
     spitz_keyboard_sense_update(s);
 }
 
-static void spitz_keyboard_keydown(struct spitz_keyboard_s *s, int keycode)
+static void spitz_keyboard_keydown(SpitzKeyboardState *s, int keycode)
 {
     int spitz_keycode = s->keymap[keycode & 0x7f];
     if (spitz_keycode == -1)
@@ -300,7 +291,7 @@ static void spitz_keyboard_keydown(struct spitz_keyboard_s *s, int keycode)
 
 #define QUEUE_KEY(c)	s->fifo[(s->fifopos + s->fifolen ++) & 0xf] = c
 
-static void spitz_keyboard_handler(struct spitz_keyboard_s *s, int keycode)
+static void spitz_keyboard_handler(SpitzKeyboardState *s, int keycode)
 {
     uint16_t code;
     int mapcode;
@@ -392,7 +383,7 @@ static void spitz_keyboard_handler(struct spitz_keyboard_s *s, int keycode)
 
 static void spitz_keyboard_tick(void *opaque)
 {
-    struct spitz_keyboard_s *s = (struct spitz_keyboard_s *) opaque;
+    SpitzKeyboardState *s = (SpitzKeyboardState *) opaque;
 
     if (s->fifolen) {
         spitz_keyboard_keydown(s, s->fifo[s->fifopos ++]);
@@ -401,10 +392,11 @@ static void spitz_keyboard_tick(void *opaque)
             s->fifopos = 0;
     }
 
-    qemu_mod_timer(s->kbdtimer, qemu_get_clock(vm_clock) + ticks_per_sec / 32);
+    qemu_mod_timer(s->kbdtimer, qemu_get_clock(vm_clock) +
+                   get_ticks_per_sec() / 32);
 }
 
-static void spitz_keyboard_pre_map(struct spitz_keyboard_s *s)
+static void spitz_keyboard_pre_map(SpitzKeyboardState *s)
 {
     int i;
     for (i = 0; i < 0x100; i ++)
@@ -456,7 +448,7 @@ static void spitz_keyboard_pre_map(struct spitz_keyboard_s *s)
 
 static void spitz_keyboard_save(QEMUFile *f, void *opaque)
 {
-    struct spitz_keyboard_s *s = (struct spitz_keyboard_s *) opaque;
+    SpitzKeyboardState *s = (SpitzKeyboardState *) opaque;
     int i;
 
     qemu_put_be16s(f, &s->sense_state);
@@ -467,7 +459,7 @@ static void spitz_keyboard_save(QEMUFile *f, void *opaque)
 
 static int spitz_keyboard_load(QEMUFile *f, void *opaque, int version_id)
 {
-    struct spitz_keyboard_s *s = (struct spitz_keyboard_s *) opaque;
+    SpitzKeyboardState *s = (SpitzKeyboardState *) opaque;
     int i;
 
     qemu_get_be16s(f, &s->sense_state);
@@ -486,14 +478,14 @@ static int spitz_keyboard_load(QEMUFile *f, void *opaque, int version_id)
     return 0;
 }
 
-static void spitz_keyboard_register(struct pxa2xx_state_s *cpu)
+static void spitz_keyboard_register(PXA2xxState *cpu)
 {
     int i, j;
-    struct spitz_keyboard_s *s;
+    SpitzKeyboardState *s;
 
-    s = (struct spitz_keyboard_s *)
-            qemu_mallocz(sizeof(struct spitz_keyboard_s));
-    memset(s, 0, sizeof(struct spitz_keyboard_s));
+    s = (SpitzKeyboardState *)
+            qemu_mallocz(sizeof(SpitzKeyboardState));
+    memset(s, 0, sizeof(SpitzKeyboardState));
 
     for (i = 0; i < 0x80; i ++)
         s->keymap[i] = -1;
@@ -520,238 +512,6 @@ static void spitz_keyboard_register(struct pxa2xx_state_s *cpu)
                     spitz_keyboard_save, spitz_keyboard_load, s);
 }
 
-/* SCOOP devices */
-
-struct scoop_info_s {
-    target_phys_addr_t target_base;
-    qemu_irq handler[16];
-    qemu_irq *in;
-    uint16_t status;
-    uint16_t power;
-    uint32_t gpio_level;
-    uint32_t gpio_dir;
-    uint32_t prev_level;
-
-    uint16_t mcr;
-    uint16_t cdr;
-    uint16_t ccr;
-    uint16_t irr;
-    uint16_t imr;
-    uint16_t isr;
-    uint16_t gprr;
-};
-
-#define SCOOP_MCR	0x00
-#define SCOOP_CDR	0x04
-#define SCOOP_CSR	0x08
-#define SCOOP_CPR	0x0c
-#define SCOOP_CCR	0x10
-#define SCOOP_IRR_IRM	0x14
-#define SCOOP_IMR	0x18
-#define SCOOP_ISR	0x1c
-#define SCOOP_GPCR	0x20
-#define SCOOP_GPWR	0x24
-#define SCOOP_GPRR	0x28
-
-static inline void scoop_gpio_handler_update(struct scoop_info_s *s) {
-    uint32_t level, diff;
-    int bit;
-    level = s->gpio_level & s->gpio_dir;
-
-    for (diff = s->prev_level ^ level; diff; diff ^= 1 << bit) {
-        bit = ffs(diff) - 1;
-        qemu_set_irq(s->handler[bit], (level >> bit) & 1);
-    }
-
-    s->prev_level = level;
-}
-
-static uint32_t scoop_readb(void *opaque, target_phys_addr_t addr)
-{
-    struct scoop_info_s *s = (struct scoop_info_s *) opaque;
-    addr -= s->target_base;
-
-    switch (addr) {
-    case SCOOP_MCR:
-        return s->mcr;
-    case SCOOP_CDR:
-        return s->cdr;
-    case SCOOP_CSR:
-        return s->status;
-    case SCOOP_CPR:
-        return s->power;
-    case SCOOP_CCR:
-        return s->ccr;
-    case SCOOP_IRR_IRM:
-        return s->irr;
-    case SCOOP_IMR:
-        return s->imr;
-    case SCOOP_ISR:
-        return s->isr;
-    case SCOOP_GPCR:
-        return s->gpio_dir;
-    case SCOOP_GPWR:
-        return s->gpio_level;
-    case SCOOP_GPRR:
-        return s->gprr;
-    default:
-        spitz_printf("Bad register offset " REG_FMT "\n", addr);
-    }
-
-    return 0;
-}
-
-static void scoop_writeb(void *opaque, target_phys_addr_t addr, uint32_t value)
-{
-    struct scoop_info_s *s = (struct scoop_info_s *) opaque;
-    addr -= s->target_base;
-    value &= 0xffff;
-
-    switch (addr) {
-    case SCOOP_MCR:
-        s->mcr = value;
-        break;
-    case SCOOP_CDR:
-        s->cdr = value;
-        break;
-    case SCOOP_CPR:
-        s->power = value;
-        if (value & 0x80)
-            s->power |= 0x8040;
-        break;
-    case SCOOP_CCR:
-        s->ccr = value;
-        break;
-    case SCOOP_IRR_IRM:
-        s->irr = value;
-        break;
-    case SCOOP_IMR:
-        s->imr = value;
-        break;
-    case SCOOP_ISR:
-        s->isr = value;
-        break;
-    case SCOOP_GPCR:
-        s->gpio_dir = value;
-        scoop_gpio_handler_update(s);
-        break;
-    case SCOOP_GPWR:
-        s->gpio_level = value & s->gpio_dir;
-        scoop_gpio_handler_update(s);
-        break;
-    case SCOOP_GPRR:
-        s->gprr = value;
-        break;
-    default:
-        spitz_printf("Bad register offset " REG_FMT "\n", addr);
-    }
-}
-
-CPUReadMemoryFunc *scoop_readfn[] = {
-    scoop_readb,
-    scoop_readb,
-    scoop_readb,
-};
-CPUWriteMemoryFunc *scoop_writefn[] = {
-    scoop_writeb,
-    scoop_writeb,
-    scoop_writeb,
-};
-
-static void scoop_gpio_set(void *opaque, int line, int level)
-{
-    struct scoop_info_s *s = (struct scoop_info_s *) s;
-
-    if (level)
-        s->gpio_level |= (1 << line);
-    else
-        s->gpio_level &= ~(1 << line);
-}
-
-static inline qemu_irq *scoop_gpio_in_get(struct scoop_info_s *s)
-{
-    return s->in;
-}
-
-static inline void scoop_gpio_out_set(struct scoop_info_s *s, int line,
-                qemu_irq handler) {
-    if (line >= 16) {
-        spitz_printf("No GPIO pin %i\n", line);
-        return;
-    }
-
-    s->handler[line] = handler;
-}
-
-static void scoop_save(QEMUFile *f, void *opaque)
-{
-    struct scoop_info_s *s = (struct scoop_info_s *) opaque;
-    qemu_put_be16s(f, &s->status);
-    qemu_put_be16s(f, &s->power);
-    qemu_put_be32s(f, &s->gpio_level);
-    qemu_put_be32s(f, &s->gpio_dir);
-    qemu_put_be32s(f, &s->prev_level);
-    qemu_put_be16s(f, &s->mcr);
-    qemu_put_be16s(f, &s->cdr);
-    qemu_put_be16s(f, &s->ccr);
-    qemu_put_be16s(f, &s->irr);
-    qemu_put_be16s(f, &s->imr);
-    qemu_put_be16s(f, &s->isr);
-    qemu_put_be16s(f, &s->gprr);
-}
-
-static int scoop_load(QEMUFile *f, void *opaque, int version_id)
-{
-    struct scoop_info_s *s = (struct scoop_info_s *) opaque;
-    qemu_get_be16s(f, &s->status);
-    qemu_get_be16s(f, &s->power);
-    qemu_get_be32s(f, &s->gpio_level);
-    qemu_get_be32s(f, &s->gpio_dir);
-    qemu_get_be32s(f, &s->prev_level);
-    qemu_get_be16s(f, &s->mcr);
-    qemu_get_be16s(f, &s->cdr);
-    qemu_get_be16s(f, &s->ccr);
-    qemu_get_be16s(f, &s->irr);
-    qemu_get_be16s(f, &s->imr);
-    qemu_get_be16s(f, &s->isr);
-    qemu_get_be16s(f, &s->gprr);
-
-    return 0;
-}
-
-static struct scoop_info_s *spitz_scoop_init(struct pxa2xx_state_s *cpu,
-                int count) {
-    int iomemtype;
-    struct scoop_info_s *s;
-
-    s = (struct scoop_info_s *)
-            qemu_mallocz(sizeof(struct scoop_info_s) * 2);
-    memset(s, 0, sizeof(struct scoop_info_s) * count);
-    s[0].target_base = 0x10800000;
-    s[1].target_base = 0x08800040;
-
-    /* Ready */
-    s[0].status = 0x02;
-    s[1].status = 0x02;
-
-    s[0].in = qemu_allocate_irqs(scoop_gpio_set, &s[0], 16);
-    iomemtype = cpu_register_io_memory(0, scoop_readfn,
-                    scoop_writefn, &s[0]);
-    cpu_register_physical_memory(s[0].target_base, 0x1000, iomemtype);
-    register_savevm("scoop", 0, 0, scoop_save, scoop_load, &s[0]);
-
-    if (count < 2)
-        return s;
-
-    s[1].in = qemu_allocate_irqs(scoop_gpio_set, &s[1], 16);
-    iomemtype = cpu_register_io_memory(0, scoop_readfn,
-                    scoop_writefn, &s[1]);
-    cpu_register_physical_memory(s[1].target_base, 0x1000, iomemtype);
-    register_savevm("scoop", 1, 0, scoop_save, scoop_load, &s[1]);
-
-    return s;
-}
-
 /* LCD backlight controller */
 
 #define LCDTG_RESCTL	0x00
@@ -763,60 +523,99 @@ static struct scoop_info_s *spitz_scoop_init(struct pxa2xx_state_s *cpu,
 #define LCDTG_PICTRL	0x06
 #define LCDTG_POLCTRL	0x07
 
-static int bl_intensity, bl_power;
+typedef struct {
+    SSISlave ssidev;
+    int bl_intensity;
+    int bl_power;
+} SpitzLCDTG;
 
-static void spitz_bl_update(struct pxa2xx_state_s *s)
+static void spitz_bl_update(SpitzLCDTG *s)
 {
-    if (bl_power && bl_intensity)
-        spitz_printf("LCD Backlight now at %i/63\n", bl_intensity);
+    if (s->bl_power && s->bl_intensity)
+        zaurus_printf("LCD Backlight now at %i/63\n", s->bl_intensity);
     else
-        spitz_printf("LCD Backlight now off\n");
+        zaurus_printf("LCD Backlight now off\n");
 }
+
+/* FIXME: Implement GPIO properly and remove this hack.  */
+static SpitzLCDTG *spitz_lcdtg;
 
 static inline void spitz_bl_bit5(void *opaque, int line, int level)
 {
-    int prev = bl_intensity;
+    SpitzLCDTG *s = spitz_lcdtg;
+    int prev = s->bl_intensity;
 
     if (level)
-        bl_intensity &= ~0x20;
+        s->bl_intensity &= ~0x20;
     else
-        bl_intensity |= 0x20;
+        s->bl_intensity |= 0x20;
 
-    if (bl_power && prev != bl_intensity)
-        spitz_bl_update((struct pxa2xx_state_s *) opaque);
+    if (s->bl_power && prev != s->bl_intensity)
+        spitz_bl_update(s);
 }
 
 static inline void spitz_bl_power(void *opaque, int line, int level)
 {
-    bl_power = !!level;
-    spitz_bl_update((struct pxa2xx_state_s *) opaque);
+    SpitzLCDTG *s = spitz_lcdtg;
+    s->bl_power = !!level;
+    spitz_bl_update(s);
 }
 
-static void spitz_lcdtg_dac_put(void *opaque, uint8_t cmd)
+static uint32_t spitz_lcdtg_transfer(SSISlave *dev, uint32_t value)
 {
-    int addr, value;
-    addr = cmd >> 5;
-    value = cmd & 0x1f;
+    SpitzLCDTG *s = FROM_SSI_SLAVE(SpitzLCDTG, dev);
+    int addr;
+    addr = value >> 5;
+    value &= 0x1f;
 
     switch (addr) {
     case LCDTG_RESCTL:
         if (value)
-            spitz_printf("LCD in QVGA mode\n");
+            zaurus_printf("LCD in QVGA mode\n");
         else
-            spitz_printf("LCD in VGA mode\n");
+            zaurus_printf("LCD in VGA mode\n");
         break;
 
     case LCDTG_DUTYCTRL:
-        bl_intensity &= ~0x1f;
-        bl_intensity |= value;
-        if (bl_power)
-            spitz_bl_update((struct pxa2xx_state_s *) opaque);
+        s->bl_intensity &= ~0x1f;
+        s->bl_intensity |= value;
+        if (s->bl_power)
+            spitz_bl_update(s);
         break;
 
     case LCDTG_POWERREG0:
         /* Set common voltage to M62332FP */
         break;
     }
+    return 0;
+}
+
+static void spitz_lcdtg_save(QEMUFile *f, void *opaque)
+{
+    SpitzLCDTG *s = (SpitzLCDTG *)opaque;
+    qemu_put_be32(f, s->bl_intensity);
+    qemu_put_be32(f, s->bl_power);
+}
+
+static int spitz_lcdtg_load(QEMUFile *f, void *opaque, int version_id)
+{
+    SpitzLCDTG *s = (SpitzLCDTG *)opaque;
+    s->bl_intensity = qemu_get_be32(f);
+    s->bl_power = qemu_get_be32(f);
+    return 0;
+}
+
+static int spitz_lcdtg_init(SSISlave *dev)
+{
+    SpitzLCDTG *s = FROM_SSI_SLAVE(SpitzLCDTG, dev);
+
+    spitz_lcdtg = s;
+    s->bl_power = 0;
+    s->bl_intensity = 0x20;
+
+    register_savevm("spitz-lcdtg", -1, 1,
+                    spitz_lcdtg_save, spitz_lcdtg_load, s);
+    return 0;
 }
 
 /* SSP devices */
@@ -828,45 +627,33 @@ static void spitz_lcdtg_dac_put(void *opaque, uint8_t cmd)
 #define SPITZ_GPIO_MAX1111_CS	20
 #define SPITZ_GPIO_TP_INT	11
 
-static int lcd_en, ads_en, max_en;
-static struct max111x_s *max1111;
-static struct ads7846_state_s *ads7846;
+static DeviceState *max1111;
 
 /* "Demux" the signal based on current chipselect */
-static uint32_t corgi_ssp_read(void *opaque)
-{
-    if (lcd_en)
-        return 0;
-    if (ads_en)
-        return ads7846_read(ads7846);
-    if (max_en)
-        return max111x_read(max1111);
-    return 0;
-}
+typedef struct {
+    SSISlave ssidev;
+    SSIBus *bus[3];
+    int enable[3];
+} CorgiSSPState;
 
-static void corgi_ssp_write(void *opaque, uint32_t value)
+static uint32_t corgi_ssp_transfer(SSISlave *dev, uint32_t value)
 {
-    if (lcd_en)
-        spitz_lcdtg_dac_put(opaque, value);
-    if (ads_en)
-        ads7846_write(ads7846, value);
-    if (max_en)
-        max111x_write(max1111, value);
+    CorgiSSPState *s = FROM_SSI_SLAVE(CorgiSSPState, dev);
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        if (s->enable[i]) {
+            return ssi_transfer(s->bus[i], value);
+        }
+    }
+    return 0;
 }
 
 static void corgi_ssp_gpio_cs(void *opaque, int line, int level)
 {
-    switch (line) {
-    case 0:
-        lcd_en = !level;
-        break;
-    case 1:
-        ads_en = !level;
-        break;
-    case 2:
-        max_en = !level;
-        break;
-    }
+    CorgiSSPState *s = (CorgiSSPState *)opaque;
+    assert(line >= 0 && line < 3);
+    s->enable[line] = !level;
 }
 
 #define MAX1111_BATT_VOLT	1
@@ -890,66 +677,86 @@ static void spitz_adc_temp_on(void *opaque, int line, int level)
 
 static void spitz_ssp_save(QEMUFile *f, void *opaque)
 {
-    qemu_put_be32(f, lcd_en);
-    qemu_put_be32(f, ads_en);
-    qemu_put_be32(f, max_en);
-    qemu_put_be32(f, bl_intensity);
-    qemu_put_be32(f, bl_power);
+    CorgiSSPState *s = (CorgiSSPState *)opaque;
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        qemu_put_be32(f, s->enable[i]);
+    }
 }
 
 static int spitz_ssp_load(QEMUFile *f, void *opaque, int version_id)
 {
-    lcd_en = qemu_get_be32(f);
-    ads_en = qemu_get_be32(f);
-    max_en = qemu_get_be32(f);
-    bl_intensity = qemu_get_be32(f);
-    bl_power = qemu_get_be32(f);
+    CorgiSSPState *s = (CorgiSSPState *)opaque;
+    int i;
 
+    if (version_id != 1) {
+        return -EINVAL;
+    }
+    for (i = 0; i < 3; i++) {
+        s->enable[i] = qemu_get_be32(f);
+    }
     return 0;
 }
 
-static void spitz_ssp_attach(struct pxa2xx_state_s *cpu)
+static int corgi_ssp_init(SSISlave *dev)
 {
-    qemu_irq *chipselects;
+    CorgiSSPState *s = FROM_SSI_SLAVE(CorgiSSPState, dev);
 
-    lcd_en = ads_en = max_en = 0;
+    qdev_init_gpio_in(&dev->qdev, corgi_ssp_gpio_cs, 3);
+    s->bus[0] = ssi_create_bus(&dev->qdev, "ssi0");
+    s->bus[1] = ssi_create_bus(&dev->qdev, "ssi1");
+    s->bus[2] = ssi_create_bus(&dev->qdev, "ssi2");
 
-    ads7846 = ads7846_init(pxa2xx_gpio_in_get(cpu->gpio)[SPITZ_GPIO_TP_INT]);
+    register_savevm("spitz_ssp", -1, 1, spitz_ssp_save, spitz_ssp_load, s);
+    return 0;
+}
 
-    max1111 = max1111_init(0);
+static void spitz_ssp_attach(PXA2xxState *cpu)
+{
+    DeviceState *mux;
+    DeviceState *dev;
+    void *bus;
+
+    mux = ssi_create_slave(cpu->ssp[CORGI_SSP_PORT - 1], "corgi-ssp");
+
+    bus = qdev_get_child_bus(mux, "ssi0");
+    dev = ssi_create_slave(bus, "spitz-lcdtg");
+
+    bus = qdev_get_child_bus(mux, "ssi1");
+    dev = ssi_create_slave(bus, "ads7846");
+    qdev_connect_gpio_out(dev, 0,
+                          pxa2xx_gpio_in_get(cpu->gpio)[SPITZ_GPIO_TP_INT]);
+
+    bus = qdev_get_child_bus(mux, "ssi2");
+    max1111 = ssi_create_slave(bus, "max1111");
     max111x_set_input(max1111, MAX1111_BATT_VOLT, SPITZ_BATTERY_VOLT);
     max111x_set_input(max1111, MAX1111_BATT_TEMP, 0);
     max111x_set_input(max1111, MAX1111_ACIN_VOLT, SPITZ_CHARGEON_ACIN);
 
-    pxa2xx_ssp_attach(cpu->ssp[CORGI_SSP_PORT - 1], corgi_ssp_read,
-                    corgi_ssp_write, cpu);
-
-    chipselects = qemu_allocate_irqs(corgi_ssp_gpio_cs, cpu, 3);
-    pxa2xx_gpio_out_set(cpu->gpio, SPITZ_GPIO_LCDCON_CS,  chipselects[0]);
-    pxa2xx_gpio_out_set(cpu->gpio, SPITZ_GPIO_ADS7846_CS, chipselects[1]);
-    pxa2xx_gpio_out_set(cpu->gpio, SPITZ_GPIO_MAX1111_CS, chipselects[2]);
-
-    bl_intensity = 0x20;
-    bl_power = 0;
-
-    register_savevm("spitz_ssp", 0, 0, spitz_ssp_save, spitz_ssp_load, cpu);
+    pxa2xx_gpio_out_set(cpu->gpio, SPITZ_GPIO_LCDCON_CS,
+                        qdev_get_gpio_in(mux, 0));
+    pxa2xx_gpio_out_set(cpu->gpio, SPITZ_GPIO_ADS7846_CS,
+                        qdev_get_gpio_in(mux, 1));
+    pxa2xx_gpio_out_set(cpu->gpio, SPITZ_GPIO_MAX1111_CS,
+                        qdev_get_gpio_in(mux, 2));
 }
 
 /* CF Microdrive */
 
-static void spitz_microdrive_attach(struct pxa2xx_state_s *cpu)
+static void spitz_microdrive_attach(PXA2xxState *cpu, int slot)
 {
-    struct pcmcia_card_s *md;
-    int index;
+    PCMCIACardState *md;
     BlockDriverState *bs;
+    DriveInfo *dinfo;
 
-    index = drive_get_index(IF_IDE, 0, 0);
-    if (index == -1)
+    dinfo = drive_get(IF_IDE, 0, 0);
+    if (!dinfo)
         return;
-    bs = drives_table[index].bdrv;
+    bs = dinfo->bdrv;
     if (bdrv_is_inserted(bs) && !bdrv_is_removable(bs)) {
-        md = dscm1xxxx_init(bs);
-        pxa2xx_pcmcia_attach(cpu->pcmcia[1], md);
+        md = dscm1xxxx_init(dinfo);
+        pxa2xx_pcmcia_attach(cpu->pcmcia[slot], md);
     }
 }
 
@@ -972,20 +779,16 @@ static void spitz_wm8750_addr(void *opaque, int line, int level)
 }
 #endif
 
-static void spitz_i2c_setup(struct pxa2xx_state_s *cpu)
+static void spitz_i2c_setup(PXA2xxState *cpu)
 {
     /* Attach the CPU on one end of our I2C bus.  */
     i2c_bus *bus = pxa2xx_i2c_bus(cpu->i2c[0]);
 
 #ifdef HAS_AUDIO
-    AudioState *audio;
-    i2c_slave *wm;
+    DeviceState *wm;
 
-    audio = AUD_init();
-    if (!audio)
-        return;
     /* Attach a WM8750 to the bus */
-    wm = wm8750_init(bus, audio);
+    wm = i2c_create_slave(bus, "wm8750", 0);
 
     spitz_wm8750_addr(wm, 0, 0);
     pxa2xx_gpio_out_set(cpu->gpio, SPITZ_GPIO_WM,
@@ -998,11 +801,11 @@ static void spitz_i2c_setup(struct pxa2xx_state_s *cpu)
 #endif
 }
 
-static void spitz_akita_i2c_setup(struct pxa2xx_state_s *cpu)
+static void spitz_akita_i2c_setup(PXA2xxState *cpu)
 {
     /* Attach a Max7310 to Akita I2C bus.  */
-    i2c_set_slave_address(max7310_init(pxa2xx_i2c_bus(cpu->i2c[0])),
-                    AKITA_MAX_ADDR);
+    i2c_create_slave(pxa2xx_i2c_bus(cpu->i2c[0]), "max7310",
+                     AKITA_MAX_ADDR);
 }
 
 /* Other peripherals */
@@ -1011,16 +814,16 @@ static void spitz_out_switch(void *opaque, int line, int level)
 {
     switch (line) {
     case 0:
-        spitz_printf("Charging %s.\n", level ? "off" : "on");
+        zaurus_printf("Charging %s.\n", level ? "off" : "on");
         break;
     case 1:
-        spitz_printf("Discharging %s.\n", level ? "on" : "off");
+        zaurus_printf("Discharging %s.\n", level ? "on" : "off");
         break;
     case 2:
-        spitz_printf("Green LED %s.\n", level ? "on" : "off");
+        zaurus_printf("Green LED %s.\n", level ? "on" : "off");
         break;
     case 3:
-        spitz_printf("Orange LED %s.\n", level ? "on" : "off");
+        zaurus_printf("Orange LED %s.\n", level ? "on" : "off");
         break;
     case 4:
         spitz_bl_bit5(opaque, line, level);
@@ -1049,22 +852,22 @@ static void spitz_out_switch(void *opaque, int line, int level)
 #define SPITZ_SCP2_BACKLIGHT_ON		8
 #define SPITZ_SCP2_MIC_BIAS		9
 
-static void spitz_scoop_gpio_setup(struct pxa2xx_state_s *cpu,
-                struct scoop_info_s *scp, int num)
+static void spitz_scoop_gpio_setup(PXA2xxState *cpu,
+                ScoopInfo *scp0, ScoopInfo *scp1)
 {
     qemu_irq *outsignals = qemu_allocate_irqs(spitz_out_switch, cpu, 8);
 
-    scoop_gpio_out_set(&scp[0], SPITZ_SCP_CHRG_ON, outsignals[0]);
-    scoop_gpio_out_set(&scp[0], SPITZ_SCP_JK_B, outsignals[1]);
-    scoop_gpio_out_set(&scp[0], SPITZ_SCP_LED_GREEN, outsignals[2]);
-    scoop_gpio_out_set(&scp[0], SPITZ_SCP_LED_ORANGE, outsignals[3]);
+    scoop_gpio_out_set(scp0, SPITZ_SCP_CHRG_ON, outsignals[0]);
+    scoop_gpio_out_set(scp0, SPITZ_SCP_JK_B, outsignals[1]);
+    scoop_gpio_out_set(scp0, SPITZ_SCP_LED_GREEN, outsignals[2]);
+    scoop_gpio_out_set(scp0, SPITZ_SCP_LED_ORANGE, outsignals[3]);
 
-    if (num >= 2) {
-        scoop_gpio_out_set(&scp[1], SPITZ_SCP2_BACKLIGHT_CONT, outsignals[4]);
-        scoop_gpio_out_set(&scp[1], SPITZ_SCP2_BACKLIGHT_ON, outsignals[5]);
+    if (scp1) {
+        scoop_gpio_out_set(scp1, SPITZ_SCP2_BACKLIGHT_CONT, outsignals[4]);
+        scoop_gpio_out_set(scp1, SPITZ_SCP2_BACKLIGHT_ON, outsignals[5]);
     }
 
-    scoop_gpio_out_set(&scp[0], SPITZ_SCP_ADC_TEMP_ON, outsignals[6]);
+    scoop_gpio_out_set(scp0, SPITZ_SCP_ADC_TEMP_ON, outsignals[6]);
 }
 
 #define SPITZ_GPIO_HSYNC		22
@@ -1081,12 +884,12 @@ static int spitz_hsync;
 
 static void spitz_lcd_hsync_handler(void *opaque, int line, int level)
 {
-    struct pxa2xx_state_s *cpu = (struct pxa2xx_state_s *) opaque;
+    PXA2xxState *cpu = (PXA2xxState *) opaque;
     qemu_set_irq(pxa2xx_gpio_in_get(cpu->gpio)[SPITZ_GPIO_HSYNC], spitz_hsync);
     spitz_hsync ^= 1;
 }
 
-static void spitz_gpio_setup(struct pxa2xx_state_s *cpu, int slots)
+static void spitz_gpio_setup(PXA2xxState *cpu, int slots)
 {
     qemu_irq lcd_hsync;
     /*
@@ -1134,49 +937,6 @@ static void spitz_gpio_setup(struct pxa2xx_state_s *cpu, int slots)
                     spitz_gpio_invert[4]);
 }
 
-/* Write the bootloader parameters memory area.  */
-
-#define MAGIC_CHG(a, b, c, d)	((d << 24) | (c << 16) | (b << 8) | a)
-
-struct __attribute__ ((__packed__)) sl_param_info {
-    uint32_t comadj_keyword;
-    int32_t comadj;
-
-    uint32_t uuid_keyword;
-    char uuid[16];
-
-    uint32_t touch_keyword;
-    int32_t touch_xp;
-    int32_t touch_yp;
-    int32_t touch_xd;
-    int32_t touch_yd;
-
-    uint32_t adadj_keyword;
-    int32_t adadj;
-
-    uint32_t phad_keyword;
-    int32_t phadadj;
-} spitz_bootparam = {
-    .comadj_keyword	= MAGIC_CHG('C', 'M', 'A', 'D'),
-    .comadj		= 125,
-    .uuid_keyword	= MAGIC_CHG('U', 'U', 'I', 'D'),
-    .uuid		= { -1 },
-    .touch_keyword	= MAGIC_CHG('T', 'U', 'C', 'H'),
-    .touch_xp		= -1,
-    .adadj_keyword	= MAGIC_CHG('B', 'V', 'A', 'D'),
-    .adadj		= -1,
-    .phad_keyword	= MAGIC_CHG('P', 'H', 'A', 'D'),
-    .phadadj		= 0x01,
-};
-
-static void sl_bootparam_write(uint32_t ptr)
-{
-    memcpy(phys_ram_base + ptr, &spitz_bootparam,
-                    sizeof(struct sl_param_info));
-}
-
-#define SL_PXA_PARAM_BASE	0xa0000a00
-
 /* Board init.  */
 enum spitz_model_e { spitz, akita, borzoi, terrier };
 
@@ -1188,24 +948,19 @@ static struct arm_boot_info spitz_binfo = {
     .ram_size = 0x04000000,
 };
 
-static void spitz_common_init(ram_addr_t ram_size, int vga_ram_size,
-                DisplayState *ds, const char *kernel_filename,
+static void spitz_common_init(ram_addr_t ram_size,
+                const char *kernel_filename,
                 const char *kernel_cmdline, const char *initrd_filename,
                 const char *cpu_model, enum spitz_model_e model, int arm_id)
 {
-    struct pxa2xx_state_s *cpu;
-    struct scoop_info_s *scp;
+    PXA2xxState *cpu;
+    ScoopInfo *scp0, *scp1 = NULL;
 
     if (!cpu_model)
         cpu_model = (model == terrier) ? "pxa270-c5" : "pxa270-c0";
 
     /* Setup CPU & memory */
-    if (ram_size < SPITZ_RAM + SPITZ_ROM + PXA2XX_INTERNAL_SIZE) {
-        fprintf(stderr, "This platform requires %i bytes of memory\n",
-                        SPITZ_RAM + SPITZ_ROM + PXA2XX_INTERNAL_SIZE);
-        exit(1);
-    }
-    cpu = pxa270_init(spitz_binfo.ram_size, ds, cpu_model);
+    cpu = pxa270_init(spitz_binfo.ram_size, cpu_model);
 
     sl_flash_register(cpu, (model == spitz) ? FLASH_128M : FLASH_1024M);
 
@@ -1217,9 +972,12 @@ static void spitz_common_init(ram_addr_t ram_size, int vga_ram_size,
 
     spitz_ssp_attach(cpu);
 
-    scp = spitz_scoop_init(cpu, (model == akita) ? 1 : 2);
+    scp0 = scoop_init(cpu, 0, 0x10800000);
+    if (model != akita) {
+	    scp1 = scoop_init(cpu, 1, 0x08800040);
+    }
 
-    spitz_scoop_gpio_setup(cpu, scp, (model == akita) ? 1 : 2);
+    spitz_scoop_gpio_setup(cpu, scp0, scp1);
 
     spitz_gpio_setup(cpu, (model == akita) ? 1 : 2);
 
@@ -1230,10 +988,10 @@ static void spitz_common_init(ram_addr_t ram_size, int vga_ram_size,
 
     if (model == terrier)
         /* A 6.0 GB microdrive is permanently sitting in CF slot 1.  */
-        spitz_microdrive_attach(cpu);
+        spitz_microdrive_attach(cpu, 1);
     else if (model != akita)
-        /* A 4.0 GB microdrive is permanently sitting in CF slot 1.  */
-        spitz_microdrive_attach(cpu);
+        /* A 4.0 GB microdrive is permanently sitting in CF slot 0.  */
+        spitz_microdrive_attach(cpu, 0);
 
     /* Setup initial (reset) machine state */
     cpu->env->regs[15] = spitz_binfo.loader_start;
@@ -1243,69 +1001,97 @@ static void spitz_common_init(ram_addr_t ram_size, int vga_ram_size,
     spitz_binfo.initrd_filename = initrd_filename;
     spitz_binfo.board_id = arm_id;
     arm_load_kernel(cpu->env, &spitz_binfo);
-    sl_bootparam_write(SL_PXA_PARAM_BASE - PXA2XX_SDRAM_BASE);
+    sl_bootparam_write(SL_PXA_PARAM_BASE);
 }
 
-static void spitz_init(ram_addr_t ram_size, int vga_ram_size,
-                const char *boot_device, DisplayState *ds,
+static void spitz_init(ram_addr_t ram_size,
+                const char *boot_device,
                 const char *kernel_filename, const char *kernel_cmdline,
                 const char *initrd_filename, const char *cpu_model)
 {
-    spitz_common_init(ram_size, vga_ram_size, ds, kernel_filename,
+    spitz_common_init(ram_size, kernel_filename,
                 kernel_cmdline, initrd_filename, cpu_model, spitz, 0x2c9);
 }
 
-static void borzoi_init(ram_addr_t ram_size, int vga_ram_size,
-                const char *boot_device, DisplayState *ds,
+static void borzoi_init(ram_addr_t ram_size,
+                const char *boot_device,
                 const char *kernel_filename, const char *kernel_cmdline,
                 const char *initrd_filename, const char *cpu_model)
 {
-    spitz_common_init(ram_size, vga_ram_size, ds, kernel_filename,
+    spitz_common_init(ram_size, kernel_filename,
                 kernel_cmdline, initrd_filename, cpu_model, borzoi, 0x33f);
 }
 
-static void akita_init(ram_addr_t ram_size, int vga_ram_size,
-                const char *boot_device, DisplayState *ds,
+static void akita_init(ram_addr_t ram_size,
+                const char *boot_device,
                 const char *kernel_filename, const char *kernel_cmdline,
                 const char *initrd_filename, const char *cpu_model)
 {
-    spitz_common_init(ram_size, vga_ram_size, ds, kernel_filename,
+    spitz_common_init(ram_size, kernel_filename,
                 kernel_cmdline, initrd_filename, cpu_model, akita, 0x2e8);
 }
 
-static void terrier_init(ram_addr_t ram_size, int vga_ram_size,
-                const char *boot_device, DisplayState *ds,
+static void terrier_init(ram_addr_t ram_size,
+                const char *boot_device,
                 const char *kernel_filename, const char *kernel_cmdline,
                 const char *initrd_filename, const char *cpu_model)
 {
-    spitz_common_init(ram_size, vga_ram_size, ds, kernel_filename,
+    spitz_common_init(ram_size, kernel_filename,
                 kernel_cmdline, initrd_filename, cpu_model, terrier, 0x33f);
 }
 
-QEMUMachine akitapda_machine = {
-    "akita",
-    "Akita PDA (PXA270)",
-    akita_init,
-    SPITZ_RAM + SPITZ_ROM + PXA2XX_INTERNAL_SIZE + RAMSIZE_FIXED,
+static QEMUMachine akitapda_machine = {
+    .name = "akita",
+    .desc = "Akita PDA (PXA270)",
+    .init = akita_init,
 };
 
-QEMUMachine spitzpda_machine = {
-    "spitz",
-    "Spitz PDA (PXA270)",
-    spitz_init,
-    SPITZ_RAM + SPITZ_ROM + PXA2XX_INTERNAL_SIZE + RAMSIZE_FIXED,
+static QEMUMachine spitzpda_machine = {
+    .name = "spitz",
+    .desc = "Spitz PDA (PXA270)",
+    .init = spitz_init,
 };
 
-QEMUMachine borzoipda_machine = {
-    "borzoi",
-    "Borzoi PDA (PXA270)",
-    borzoi_init,
-    SPITZ_RAM + SPITZ_ROM + PXA2XX_INTERNAL_SIZE + RAMSIZE_FIXED,
+static QEMUMachine borzoipda_machine = {
+    .name = "borzoi",
+    .desc = "Borzoi PDA (PXA270)",
+    .init = borzoi_init,
 };
 
-QEMUMachine terrierpda_machine = {
-    "terrier",
-    "Terrier PDA (PXA270)",
-    terrier_init,
-    SPITZ_RAM + SPITZ_ROM + PXA2XX_INTERNAL_SIZE + RAMSIZE_FIXED,
+static QEMUMachine terrierpda_machine = {
+    .name = "terrier",
+    .desc = "Terrier PDA (PXA270)",
+    .init = terrier_init,
 };
+
+static void spitz_machine_init(void)
+{
+    qemu_register_machine(&akitapda_machine);
+    qemu_register_machine(&spitzpda_machine);
+    qemu_register_machine(&borzoipda_machine);
+    qemu_register_machine(&terrierpda_machine);
+}
+
+machine_init(spitz_machine_init);
+
+static SSISlaveInfo corgi_ssp_info = {
+    .qdev.name = "corgi-ssp",
+    .qdev.size = sizeof(CorgiSSPState),
+    .init = corgi_ssp_init,
+    .transfer = corgi_ssp_transfer
+};
+
+static SSISlaveInfo spitz_lcdtg_info = {
+    .qdev.name = "spitz-lcdtg",
+    .qdev.size = sizeof(SpitzLCDTG),
+    .init = spitz_lcdtg_init,
+    .transfer = spitz_lcdtg_transfer
+};
+
+static void spitz_register_devices(void)
+{
+    ssi_register_slave(&corgi_ssp_info);
+    ssi_register_slave(&spitz_lcdtg_info);
+}
+
+device_init(spitz_register_devices)

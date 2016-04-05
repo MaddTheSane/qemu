@@ -37,38 +37,31 @@ typedef struct WAVVoiceOut {
 } WAVVoiceOut;
 
 static struct {
-    audsettings_t settings;
+    struct audsettings settings;
     const char *wav_path;
 } conf = {
-    {
-        44100,
-        2,
-        AUD_FMT_S16,
-        0
-    },
-    "qemu.wav"
+    .settings.freq      = 44100,
+    .settings.nchannels = 2,
+    .settings.fmt       = AUD_FMT_S16,
+    .wav_path           = "qemu.wav"
 };
 
-static int wav_run_out (HWVoiceOut *hw)
+static int wav_run_out (HWVoiceOut *hw, int live)
 {
     WAVVoiceOut *wav = (WAVVoiceOut *) hw;
-    int rpos, live, decr, samples;
+    int rpos, decr, samples;
     uint8_t *dst;
-    st_sample_t *src;
+    struct st_sample *src;
     int64_t now = qemu_get_clock (vm_clock);
     int64_t ticks = now - wav->old_ticks;
-    int64_t bytes = (ticks * hw->info.bytes_per_second) / ticks_per_sec;
+    int64_t bytes =
+        muldiv64 (ticks, hw->info.bytes_per_second, get_ticks_per_sec ());
 
     if (bytes > INT_MAX) {
         samples = INT_MAX >> hw->info.shift;
     }
     else {
         samples = bytes >> hw->info.shift;
-    }
-
-    live = audio_pcm_hw_get_live_out (hw);
-    if (!live) {
-        return 0;
     }
 
     wav->old_ticks = now;
@@ -109,7 +102,7 @@ static void le_store (uint8_t *buf, uint32_t val, int len)
     }
 }
 
-static int wav_init_out (HWVoiceOut *hw, audsettings_t *as)
+static int wav_init_out (HWVoiceOut *hw, struct audsettings *as)
 {
     WAVVoiceOut *wav = (WAVVoiceOut *) hw;
     int bits16 = 0, stereo = 0;
@@ -119,7 +112,7 @@ static int wav_init_out (HWVoiceOut *hw, audsettings_t *as)
         0x02, 0x00, 0x44, 0xac, 0x00, 0x00, 0x10, 0xb1, 0x02, 0x00, 0x04,
         0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x00, 0x00, 0x00, 0x00
     };
-    audsettings_t wav_as = conf.settings;
+    struct audsettings wav_as = conf.settings;
 
     (void) as;
 
@@ -218,46 +211,52 @@ static void wav_audio_fini (void *opaque)
     ldebug ("wav_fini");
 }
 
-struct audio_option wav_options[] = {
-    {"FREQUENCY", AUD_OPT_INT, &conf.settings.freq,
-     "Frequency", NULL, 0},
-
-    {"FORMAT", AUD_OPT_FMT, &conf.settings.fmt,
-     "Format", NULL, 0},
-
-    {"DAC_FIXED_CHANNELS", AUD_OPT_INT, &conf.settings.nchannels,
-     "Number of channels (1 - mono, 2 - stereo)", NULL, 0},
-
-    {"PATH", AUD_OPT_STR, &conf.wav_path,
-     "Path to wave file", NULL, 0},
-    {NULL, 0, NULL, NULL, NULL, 0}
+static struct audio_option wav_options[] = {
+    {
+        .name  = "FREQUENCY",
+        .tag   = AUD_OPT_INT,
+        .valp  = &conf.settings.freq,
+        .descr = "Frequency"
+    },
+    {
+        .name  = "FORMAT",
+        .tag   = AUD_OPT_FMT,
+        .valp  = &conf.settings.fmt,
+        .descr = "Format"
+    },
+    {
+        .name  = "DAC_FIXED_CHANNELS",
+        .tag   = AUD_OPT_INT,
+        .valp  = &conf.settings.nchannels,
+        .descr = "Number of channels (1 - mono, 2 - stereo)"
+    },
+    {
+        .name  = "PATH",
+        .tag   = AUD_OPT_STR,
+        .valp  = &conf.wav_path,
+        .descr = "Path to wave file"
+    },
+    { /* End of list */ }
 };
 
-struct audio_pcm_ops wav_pcm_ops = {
-    wav_init_out,
-    wav_fini_out,
-    wav_run_out,
-    wav_write_out,
-    wav_ctl_out,
-
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL
+static struct audio_pcm_ops wav_pcm_ops = {
+    .init_out = wav_init_out,
+    .fini_out = wav_fini_out,
+    .run_out  = wav_run_out,
+    .write    = wav_write_out,
+    .ctl_out  = wav_ctl_out,
 };
 
 struct audio_driver wav_audio_driver = {
-    INIT_FIELD (name           = ) "wav",
-    INIT_FIELD (descr          = )
-    "WAV renderer http://wikipedia.org/wiki/WAV",
-    INIT_FIELD (options        = ) wav_options,
-    INIT_FIELD (init           = ) wav_audio_init,
-    INIT_FIELD (fini           = ) wav_audio_fini,
-    INIT_FIELD (pcm_ops        = ) &wav_pcm_ops,
-    INIT_FIELD (can_be_default = ) 0,
-    INIT_FIELD (max_voices_out = ) 1,
-    INIT_FIELD (max_voices_in  = ) 0,
-    INIT_FIELD (voice_size_out = ) sizeof (WAVVoiceOut),
-    INIT_FIELD (voice_size_in  = ) 0
+    .name           = "wav",
+    .descr          = "WAV renderer http://wikipedia.org/wiki/WAV",
+    .options        = wav_options,
+    .init           = wav_audio_init,
+    .fini           = wav_audio_fini,
+    .pcm_ops        = &wav_pcm_ops,
+    .can_be_default = 0,
+    .max_voices_out = 1,
+    .max_voices_in  = 0,
+    .voice_size_out = sizeof (WAVVoiceOut),
+    .voice_size_in  = 0
 };

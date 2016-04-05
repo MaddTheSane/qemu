@@ -18,14 +18,15 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
 
 #include "hw.h"
 #include "pci.h"
 #include "net.h"
+#include "net/checksum.h"
+#include "loader.h"
 
 #include "e1000_hw.h"
 
@@ -41,12 +42,12 @@ enum {
 #define DBGBIT(x)	(1<<DEBUG_##x)
 static int debugflags = DBGBIT(TXERR) | DBGBIT(GENERAL);
 
-#define	DBGOUT(what, fmt, params...) do { \
+#define	DBGOUT(what, fmt, ...) do { \
     if (debugflags & DBGBIT(what)) \
-        fprintf(stderr, "e1000: " fmt, ##params); \
+        fprintf(stderr, "e1000: " fmt, ## __VA_ARGS__); \
     } while (0)
 #else
-#define	DBGOUT(what, fmt, params...) do {} while (0)
+#define	DBGOUT(what, fmt, ...) do {} while (0)
 #endif
 
 #define IOPORT_SIZE       0x40
@@ -74,10 +75,8 @@ enum {
 
 typedef struct E1000State_st {
     PCIDevice dev;
-    VLANClientState *vc;
-    NICInfo *nd;
-    uint32_t instance;
-    uint32_t mmio_base;
+    NICState *nic;
+    NICConf conf;
     int mmio_index;
 
     uint32_t mac_reg[0x8000];
@@ -89,9 +88,13 @@ typedef struct E1000State_st {
     int check_rxov;
     struct e1000_tx {
         unsigned char header[256];
+        unsigned char vlan_header[4];
+        /* Fields vlan and data must not be reordered or separated. */
+        unsigned char vlan[4];
         unsigned char data[0x10000];
         uint16_t size;
         unsigned char sum_needed;
+        unsigned char vlan_needed;
         uint8_t ipcss;
         uint8_t ipcso;
         uint16_t ipcse;
@@ -103,8 +106,9 @@ typedef struct E1000State_st {
         uint32_t paylen;
         uint16_t tso_frames;
         char tse;
-        char ip;
-        char tcp;
+        int8_t ip;
+        int8_t tcp;
+        char cptse;     // current packet tse bit
     } tx;
 
     struct {
@@ -127,11 +131,12 @@ enum {
     defreg(TDBAL),	defreg(TDH),	defreg(TDLEN),	defreg(TDT),
     defreg(TORH),	defreg(TORL),	defreg(TOTH),	defreg(TOTL),
     defreg(TPR),	defreg(TPT),	defreg(TXDCTL),	defreg(WUFC),
-    defreg(RA),		defreg(MTA),	defreg(CRCERRS),
+    defreg(RA),		defreg(MTA),	defreg(CRCERRS),defreg(VFTA),
+    defreg(VET),
 };
 
 enum { PHY_R = 1, PHY_W = 2, PHY_RW = PHY_R | PHY_W };
-static char phy_regcap[0x20] = {
+static const char phy_regcap[0x20] = {
     [PHY_STATUS] = PHY_R,	[M88E1000_EXT_PHY_SPEC_CTRL] = PHY_RW,
     [PHY_ID1] = PHY_R,		[M88E1000_PHY_SPEC_CTRL] = PHY_RW,
     [PHY_CTRL] = PHY_RW,	[PHY_1000T_CTRL] = PHY_RW,
@@ -141,10 +146,11 @@ static char phy_regcap[0x20] = {
 };
 
 static void
-ioport_map(PCIDevice *pci_dev, int region_num, uint32_t addr,
-           uint32_t size, int type)
+ioport_map(PCIDevice *pci_dev, int region_num, pcibus_t addr,
+           pcibus_t size, int type)
 {
-    DBGOUT(IO, "e1000_ioport_map addr=0x%04x size=0x%08x\n", addr, size);
+    DBGOUT(IO, "e1000_ioport_map addr=0x%04"FMT_PCIBUS
+           " size=0x%08"FMT_PCIBUS"\n", addr, size);
 }
 
 static void
@@ -153,6 +159,7 @@ set_interrupt_cause(E1000State *s, int index, uint32_t val)
     if (val)
         val |= E1000_ICR_INT_ASSERTED;
     s->mac_reg[ICR] = val;
+    s->mac_reg[ICS] = val;
     qemu_set_irq(s->dev.irq[0], (s->mac_reg[IMS] & s->mac_reg[ICR]) != 0);
 }
 
@@ -185,6 +192,13 @@ rxbufsize(uint32_t v)
         return 256;
     }
     return 2048;
+}
+
+static void
+set_ctrl(E1000State *s, int index, uint32_t val)
+{
+    /* RST is self clearing */
+    s->mac_reg[CTRL] = val & ~E1000_CTRL_RST;
 }
 
 static void
@@ -253,6 +267,11 @@ set_eecd(E1000State *s, int index, uint32_t val)
     }
     if (!(val & E1000_EECD_CS)) {		// rising, no CS (EEPROM reset)
         memset(&s->eecd_state, 0, sizeof s->eecd_state);
+        /*
+         * restore old_eecd's E1000_EECD_SK (known to be on)
+         * to avoid false detection of a clock edge
+         */
+        s->eecd_state.old_eecd = E1000_EECD_SK;
         return;
     }
     s->eecd_state.val_in <<= 1;
@@ -273,32 +292,53 @@ flash_eerd_read(E1000State *s, int x)
 {
     unsigned int index, r = s->mac_reg[EERD] & ~E1000_EEPROM_RW_REG_START;
 
+    if ((s->mac_reg[EERD] & E1000_EEPROM_RW_REG_START) == 0)
+        return (s->mac_reg[EERD]);
+
     if ((index = r >> E1000_EEPROM_RW_ADDR_SHIFT) > EEPROM_CHECKSUM_REG)
-        return 0;
-    return (s->eeprom_data[index] << E1000_EEPROM_RW_REG_DATA) |
-           E1000_EEPROM_RW_REG_DONE | r;
-}
+        return (E1000_EEPROM_RW_REG_DONE | r);
 
-static unsigned int
-do_cksum(uint8_t *dp, uint8_t *de)
-{
-    unsigned int bsum[2] = {0, 0}, i, sum;
-
-    for (i = 1; dp < de; bsum[i^=1] += *dp++)
-        ;
-    sum = (bsum[0] << 8) + bsum[1];
-    sum = (sum >> 16) + (sum & 0xffff);
-    return ~(sum + (sum >> 16));
+    return ((s->eeprom_data[index] << E1000_EEPROM_RW_REG_DATA) |
+           E1000_EEPROM_RW_REG_DONE | r);
 }
 
 static void
 putsum(uint8_t *data, uint32_t n, uint32_t sloc, uint32_t css, uint32_t cse)
 {
+    uint32_t sum;
+
     if (cse && cse < n)
         n = cse + 1;
-    if (sloc < n-1)
+    if (sloc < n-1) {
+        sum = net_checksum_add(n-css, data+css);
         cpu_to_be16wu((uint16_t *)(data + sloc),
-                      do_cksum(data + css, data + n));
+                      net_checksum_finish(sum));
+    }
+}
+
+static inline int
+vlan_enabled(E1000State *s)
+{
+    return ((s->mac_reg[CTRL] & E1000_CTRL_VME) != 0);
+}
+
+static inline int
+vlan_rx_filter_enabled(E1000State *s)
+{
+    return ((s->mac_reg[RCTL] & E1000_RCTL_VFE) != 0);
+}
+
+static inline int
+is_vlan_packet(E1000State *s, const uint8_t *buf)
+{
+    return (be16_to_cpup((uint16_t *)(buf + 12)) ==
+                le16_to_cpup((uint16_t *)(s->mac_reg + VET)));
+}
+
+static inline int
+is_vlan_txd(uint32_t txd_lower)
+{
+    return ((txd_lower & E1000_TXD_CMD_VLE) != 0);
 }
 
 static void
@@ -308,7 +348,7 @@ xmit_seg(E1000State *s)
     unsigned int frames = s->tx.tso_frames, css, sofar, n;
     struct e1000_tx *tp = &s->tx;
 
-    if (tp->tse) {
+    if (tp->tse && tp->cptse) {
         css = tp->ipcss;
         DBGOUT(TXSUM, "frames %d size %d ipcss %d\n",
                frames, tp->size, css);
@@ -343,7 +383,13 @@ xmit_seg(E1000State *s)
         putsum(tp->data, tp->size, tp->tucso, tp->tucss, tp->tucse);
     if (tp->sum_needed & E1000_TXD_POPTS_IXSM)
         putsum(tp->data, tp->size, tp->ipcso, tp->ipcss, tp->ipcse);
-    qemu_send_packet(s->vc, tp->data, tp->size);
+    if (tp->vlan_needed) {
+        memmove(tp->vlan, tp->data, 4);
+        memmove(tp->data, tp->data + 4, 8);
+        memcpy(tp->data + 8, tp->vlan_header, 4);
+        qemu_send_packet(&s->nic->nc, tp->vlan, tp->size + 4);
+    } else
+        qemu_send_packet(&s->nic->nc, tp->data, tp->size);
     s->mac_reg[TPT]++;
     s->mac_reg[GPTC]++;
     n = s->mac_reg[TOTL];
@@ -382,37 +428,59 @@ process_tx_desc(E1000State *s, struct e1000_tx_desc *dp)
             tp->tucso = tp->tucss + (tp->tcp ? 16 : 6);
         }
         return;
-    } else if (dtype == (E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D))
+    } else if (dtype == (E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D)) {
+        // data descriptor
         tp->sum_needed = le32_to_cpu(dp->upper.data) >> 8;
+        tp->cptse = ( txd_lower & E1000_TXD_CMD_TSE ) ? 1 : 0;
+    } else
+        // legacy descriptor
+        tp->cptse = 0;
 
+    if (vlan_enabled(s) && is_vlan_txd(txd_lower) &&
+        (tp->cptse || txd_lower & E1000_TXD_CMD_EOP)) {
+        tp->vlan_needed = 1;
+        cpu_to_be16wu((uint16_t *)(tp->vlan_header),
+                      le16_to_cpup((uint16_t *)(s->mac_reg + VET)));
+        cpu_to_be16wu((uint16_t *)(tp->vlan_header + 2),
+                      le16_to_cpu(dp->upper.fields.special));
+    }
+        
     addr = le64_to_cpu(dp->buffer_addr);
-    if (tp->tse) {
+    if (tp->tse && tp->cptse) {
         hdr = tp->hdr_len;
         msh = hdr + tp->mss;
+        do {
+            bytes = split_size;
+            if (tp->size + bytes > msh)
+                bytes = msh - tp->size;
+            cpu_physical_memory_read(addr, tp->data + tp->size, bytes);
+            if ((sz = tp->size + bytes) >= hdr && tp->size < hdr)
+                memmove(tp->header, tp->data, hdr);
+            tp->size = sz;
+            addr += bytes;
+            if (sz == msh) {
+                xmit_seg(s);
+                memmove(tp->data, tp->header, hdr);
+                tp->size = hdr;
+            }
+        } while (split_size -= bytes);
+    } else if (!tp->tse && tp->cptse) {
+        // context descriptor TSE is not set, while data descriptor TSE is set
+        DBGOUT(TXERR, "TCP segmentaion Error\n");
+    } else {
+        cpu_physical_memory_read(addr, tp->data + tp->size, split_size);
+        tp->size += split_size;
     }
-    do {
-        bytes = split_size;
-        if (tp->size + bytes > msh)
-            bytes = msh - tp->size;
-        cpu_physical_memory_read(addr, tp->data + tp->size, bytes);
-        if ((sz = tp->size + bytes) >= hdr && tp->size < hdr)
-            memmove(tp->header, tp->data, hdr);
-        tp->size = sz;
-        addr += bytes;
-        if (sz == msh) {
-            xmit_seg(s);
-            memmove(tp->data, tp->header, hdr);
-            tp->size = hdr;
-        }
-    } while (split_size -= bytes);
 
     if (!(txd_lower & E1000_TXD_CMD_EOP))
         return;
-    if (tp->size > hdr)
+    if (!(tp->tse && tp->cptse && tp->size < hdr))
         xmit_seg(s);
     tp->tso_frames = 0;
     tp->sum_needed = 0;
+    tp->vlan_needed = 0;
     tp->size = 0;
+    tp->cptse = 0;
 }
 
 static uint32_t
@@ -448,7 +516,7 @@ start_xmit(E1000State *s)
         cpu_physical_memory_read(base, (void *)&desc, sizeof(desc));
 
         DBGOUT(TX, "index %d: %p : %x %x\n", s->mac_reg[TDH],
-               (void *)desc.buffer_addr, desc.lower.data,
+               (void *)(intptr_t)desc.buffer_addr, desc.lower.data,
                desc.upper.data);
 
         process_tx_desc(s, &desc);
@@ -476,6 +544,14 @@ receive_filter(E1000State *s, const uint8_t *buf, int size)
     static uint8_t bcast[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     static int mta_shift[] = {4, 3, 2, 0};
     uint32_t f, rctl = s->mac_reg[RCTL], ra[2], *rp;
+
+    if (is_vlan_packet(s, buf) && vlan_rx_filter_enabled(s)) {
+        uint16_t vid = be16_to_cpup((uint16_t *)(buf + 14));
+        uint32_t vfta = le32_to_cpup((uint32_t *)(s->mac_reg + VFTA) +
+                                     ((vid >> 5) & 0x7f));
+        if ((vfta & (1 << (vid & 0x1f))) == 0)
+            return 0;
+    }
 
     if (rctl & E1000_RCTL_UPE)			// promiscuous
         return 1;
@@ -515,50 +591,75 @@ receive_filter(E1000State *s, const uint8_t *buf, int size)
     return 0;
 }
 
-static int
-e1000_can_receive(void *opaque)
+static void
+e1000_set_link_status(VLANClientState *nc)
 {
-    E1000State *s = opaque;
+    E1000State *s = DO_UPCAST(NICState, nc, nc)->opaque;
+    uint32_t old_status = s->mac_reg[STATUS];
 
-    return (!(s->mac_reg[RCTL] & E1000_RCTL_EN) ||
-            s->mac_reg[RDH] != s->mac_reg[RDT]);
+    if (nc->link_down)
+        s->mac_reg[STATUS] &= ~E1000_STATUS_LU;
+    else
+        s->mac_reg[STATUS] |= E1000_STATUS_LU;
+
+    if (s->mac_reg[STATUS] != old_status)
+        set_ics(s, 0, E1000_ICR_LSC);
 }
 
-static void
-e1000_receive(void *opaque, const uint8_t *buf, int size)
+static int
+e1000_can_receive(VLANClientState *nc)
 {
-    E1000State *s = opaque;
+    E1000State *s = DO_UPCAST(NICState, nc, nc)->opaque;
+
+    return (s->mac_reg[RCTL] & E1000_RCTL_EN);
+}
+
+static ssize_t
+e1000_receive(VLANClientState *nc, const uint8_t *buf, size_t size)
+{
+    E1000State *s = DO_UPCAST(NICState, nc, nc)->opaque;
     struct e1000_rx_desc desc;
     target_phys_addr_t base;
     unsigned int n, rdt;
     uint32_t rdh_start;
+    uint16_t vlan_special = 0;
+    uint8_t vlan_status = 0, vlan_offset = 0;
 
     if (!(s->mac_reg[RCTL] & E1000_RCTL_EN))
-        return;
+        return -1;
 
     if (size > s->rxbuf_size) {
-        DBGOUT(RX, "packet too large for buffers (%d > %d)\n", size,
-               s->rxbuf_size);
-        return;
+        DBGOUT(RX, "packet too large for buffers (%lu > %d)\n",
+               (unsigned long)size, s->rxbuf_size);
+        return -1;
     }
 
     if (!receive_filter(s, buf, size))
-        return;
+        return size;
+
+    if (vlan_enabled(s) && is_vlan_packet(s, buf)) {
+        vlan_special = cpu_to_le16(be16_to_cpup((uint16_t *)(buf + 14)));
+        memmove((void *)(buf + 4), buf, 12);
+        vlan_status = E1000_RXD_STAT_VP;
+        vlan_offset = 4;
+        size -= 4;
+    }
 
     rdh_start = s->mac_reg[RDH];
     size += 4; // for the header
     do {
         if (s->mac_reg[RDH] == s->mac_reg[RDT] && s->check_rxov) {
             set_ics(s, 0, E1000_ICS_RXO);
-            return;
+            return -1;
         }
         base = ((uint64_t)s->mac_reg[RDBAH] << 32) + s->mac_reg[RDBAL] +
                sizeof(desc) * s->mac_reg[RDH];
         cpu_physical_memory_read(base, (void *)&desc, sizeof(desc));
-        desc.status |= E1000_RXD_STAT_DD;
+        desc.special = vlan_special;
+        desc.status |= (vlan_status | E1000_RXD_STAT_DD);
         if (desc.buffer_addr) {
             cpu_physical_memory_write(le64_to_cpu(desc.buffer_addr),
-                                      (void *)buf, size);
+                                      (void *)(buf + vlan_offset), size);
             desc.length = cpu_to_le16(size);
             desc.status |= E1000_RXD_STAT_EOP|E1000_RXD_STAT_IXSM;
         } else // as per intel docs; skip descriptors with null buf addr
@@ -573,7 +674,7 @@ e1000_receive(void *opaque, const uint8_t *buf, int size)
             DBGOUT(RXERR, "RDH wraparound @%x, RDT %x, RDLEN %x\n",
                    rdh_start, s->mac_reg[RDT], s->mac_reg[RDLEN]);
             set_ics(s, 0, E1000_ICS_RXO);
-            return;
+            return -1;
         }
     } while (desc.buffer_addr == 0);
 
@@ -586,11 +687,13 @@ e1000_receive(void *opaque, const uint8_t *buf, int size)
     n = E1000_ICS_RXT0;
     if ((rdt = s->mac_reg[RDT]) < s->mac_reg[RDH])
         rdt += s->mac_reg[RDLEN] / sizeof(desc);
-    if (((rdt - s->mac_reg[RDH]) * sizeof(desc)) << s->rxbuf_min_shift >=
-        s->mac_reg[RDLEN])
+    if (((rdt - s->mac_reg[RDH]) * sizeof(desc)) <= s->mac_reg[RDLEN] >>
+        s->rxbuf_min_shift)
         n |= E1000_ICS_RXDMT0;
 
     set_ics(s, 0, n);
+
+    return size;
 }
 
 static uint32_t
@@ -688,7 +791,9 @@ static uint32_t (*macreg_readops[])(E1000State *, int) = {
     getreg(WUFC),	getreg(TDT),	getreg(CTRL),	getreg(LEDCTL),
     getreg(MANC),	getreg(MDIC),	getreg(SWSM),	getreg(STATUS),
     getreg(TORL),	getreg(TOTL),	getreg(IMS),	getreg(TCTL),
-    getreg(RDH),	getreg(RDT),
+    getreg(RDH),	getreg(RDT),	getreg(VET),	getreg(ICS),
+    getreg(TDBAL),	getreg(TDBAH),	getreg(RDBAH),	getreg(RDBAL),
+    getreg(TDLEN),	getreg(RDLEN),
 
     [TOTH] = mac_read_clr8,	[TORH] = mac_read_clr8,	[GPRC] = mac_read_clr4,
     [GPTC] = mac_read_clr4,	[TPR] = mac_read_clr4,	[TPT] = mac_read_clr4,
@@ -696,29 +801,31 @@ static uint32_t (*macreg_readops[])(E1000State *, int) = {
     [CRCERRS ... MPC] = &mac_readreg,
     [RA ... RA+31] = &mac_readreg,
     [MTA ... MTA+127] = &mac_readreg,
+    [VFTA ... VFTA+127] = &mac_readreg,
 };
-enum { NREADOPS = sizeof(macreg_readops) / sizeof(*macreg_readops) };
+enum { NREADOPS = ARRAY_SIZE(macreg_readops) };
 
 #define putreg(x)	[x] = mac_writereg
 static void (*macreg_writeops[])(E1000State *, int, uint32_t) = {
     putreg(PBA),	putreg(EERD),	putreg(SWSM),	putreg(WUFC),
     putreg(TDBAL),	putreg(TDBAH),	putreg(TXDCTL),	putreg(RDBAH),
-    putreg(RDBAL),	putreg(LEDCTL),
+    putreg(RDBAL),	putreg(LEDCTL), putreg(VET),
     [TDLEN] = set_dlen,	[RDLEN] = set_dlen,	[TCTL] = set_tctl,
     [TDT] = set_tctl,	[MDIC] = set_mdic,	[ICS] = set_ics,
     [TDH] = set_16bit,	[RDH] = set_16bit,	[RDT] = set_rdt,
     [IMC] = set_imc,	[IMS] = set_ims,	[ICR] = set_icr,
-    [EECD] = set_eecd,	[RCTL] = set_rx_control,
+    [EECD] = set_eecd,	[RCTL] = set_rx_control, [CTRL] = set_ctrl,
     [RA ... RA+31] = &mac_writereg,
     [MTA ... MTA+127] = &mac_writereg,
+    [VFTA ... VFTA+127] = &mac_writereg,
 };
-enum { NWRITEOPS = sizeof(macreg_writeops) / sizeof(*macreg_writeops) };
+enum { NWRITEOPS = ARRAY_SIZE(macreg_writeops) };
 
 static void
 e1000_mmio_writel(void *opaque, target_phys_addr_t addr, uint32_t val)
 {
     E1000State *s = opaque;
-    unsigned int index = ((addr - s->mmio_base) & 0x1ffff) >> 2;
+    unsigned int index = (addr & 0x1ffff) >> 2;
 
 #ifdef TARGET_WORDS_BIGENDIAN
     val = bswap32(val);
@@ -752,7 +859,7 @@ static uint32_t
 e1000_mmio_readl(void *opaque, target_phys_addr_t addr)
 {
     E1000State *s = opaque;
-    unsigned int index = ((addr - s->mmio_base) & 0x1ffff) >> 2;
+    unsigned int index = (addr & 0x1ffff) >> 2;
 
     if (index < NREADOPS && macreg_readops[index])
     {
@@ -780,111 +887,90 @@ e1000_mmio_readw(void *opaque, target_phys_addr_t addr)
             (8 * (addr & 3))) & 0xffff;
 }
 
-int mac_regtosave[] = {
-    CTRL,	EECD,	EERD,	GPRC,	GPTC,	ICR,	ICS,	IMC,	IMS,
-    LEDCTL,	MANC,	MDIC,	MPC,	PBA,	RCTL,	RDBAH,	RDBAL,	RDH,
-    RDLEN,	RDT,	STATUS,	SWSM,	TCTL,	TDBAH,	TDBAL,	TDH,	TDLEN,
-    TDT,	TORH,	TORL,	TOTH,	TOTL,	TPR,	TPT,	TXDCTL,	WUFC,
+static bool is_version_1(void *opaque, int version_id)
+{
+    return version_id == 1;
+}
+
+static const VMStateDescription vmstate_e1000 = {
+    .name = "e1000",
+    .version_id = 2,
+    .minimum_version_id = 1,
+    .minimum_version_id_old = 1,
+    .fields      = (VMStateField []) {
+        VMSTATE_PCI_DEVICE(dev, E1000State),
+        VMSTATE_UNUSED_TEST(is_version_1, 4), /* was instance id */
+        VMSTATE_UNUSED(4), /* Was mmio_base.  */
+        VMSTATE_UINT32(rxbuf_size, E1000State),
+        VMSTATE_UINT32(rxbuf_min_shift, E1000State),
+        VMSTATE_UINT32(eecd_state.val_in, E1000State),
+        VMSTATE_UINT16(eecd_state.bitnum_in, E1000State),
+        VMSTATE_UINT16(eecd_state.bitnum_out, E1000State),
+        VMSTATE_UINT16(eecd_state.reading, E1000State),
+        VMSTATE_UINT32(eecd_state.old_eecd, E1000State),
+        VMSTATE_UINT8(tx.ipcss, E1000State),
+        VMSTATE_UINT8(tx.ipcso, E1000State),
+        VMSTATE_UINT16(tx.ipcse, E1000State),
+        VMSTATE_UINT8(tx.tucss, E1000State),
+        VMSTATE_UINT8(tx.tucso, E1000State),
+        VMSTATE_UINT16(tx.tucse, E1000State),
+        VMSTATE_UINT32(tx.paylen, E1000State),
+        VMSTATE_UINT8(tx.hdr_len, E1000State),
+        VMSTATE_UINT16(tx.mss, E1000State),
+        VMSTATE_UINT16(tx.size, E1000State),
+        VMSTATE_UINT16(tx.tso_frames, E1000State),
+        VMSTATE_UINT8(tx.sum_needed, E1000State),
+        VMSTATE_INT8(tx.ip, E1000State),
+        VMSTATE_INT8(tx.tcp, E1000State),
+        VMSTATE_BUFFER(tx.header, E1000State),
+        VMSTATE_BUFFER(tx.data, E1000State),
+        VMSTATE_UINT16_ARRAY(eeprom_data, E1000State, 64),
+        VMSTATE_UINT16_ARRAY(phy_reg, E1000State, 0x20),
+        VMSTATE_UINT32(mac_reg[CTRL], E1000State),
+        VMSTATE_UINT32(mac_reg[EECD], E1000State),
+        VMSTATE_UINT32(mac_reg[EERD], E1000State),
+        VMSTATE_UINT32(mac_reg[GPRC], E1000State),
+        VMSTATE_UINT32(mac_reg[GPTC], E1000State),
+        VMSTATE_UINT32(mac_reg[ICR], E1000State),
+        VMSTATE_UINT32(mac_reg[ICS], E1000State),
+        VMSTATE_UINT32(mac_reg[IMC], E1000State),
+        VMSTATE_UINT32(mac_reg[IMS], E1000State),
+        VMSTATE_UINT32(mac_reg[LEDCTL], E1000State),
+        VMSTATE_UINT32(mac_reg[MANC], E1000State),
+        VMSTATE_UINT32(mac_reg[MDIC], E1000State),
+        VMSTATE_UINT32(mac_reg[MPC], E1000State),
+        VMSTATE_UINT32(mac_reg[PBA], E1000State),
+        VMSTATE_UINT32(mac_reg[RCTL], E1000State),
+        VMSTATE_UINT32(mac_reg[RDBAH], E1000State),
+        VMSTATE_UINT32(mac_reg[RDBAL], E1000State),
+        VMSTATE_UINT32(mac_reg[RDH], E1000State),
+        VMSTATE_UINT32(mac_reg[RDLEN], E1000State),
+        VMSTATE_UINT32(mac_reg[RDT], E1000State),
+        VMSTATE_UINT32(mac_reg[STATUS], E1000State),
+        VMSTATE_UINT32(mac_reg[SWSM], E1000State),
+        VMSTATE_UINT32(mac_reg[TCTL], E1000State),
+        VMSTATE_UINT32(mac_reg[TDBAH], E1000State),
+        VMSTATE_UINT32(mac_reg[TDBAL], E1000State),
+        VMSTATE_UINT32(mac_reg[TDH], E1000State),
+        VMSTATE_UINT32(mac_reg[TDLEN], E1000State),
+        VMSTATE_UINT32(mac_reg[TDT], E1000State),
+        VMSTATE_UINT32(mac_reg[TORH], E1000State),
+        VMSTATE_UINT32(mac_reg[TORL], E1000State),
+        VMSTATE_UINT32(mac_reg[TOTH], E1000State),
+        VMSTATE_UINT32(mac_reg[TOTL], E1000State),
+        VMSTATE_UINT32(mac_reg[TPR], E1000State),
+        VMSTATE_UINT32(mac_reg[TPT], E1000State),
+        VMSTATE_UINT32(mac_reg[TXDCTL], E1000State),
+        VMSTATE_UINT32(mac_reg[WUFC], E1000State),
+        VMSTATE_UINT32(mac_reg[VET], E1000State),
+        VMSTATE_UINT32_SUB_ARRAY(mac_reg, E1000State, RA, 32),
+        VMSTATE_UINT32_SUB_ARRAY(mac_reg, E1000State, MTA, 128),
+        VMSTATE_UINT32_SUB_ARRAY(mac_reg, E1000State, VFTA, 128),
+        VMSTATE_END_OF_LIST()
+    }
 };
-enum { MAC_NSAVE = sizeof mac_regtosave/sizeof *mac_regtosave };
 
-struct {
-    int size;
-    int array0;
-} mac_regarraystosave[] = { {32, RA}, {128, MTA} };
-enum { MAC_NARRAYS = sizeof mac_regarraystosave/sizeof *mac_regarraystosave };
-
-static void
-nic_save(QEMUFile *f, void *opaque)
-{
-    E1000State *s = (E1000State *)opaque;
-    int i, j;
-
-    pci_device_save(&s->dev, f);
-    qemu_put_be32s(f, &s->instance);
-    qemu_put_be32s(f, &s->mmio_base);
-    qemu_put_be32s(f, &s->rxbuf_size);
-    qemu_put_be32s(f, &s->rxbuf_min_shift);
-    qemu_put_be32s(f, &s->eecd_state.val_in);
-    qemu_put_be16s(f, &s->eecd_state.bitnum_in);
-    qemu_put_be16s(f, &s->eecd_state.bitnum_out);
-    qemu_put_be16s(f, &s->eecd_state.reading);
-    qemu_put_be32s(f, &s->eecd_state.old_eecd);
-    qemu_put_8s(f, &s->tx.ipcss);
-    qemu_put_8s(f, &s->tx.ipcso);
-    qemu_put_be16s(f, &s->tx.ipcse);
-    qemu_put_8s(f, &s->tx.tucss);
-    qemu_put_8s(f, &s->tx.tucso);
-    qemu_put_be16s(f, &s->tx.tucse);
-    qemu_put_be32s(f, &s->tx.paylen);
-    qemu_put_8s(f, &s->tx.hdr_len);
-    qemu_put_be16s(f, &s->tx.mss);
-    qemu_put_be16s(f, &s->tx.size);
-    qemu_put_be16s(f, &s->tx.tso_frames);
-    qemu_put_8s(f, &s->tx.sum_needed);
-    qemu_put_8s(f, &s->tx.ip);
-    qemu_put_8s(f, &s->tx.tcp);
-    qemu_put_buffer(f, s->tx.header, sizeof s->tx.header);
-    qemu_put_buffer(f, s->tx.data, sizeof s->tx.data);
-    for (i = 0; i < 64; i++)
-        qemu_put_be16s(f, s->eeprom_data + i);
-    for (i = 0; i < 0x20; i++)
-        qemu_put_be16s(f, s->phy_reg + i);
-    for (i = 0; i < MAC_NSAVE; i++)
-        qemu_put_be32s(f, s->mac_reg + mac_regtosave[i]);
-    for (i = 0; i < MAC_NARRAYS; i++)
-        for (j = 0; j < mac_regarraystosave[i].size; j++)
-            qemu_put_be32s(f,
-                           s->mac_reg + mac_regarraystosave[i].array0 + j);
-}
-
-static int
-nic_load(QEMUFile *f, void *opaque, int version_id)
-{
-    E1000State *s = (E1000State *)opaque;
-    int i, j, ret;
-
-    if ((ret = pci_device_load(&s->dev, f)) < 0)
-        return ret;
-    qemu_get_be32s(f, &s->instance);
-    qemu_get_be32s(f, &s->mmio_base);
-    qemu_get_be32s(f, &s->rxbuf_size);
-    qemu_get_be32s(f, &s->rxbuf_min_shift);
-    qemu_get_be32s(f, &s->eecd_state.val_in);
-    qemu_get_be16s(f, &s->eecd_state.bitnum_in);
-    qemu_get_be16s(f, &s->eecd_state.bitnum_out);
-    qemu_get_be16s(f, &s->eecd_state.reading);
-    qemu_get_be32s(f, &s->eecd_state.old_eecd);
-    qemu_get_8s(f, &s->tx.ipcss);
-    qemu_get_8s(f, &s->tx.ipcso);
-    qemu_get_be16s(f, &s->tx.ipcse);
-    qemu_get_8s(f, &s->tx.tucss);
-    qemu_get_8s(f, &s->tx.tucso);
-    qemu_get_be16s(f, &s->tx.tucse);
-    qemu_get_be32s(f, &s->tx.paylen);
-    qemu_get_8s(f, &s->tx.hdr_len);
-    qemu_get_be16s(f, &s->tx.mss);
-    qemu_get_be16s(f, &s->tx.size);
-    qemu_get_be16s(f, &s->tx.tso_frames);
-    qemu_get_8s(f, &s->tx.sum_needed);
-    qemu_get_8s(f, &s->tx.ip);
-    qemu_get_8s(f, &s->tx.tcp);
-    qemu_get_buffer(f, s->tx.header, sizeof s->tx.header);
-    qemu_get_buffer(f, s->tx.data, sizeof s->tx.data);
-    for (i = 0; i < 64; i++)
-        qemu_get_be16s(f, s->eeprom_data + i);
-    for (i = 0; i < 0x20; i++)
-        qemu_get_be16s(f, s->phy_reg + i);
-    for (i = 0; i < MAC_NSAVE; i++)
-        qemu_get_be32s(f, s->mac_reg + mac_regtosave[i]);
-    for (i = 0; i < MAC_NARRAYS; i++)
-        for (j = 0; j < mac_regarraystosave[i].size; j++)
-            qemu_get_be32s(f,
-                           s->mac_reg + mac_regarraystosave[i].array0 + j);
-    return 0;
-}
-
-static uint16_t e1000_eeprom_template[64] = {
+static const uint16_t e1000_eeprom_template[64] = {
     0x0000, 0x0000, 0x0000, 0x0000,      0xffff, 0x0000,      0x0000, 0x0000,
     0x3000, 0x1000, 0x6403, E1000_DEVID, 0x8086, E1000_DEVID, 0x8086, 0x3040,
     0x0008, 0x2000, 0x7e14, 0x0048,      0x1000, 0x00d8,      0x0000, 0x2700,
@@ -895,7 +981,7 @@ static uint16_t e1000_eeprom_template[64] = {
     0xffff, 0xffff, 0xffff, 0xffff,      0xffff, 0xffff,      0xffff, 0x0000,
 };
 
-static uint16_t phy_reg_init[] = {
+static const uint16_t phy_reg_init[] = {
     [PHY_CTRL] = 0x1140,			[PHY_STATUS] = 0x796d, // link initially up
     [PHY_ID1] = 0x141,				[PHY_ID2] = PHY_ID2_INIT,
     [PHY_1000T_CTRL] = 0x0e00,			[M88E1000_PHY_SPEC_CTRL] = 0x360,
@@ -904,7 +990,7 @@ static uint16_t phy_reg_init[] = {
     [M88E1000_PHY_SPEC_STATUS] = 0xac00,
 };
 
-static uint32_t mac_reg_init[] = {
+static const uint32_t mac_reg_init[] = {
     [PBA] =     0x00100030,
     [LEDCTL] =  0x602,
     [CTRL] =    E1000_CTRL_SWDPIN2 | E1000_CTRL_SWDPIN0 |
@@ -920,73 +1006,59 @@ static uint32_t mac_reg_init[] = {
 
 /* PCI interface */
 
-static CPUWriteMemoryFunc *e1000_mmio_write[] = {
+static CPUWriteMemoryFunc * const e1000_mmio_write[] = {
     e1000_mmio_writeb,	e1000_mmio_writew,	e1000_mmio_writel
 };
 
-static CPUReadMemoryFunc *e1000_mmio_read[] = {
+static CPUReadMemoryFunc * const e1000_mmio_read[] = {
     e1000_mmio_readb,	e1000_mmio_readw,	e1000_mmio_readl
 };
 
 static void
 e1000_mmio_map(PCIDevice *pci_dev, int region_num,
-                uint32_t addr, uint32_t size, int type)
+                pcibus_t addr, pcibus_t size, int type)
 {
-    E1000State *d = (E1000State *)pci_dev;
+    E1000State *d = DO_UPCAST(E1000State, dev, pci_dev);
+    int i;
+    const uint32_t excluded_regs[] = {
+        E1000_MDIC, E1000_ICR, E1000_ICS, E1000_IMS,
+        E1000_IMC, E1000_TCTL, E1000_TDT, PNPMMIO_SIZE
+    };
 
-    DBGOUT(MMIO, "e1000_mmio_map addr=0x%08x 0x%08x\n", addr, size);
 
-    d->mmio_base = addr;
+    DBGOUT(MMIO, "e1000_mmio_map addr=0x%08"FMT_PCIBUS" 0x%08"FMT_PCIBUS"\n",
+           addr, size);
+
     cpu_register_physical_memory(addr, PNPMMIO_SIZE, d->mmio_index);
+    qemu_register_coalesced_mmio(addr, excluded_regs[0]);
+
+    for (i = 0; excluded_regs[i] != PNPMMIO_SIZE; i++)
+        qemu_register_coalesced_mmio(addr + excluded_regs[i] + 4,
+                                     excluded_regs[i + 1] -
+                                     excluded_regs[i] - 4);
 }
 
-void
-pci_e1000_init(PCIBus *bus, NICInfo *nd, int devfn)
+static void
+e1000_cleanup(VLANClientState *nc)
 {
-    E1000State *d;
-    uint8_t *pci_conf;
-    static int instance;
-    uint16_t checksum = 0;
-    char *info_str = "e1000";
-    int i;
+    E1000State *s = DO_UPCAST(NICState, nc, nc)->opaque;
 
-    d = (E1000State *)pci_register_device(bus, "e1000",
-                sizeof(E1000State), devfn, NULL, NULL);
+    s->nic = NULL;
+}
 
-    pci_conf = d->dev.config;
-    memset(pci_conf, 0, 256);
+static int
+pci_e1000_uninit(PCIDevice *dev)
+{
+    E1000State *d = DO_UPCAST(E1000State, dev, dev);
 
-    *(uint16_t *)(pci_conf+0x00) = cpu_to_le16(0x8086);
-    *(uint16_t *)(pci_conf+0x02) = cpu_to_le16(E1000_DEVID);
-    *(uint16_t *)(pci_conf+0x04) = cpu_to_le16(0x0407);
-    *(uint16_t *)(pci_conf+0x06) = cpu_to_le16(0x0010);
-    pci_conf[0x08] = 0x03;
-    pci_conf[0x0a] = 0x00; // ethernet network controller
-    pci_conf[0x0b] = 0x02;
-    pci_conf[0x0c] = 0x10;
+    cpu_unregister_io_memory(d->mmio_index);
+    qemu_del_vlan_client(&d->nic->nc);
+    return 0;
+}
 
-    pci_conf[0x3d] = 1; // interrupt pin 0
-
-    d->mmio_index = cpu_register_io_memory(0, e1000_mmio_read,
-            e1000_mmio_write, d);
-
-    pci_register_io_region((PCIDevice *)d, 0, PNPMMIO_SIZE,
-                           PCI_ADDRESS_SPACE_MEM, e1000_mmio_map);
-
-    pci_register_io_region((PCIDevice *)d, 1, IOPORT_SIZE,
-                           PCI_ADDRESS_SPACE_IO, ioport_map);
-
-    d->instance = instance++;
-
-    d->nd = nd;
-    memmove(d->eeprom_data, e1000_eeprom_template,
-        sizeof e1000_eeprom_template);
-    for (i = 0; i < 3; i++)
-        d->eeprom_data[i] = (nd->macaddr[2*i+1]<<8) | nd->macaddr[2*i];
-    for (i = 0; i < EEPROM_CHECKSUM_REG; i++)
-        checksum += d->eeprom_data[i];
-    checksum = (uint16_t) EEPROM_SUM - checksum;
-    d->eeprom_data[EEPROM_CHECKSUM_REG] = checksum;
+static void e1000_reset(void *opaque)
+{
+    E1000State *d = opaque;
 
     memset(d->phy_reg, 0, sizeof d->phy_reg);
     memmove(d->phy_reg, phy_reg_init, sizeof phy_reg_init);
@@ -994,14 +1066,87 @@ pci_e1000_init(PCIBus *bus, NICInfo *nd, int devfn)
     memmove(d->mac_reg, mac_reg_init, sizeof mac_reg_init);
     d->rxbuf_min_shift = 1;
     memset(&d->tx, 0, sizeof d->tx);
-
-    d->vc = qemu_new_vlan_client(nd->vlan, e1000_receive,
-                                 e1000_can_receive, d);
-
-    snprintf(d->vc->info_str, sizeof(d->vc->info_str),
-             "%s macaddr=%02x:%02x:%02x:%02x:%02x:%02x", info_str,
-             d->nd->macaddr[0], d->nd->macaddr[1], d->nd->macaddr[2],
-             d->nd->macaddr[3], d->nd->macaddr[4], d->nd->macaddr[5]);
-
-    register_savevm(info_str, d->instance, 1, nic_save, nic_load, d);
 }
+
+static NetClientInfo net_e1000_info = {
+    .type = NET_CLIENT_TYPE_NIC,
+    .size = sizeof(NICState),
+    .can_receive = e1000_can_receive,
+    .receive = e1000_receive,
+    .cleanup = e1000_cleanup,
+    .link_status_changed = e1000_set_link_status,
+};
+
+static int pci_e1000_init(PCIDevice *pci_dev)
+{
+    E1000State *d = DO_UPCAST(E1000State, dev, pci_dev);
+    uint8_t *pci_conf;
+    uint16_t checksum = 0;
+    int i;
+    uint8_t *macaddr;
+
+    pci_conf = d->dev.config;
+
+    pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_INTEL);
+    pci_config_set_device_id(pci_conf, E1000_DEVID);
+    *(uint16_t *)(pci_conf+0x06) = cpu_to_le16(0x0010);
+    pci_conf[0x08] = 0x03;
+    pci_config_set_class(pci_conf, PCI_CLASS_NETWORK_ETHERNET);
+    pci_conf[0x0c] = 0x10;
+
+    pci_conf[0x3d] = 1; // interrupt pin 0
+
+    d->mmio_index = cpu_register_io_memory(e1000_mmio_read,
+            e1000_mmio_write, d);
+
+    pci_register_bar((PCIDevice *)d, 0, PNPMMIO_SIZE,
+                           PCI_BASE_ADDRESS_SPACE_MEMORY, e1000_mmio_map);
+
+    pci_register_bar((PCIDevice *)d, 1, IOPORT_SIZE,
+                           PCI_BASE_ADDRESS_SPACE_IO, ioport_map);
+
+    memmove(d->eeprom_data, e1000_eeprom_template,
+        sizeof e1000_eeprom_template);
+    qemu_macaddr_default_if_unset(&d->conf.macaddr);
+    macaddr = d->conf.macaddr.a;
+    for (i = 0; i < 3; i++)
+        d->eeprom_data[i] = (macaddr[2*i+1]<<8) | macaddr[2*i];
+    for (i = 0; i < EEPROM_CHECKSUM_REG; i++)
+        checksum += d->eeprom_data[i];
+    checksum = (uint16_t) EEPROM_SUM - checksum;
+    d->eeprom_data[EEPROM_CHECKSUM_REG] = checksum;
+
+    d->nic = qemu_new_nic(&net_e1000_info, &d->conf,
+                          d->dev.qdev.info->name, d->dev.qdev.id, d);
+
+    qemu_format_nic_info_str(&d->nic->nc, macaddr);
+    return 0;
+}
+
+static void qdev_e1000_reset(DeviceState *dev)
+{
+    E1000State *d = DO_UPCAST(E1000State, dev.qdev, dev);
+    e1000_reset(d);
+}
+
+static PCIDeviceInfo e1000_info = {
+    .qdev.name  = "e1000",
+    .qdev.desc  = "Intel Gigabit Ethernet",
+    .qdev.size  = sizeof(E1000State),
+    .qdev.reset = qdev_e1000_reset,
+    .qdev.vmsd  = &vmstate_e1000,
+    .init       = pci_e1000_init,
+    .exit       = pci_e1000_uninit,
+    .romfile    = "pxe-e1000.bin",
+    .qdev.props = (Property[]) {
+        DEFINE_NIC_PROPERTIES(E1000State, conf),
+        DEFINE_PROP_END_OF_LIST(),
+    }
+};
+
+static void e1000_register_devices(void)
+{
+    pci_qdev_register(&e1000_info);
+}
+
+device_init(e1000_register_devices)

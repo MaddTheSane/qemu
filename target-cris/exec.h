@@ -15,26 +15,14 @@
  * General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "dyngen-exec.h"
 
-#if 1
 register struct CPUCRISState *env asm(AREG0);
-/* This is only used for tb lookup.  */
-register uint32_t T0 asm(AREG1);
-register uint32_t T1 asm(AREG2);
-#else
-struct CPUCRISState *env;
-/* This is only used for tb lookup.  */
-uint32_t T0;
-uint32_t T1;
-#endif
+
 #include "cpu.h"
 #include "exec-all.h"
-
-#define RETURN() __asm__ __volatile__("" : : : "memory");
 
 static inline void env_to_regs(void)
 {
@@ -44,10 +32,6 @@ static inline void regs_to_env(void)
 {
 }
 
-int cpu_cris_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
-                              int mmu_idx, int is_softmmu);
-void tlb_fill (target_ulong addr, int is_write, int mmu_idx, void *retaddr);
-
 #if !defined(CONFIG_USER_ONLY)
 #include "softmmu_exec.h"
 #endif
@@ -55,12 +39,18 @@ void tlb_fill (target_ulong addr, int is_write, int mmu_idx, void *retaddr);
 void cpu_cris_flush_flags(CPUCRISState *env, int cc_op);
 void helper_movec(CPUCRISState *env, int reg, uint32_t val);
 
-void cpu_loop_exit(void);
+static inline int cpu_has_work(CPUState *env)
+{
+    return (env->interrupt_request & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_NMI));
+}
 
 static inline int cpu_halted(CPUState *env) {
 	if (!env->halted)
 		return 0;
-	if (env->interrupt_request & CPU_INTERRUPT_HARD) {
+
+	/* IRQ, NMI and GURU execeptions wakes us up.  */
+	if (env->interrupt_request
+	    & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_NMI)) {
 		env->halted = 0;
 		return 0;
 	}

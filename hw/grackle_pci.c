@@ -23,60 +23,25 @@
  * THE SOFTWARE.
  */
 
-#include "hw.h"
+#include "sysbus.h"
 #include "ppc_mac.h"
 #include "pci.h"
-
-typedef target_phys_addr_t pci_addr_t;
 #include "pci_host.h"
 
-typedef PCIHostState GrackleState;
+/* debug Grackle */
+//#define DEBUG_GRACKLE
 
-static void pci_grackle_config_writel (void *opaque, target_phys_addr_t addr,
-                                       uint32_t val)
-{
-    GrackleState *s = opaque;
-#ifdef TARGET_WORDS_BIGENDIAN
-    val = bswap32(val);
+#ifdef DEBUG_GRACKLE
+#define GRACKLE_DPRINTF(fmt, ...)                               \
+    do { printf("GRACKLE: " fmt , ## __VA_ARGS__); } while (0)
+#else
+#define GRACKLE_DPRINTF(fmt, ...)
 #endif
-    s->config_reg = val;
-}
 
-static uint32_t pci_grackle_config_readl (void *opaque, target_phys_addr_t addr)
-{
-    GrackleState *s = opaque;
-    uint32_t val;
-
-    val = s->config_reg;
-#ifdef TARGET_WORDS_BIGENDIAN
-    val = bswap32(val);
-#endif
-    return val;
-}
-
-static CPUWriteMemoryFunc *pci_grackle_config_write[] = {
-    &pci_grackle_config_writel,
-    &pci_grackle_config_writel,
-    &pci_grackle_config_writel,
-};
-
-static CPUReadMemoryFunc *pci_grackle_config_read[] = {
-    &pci_grackle_config_readl,
-    &pci_grackle_config_readl,
-    &pci_grackle_config_readl,
-};
-
-static CPUWriteMemoryFunc *pci_grackle_write[] = {
-    &pci_host_data_writeb,
-    &pci_host_data_writew,
-    &pci_host_data_writel,
-};
-
-static CPUReadMemoryFunc *pci_grackle_read[] = {
-    &pci_host_data_readb,
-    &pci_host_data_readw,
-    &pci_host_data_readl,
-};
+typedef struct GrackleState {
+    SysBusDevice busdev;
+    PCIHostState host_state;
+} GrackleState;
 
 /* Don't know if this matches real hardware, but it agrees with OHW.  */
 static int pci_grackle_map_irq(PCIDevice *pci_dev, int irq_num)
@@ -84,49 +49,109 @@ static int pci_grackle_map_irq(PCIDevice *pci_dev, int irq_num)
     return (irq_num + (pci_dev->devfn >> 3)) & 3;
 }
 
-static void pci_grackle_set_irq(qemu_irq *pic, int irq_num, int level)
+static void pci_grackle_set_irq(void *opaque, int irq_num, int level)
 {
+    qemu_irq *pic = opaque;
+
+    GRACKLE_DPRINTF("set_irq num %d level %d\n", irq_num, level);
     qemu_set_irq(pic[irq_num + 0x15], level);
+}
+
+static void pci_grackle_save(QEMUFile* f, void *opaque)
+{
+    PCIDevice *d = opaque;
+
+    pci_device_save(d, f);
+}
+
+static int pci_grackle_load(QEMUFile* f, void *opaque, int version_id)
+{
+    PCIDevice *d = opaque;
+
+    if (version_id != 1)
+        return -EINVAL;
+
+    return pci_device_load(d, f);
+}
+
+static void pci_grackle_reset(void *opaque)
+{
 }
 
 PCIBus *pci_grackle_init(uint32_t base, qemu_irq *pic)
 {
+    DeviceState *dev;
+    SysBusDevice *s;
+    GrackleState *d;
+
+    dev = qdev_create(NULL, "grackle");
+    qdev_init_nofail(dev);
+    s = sysbus_from_qdev(dev);
+    d = FROM_SYSBUS(GrackleState, s);
+    d->host_state.bus = pci_register_bus(&d->busdev.qdev, "pci",
+                                         pci_grackle_set_irq,
+                                         pci_grackle_map_irq,
+                                         pic, 0, 4);
+
+    pci_create_simple(d->host_state.bus, 0, "grackle");
+
+    sysbus_mmio_map(s, 0, base);
+    sysbus_mmio_map(s, 1, base + 0x00200000);
+
+    return d->host_state.bus;
+}
+
+static int pci_grackle_init_device(SysBusDevice *dev)
+{
     GrackleState *s;
-    PCIDevice *d;
     int pci_mem_config, pci_mem_data;
 
-    s = qemu_mallocz(sizeof(GrackleState));
-    s->bus = pci_register_bus(pci_grackle_set_irq, pci_grackle_map_irq,
-                              pic, 0, 4);
+    s = FROM_SYSBUS(GrackleState, dev);
 
-    pci_mem_config = cpu_register_io_memory(0, pci_grackle_config_read,
-                                            pci_grackle_config_write, s);
-    pci_mem_data = cpu_register_io_memory(0, pci_grackle_read,
-                                          pci_grackle_write, s);
-    cpu_register_physical_memory(base, 0x1000, pci_mem_config);
-    cpu_register_physical_memory(base + 0x00200000, 0x1000, pci_mem_data);
-    d = pci_register_device(s->bus, "Grackle host bridge", sizeof(PCIDevice),
-                            0, NULL, NULL);
-    d->config[0x00] = 0x57; // vendor_id
-    d->config[0x01] = 0x10;
-    d->config[0x02] = 0x02; // device_id
-    d->config[0x03] = 0x00;
+    pci_mem_config = pci_host_conf_register_mmio(&s->host_state);
+    pci_mem_data = pci_host_data_register_mmio(&s->host_state);
+    sysbus_init_mmio(dev, 0x1000, pci_mem_config);
+    sysbus_init_mmio(dev, 0x1000, pci_mem_data);
+
+    register_savevm("grackle", 0, 1, pci_grackle_save, pci_grackle_load,
+                    &s->host_state);
+    qemu_register_reset(pci_grackle_reset, &s->host_state);
+    return 0;
+}
+
+static int pci_dec_21154_init_device(SysBusDevice *dev)
+{
+    GrackleState *s;
+    int pci_mem_config, pci_mem_data;
+
+    s = FROM_SYSBUS(GrackleState, dev);
+
+    pci_mem_config = pci_host_conf_register_mmio(&s->host_state);
+    pci_mem_data = pci_host_data_register_mmio(&s->host_state);
+    sysbus_init_mmio(dev, 0x1000, pci_mem_config);
+    sysbus_init_mmio(dev, 0x1000, pci_mem_data);
+    return 0;
+}
+
+static int grackle_pci_host_init(PCIDevice *d)
+{
+    pci_config_set_vendor_id(d->config, PCI_VENDOR_ID_MOTOROLA);
+    pci_config_set_device_id(d->config, PCI_DEVICE_ID_MOTOROLA_MPC106);
     d->config[0x08] = 0x00; // revision
     d->config[0x09] = 0x01;
-    d->config[0x0a] = 0x00; // class_sub = host
-    d->config[0x0b] = 0x06; // class_base = PCI_bridge
-    d->config[0x0e] = 0x00; // header_type
+    pci_config_set_class(d->config, PCI_CLASS_BRIDGE_HOST);
+    d->config[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL; // header_type
+    return 0;
+}
 
-#if 0
+static int dec_21154_pci_host_init(PCIDevice *d)
+{
     /* PCI2PCI bridge same values as PearPC - check this */
-    d->config[0x00] = 0x11; // vendor_id
-    d->config[0x01] = 0x10;
-    d->config[0x02] = 0x26; // device_id
-    d->config[0x03] = 0x00;
+    pci_config_set_vendor_id(d->config, PCI_VENDOR_ID_DEC);
+    pci_config_set_device_id(d->config, PCI_DEVICE_ID_DEC_21154);
     d->config[0x08] = 0x02; // revision
-    d->config[0x0a] = 0x04; // class_sub = pci2pci
-    d->config[0x0b] = 0x06; // class_base = PCI_bridge
-    d->config[0x0e] = 0x01; // header_type
+    pci_config_set_class(d->config, PCI_CLASS_BRIDGE_PCI);
+    d->config[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_BRIDGE; // header_type
 
     d->config[0x18] = 0x0;  // primary_bus
     d->config[0x19] = 0x1;  // secondary_bus
@@ -143,7 +168,29 @@ PCIBus *pci_grackle_init(uint32_t base, qemu_irq *pic)
     d->config[0x25] = 0x84;
     d->config[0x26] = 0x00; // prefetchable_memory_limit
     d->config[0x27] = 0x85;
-#endif
-    return s->bus;
+    return 0;
 }
 
+static PCIDeviceInfo grackle_pci_host_info = {
+    .qdev.name = "grackle",
+    .qdev.size = sizeof(PCIDevice),
+    .init      = grackle_pci_host_init,
+};
+
+static PCIDeviceInfo dec_21154_pci_host_info = {
+    .qdev.name = "dec-21154",
+    .qdev.size = sizeof(PCIDevice),
+    .init      = dec_21154_pci_host_init,
+};
+
+static void grackle_register_devices(void)
+{
+    sysbus_register_dev("grackle", sizeof(GrackleState),
+                        pci_grackle_init_device);
+    pci_qdev_register(&grackle_pci_host_info);
+    sysbus_register_dev("dec-21154", sizeof(GrackleState),
+                        pci_dec_21154_init_device);
+    pci_qdev_register(&dec_21154_pci_host_info);
+}
+
+device_init(grackle_register_devices)

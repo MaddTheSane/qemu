@@ -7,7 +7,7 @@
 
 #include "dis-asm.h"
 
-/* **** foatformat.h from sourceware.org CVS 2005-08-14.  */
+/* **** floatformat.h from sourceware.org CVS 2005-08-14.  */
 /* IEEE floating point support declarations, for GDB, the GNU Debugger.
    Copyright 1991, 1994, 1995, 1997, 2000, 2003 Free Software Foundation, Inc.
 
@@ -24,8 +24,7 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA 02110-1301, USA.  */
+along with this program; if not, see <http://www.gnu.org/licenses/>.  */
 
 #if !defined (FLOATFORMAT_H)
 #define FLOATFORMAT_H 1
@@ -159,9 +158,8 @@ floatformat_is_valid (const struct floatformat *fmt, const char *from);
    the GNU General Public License for more details.
 
    You should have received a copy of the GNU General Public License
-   along with this file; see the file COPYING.  If not, write to the Free
-   Software Foundation, 51 Franklin Street - Fifth Floor, Boston, MA
-   02110-1301, USA.  */
+   along with this file; see the file COPYING.  If not,
+   see <http://www.gnu.org/licenses/>.  */
 
 /* These are used as bit flags for the arch field in the m68k_opcode
    structure.  */
@@ -540,19 +538,17 @@ extern const int m68k_numopcodes, m68k_numaliases;
    GNU General Public License for more details.
 
    You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
-   MA 02110-1301, USA.  */
+   along with this program; if not, see <http://www.gnu.org/licenses/>.  */
 
 /* Local function prototypes.  */
 
-const char * const fpcr_names[] =
+static const char * const fpcr_names[] =
 {
   "", "%fpiar", "%fpsr", "%fpiar/%fpsr", "%fpcr",
   "%fpiar/%fpcr", "%fpsr/%fpcr", "%fpiar/%fpsr/%fpcr"
 };
 
-static char *const reg_names[] =
+static const char *const reg_names[] =
 {
   "%d0", "%d1", "%d2", "%d3", "%d4", "%d5", "%d6", "%d7",
   "%a0", "%a1", "%a2", "%a3", "%a4", "%a5", "%fp", "%sp",
@@ -561,7 +557,7 @@ static char *const reg_names[] =
 
 /* Name of register halves for MAC/EMAC.
    Separate from reg_names since 'spu', 'fpl' look weird.  */
-static char *const reg_half_names[] =
+static const char *const reg_half_names[] =
 {
   "%d0", "%d1", "%d2", "%d3", "%d4", "%d5", "%d6", "%d7",
   "%a0", "%a1", "%a2", "%a3", "%a4", "%a5", "%a6", "%a7",
@@ -991,7 +987,7 @@ print_indexed (int basereg,
 	       disassemble_info *info)
 {
   int word;
-  static char *const scales[] = { "", ":2", ":4", ":8" };
+  static const char *const scales[] = { "", ":2", ":4", ":8" };
   bfd_vma base_disp;
   bfd_vma outer_disp;
   char buf[40];
@@ -1106,7 +1102,7 @@ print_insn_arg (const char *d,
     {
     case 'c':		/* Cache identifier.  */
       {
-        static char *const cacheFieldName[] = { "nc", "dc", "ic", "bc" };
+        static const char *const cacheFieldName[] = { "nc", "dc", "ic", "bc" };
         val = fetch_arg (buffer, place, 2, info);
         (*info->fprintf_func) (info->stream, cacheFieldName[val]);
         break;
@@ -1157,7 +1153,7 @@ print_insn_arg (const char *d,
 	/* FIXME: There's a problem here, different m68k processors call the
 	   same address different names. This table can't get it right
 	   because it doesn't know which processor it's disassembling for.  */
-	static const struct { char *name; int value; } names[]
+	static const struct { const char *name; int value; } names[]
 	  = {{"%sfc", 0x000}, {"%dfc", 0x001}, {"%cacr", 0x002},
 	     {"%tc",  0x003}, {"%itt0",0x004}, {"%itt1", 0x005},
              {"%dtt0",0x006}, {"%dtt1",0x007}, {"%buscr",0x008},
@@ -1201,7 +1197,7 @@ print_insn_arg (const char *d,
     case 'M':
       if (place == 'h')
 	{
-	  static char *const scalefactor_name[] = { "<<", ">>" };
+	  static const char *const scalefactor_name[] = { "<<", ">>" };
 	  val = fetch_arg (buffer, place, 1, info);
 	  (*info->fprintf_func) (info->stream, scalefactor_name[val]);
 	}
@@ -1633,7 +1629,7 @@ print_insn_arg (const char *d,
     case '3':
       {
 	int val = fetch_arg (buffer, place, 5, info);
-	char *name = 0;
+        const char *name = 0;
 
 	switch (val)
 	  {
@@ -2047,9 +2043,8 @@ print_insn_m68k (bfd_vma memaddr, disassemble_info *info)
    the GNU General Public License for more details.
 
    You should have received a copy of the GNU General Public License
-   along with this file; see the file COPYING.  If not, write to the Free
-   Software Foundation, 51 Franklin Street - Fifth Floor, Boston, MA
-   02110-1301, USA.  */
+   along with this file; see the file COPYING.  If not,
+   see <http://www.gnu.org/licenses/>.  */
 
 #define one(x) ((unsigned int) (x) << 16)
 #define two(x, y) (((unsigned int) (x) << 16) + (y))
@@ -4471,8 +4466,7 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA 02110-1301, USA.  */
+along with this program; if not, see <http://www.gnu.org/licenses/>.  */
 
 /* This is needed to pick up the NAN macro on some systems.  */
 //#define _GNU_SOURCE

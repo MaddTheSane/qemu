@@ -7,7 +7,7 @@
  */
 #include "hw.h"
 #include "qemu-timer.h"
-
+#include "host-utils.h"
 
 struct ptimer_state
 {
@@ -78,9 +78,38 @@ uint64_t ptimer_get_count(ptimer_state *s)
         } else {
             uint64_t rem;
             uint64_t div;
+            int clz1, clz2;
+            int shift;
+
+            /* We need to divide time by period, where time is stored in
+               rem (64-bit integer) and period is stored in period/period_frac
+               (64.32 fixed point).
+              
+               Doing full precision division is hard, so scale values and
+               do a 64-bit division.  The result should be rounded down,
+               so that the rounding error never causes the timer to go
+               backwards.
+            */
 
             rem = s->next_event - now;
             div = s->period;
+
+            clz1 = clz64(rem);
+            clz2 = clz64(div);
+            shift = clz1 < clz2 ? clz1 : clz2;
+
+            rem <<= shift;
+            div <<= shift;
+            if (shift >= 32) {
+                div |= ((uint64_t)s->period_frac << (shift - 32));
+            } else {
+                if (shift != 0)
+                    div |= (s->period_frac >> (32 - shift));
+                /* Look at remaining bits of period_frac and round div up if 
+                   necessary.  */
+                if ((uint32_t)(s->period_frac << shift))
+                    div += 1;
+            }
             counter = rem / div;
         }
     } else {
@@ -100,6 +129,9 @@ void ptimer_set_count(ptimer_state *s, uint64_t count)
 
 void ptimer_run(ptimer_state *s, int oneshot)
 {
+    if (s->enabled) {
+        return;
+    }
     if (s->period == 0) {
         fprintf(stderr, "Timer with period zero, disabling\n");
         return;
@@ -162,9 +194,9 @@ void qemu_put_ptimer(QEMUFile *f, ptimer_state *s)
     qemu_put_be64s(f, &s->limit);
     qemu_put_be64s(f, &s->delta);
     qemu_put_be32s(f, &s->period_frac);
-    qemu_put_be64s(f, &s->period);
-    qemu_put_be64s(f, &s->last_event);
-    qemu_put_be64s(f, &s->next_event);
+    qemu_put_sbe64s(f, &s->period);
+    qemu_put_sbe64s(f, &s->last_event);
+    qemu_put_sbe64s(f, &s->next_event);
     qemu_put_timer(f, s->timer);
 }
 
@@ -174,11 +206,32 @@ void qemu_get_ptimer(QEMUFile *f, ptimer_state *s)
     qemu_get_be64s(f, &s->limit);
     qemu_get_be64s(f, &s->delta);
     qemu_get_be32s(f, &s->period_frac);
-    qemu_get_be64s(f, &s->period);
-    qemu_get_be64s(f, &s->last_event);
-    qemu_get_be64s(f, &s->next_event);
+    qemu_get_sbe64s(f, &s->period);
+    qemu_get_sbe64s(f, &s->last_event);
+    qemu_get_sbe64s(f, &s->next_event);
     qemu_get_timer(f, s->timer);
 }
+
+static int get_ptimer(QEMUFile *f, void *pv, size_t size)
+{
+    ptimer_state *v = pv;
+
+    qemu_get_ptimer(f, v);
+    return 0;
+}
+
+static void put_ptimer(QEMUFile *f, void *pv, size_t size)
+{
+    ptimer_state *v = pv;
+
+    qemu_put_ptimer(f, v);
+}
+
+const VMStateInfo vmstate_info_ptimer = {
+    .name = "ptimer",
+    .get  = get_ptimer,
+    .put  = put_ptimer,
+};
 
 ptimer_state *ptimer_init(QEMUBH *bh)
 {
@@ -189,4 +242,3 @@ ptimer_state *ptimer_init(QEMUBH *bh)
     s->timer = qemu_new_timer(vm_clock, ptimer_tick, s);
     return s;
 }
-

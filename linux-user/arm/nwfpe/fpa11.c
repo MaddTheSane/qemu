@@ -30,12 +30,7 @@
 
 #include <stdio.h>
 
-/* forward declarations */
-unsigned int EmulateCPDO(const unsigned int);
-unsigned int EmulateCPDT(const unsigned int);
-unsigned int EmulateCPRT(const unsigned int);
-
-FPA11* qemufpa=0;
+FPA11* qemufpa = NULL;
 CPUARMState* user_registers;
 
 /* Reset the FPA11 chip.  Called to initialize and reset the emulator. */
@@ -54,7 +49,7 @@ void resetFPA11(void)
   fpa11->fpsr = FP_EMULATOR | BIT_AC;
 
   /* FPCR: set SB, AB and DA bits, clear all others */
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
   fpa11->fpcr = MASK_RESET;
 #endif
 }
@@ -64,7 +59,7 @@ void SetRoundingMode(const unsigned int opcode)
     int rounding_mode;
    FPA11 *fpa11 = GET_FPA11();
 
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
    fpa11->fpcr &= ~MASK_ROUNDING_MODE;
 #endif
    switch (opcode & MASK_ROUNDING_MODE)
@@ -72,28 +67,28 @@ void SetRoundingMode(const unsigned int opcode)
       default:
       case ROUND_TO_NEAREST:
          rounding_mode = float_round_nearest_even;
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
          fpa11->fpcr |= ROUND_TO_NEAREST;
 #endif
       break;
 
       case ROUND_TO_PLUS_INFINITY:
          rounding_mode = float_round_up;
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
          fpa11->fpcr |= ROUND_TO_PLUS_INFINITY;
 #endif
       break;
 
       case ROUND_TO_MINUS_INFINITY:
          rounding_mode = float_round_down;
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
          fpa11->fpcr |= ROUND_TO_MINUS_INFINITY;
 #endif
       break;
 
       case ROUND_TO_ZERO:
          rounding_mode = float_round_to_zero;
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
          fpa11->fpcr |= ROUND_TO_ZERO;
 #endif
       break;
@@ -105,28 +100,28 @@ void SetRoundingPrecision(const unsigned int opcode)
 {
     int rounding_precision;
    FPA11 *fpa11 = GET_FPA11();
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
    fpa11->fpcr &= ~MASK_ROUNDING_PRECISION;
 #endif
    switch (opcode & MASK_ROUNDING_PRECISION)
    {
       case ROUND_SINGLE:
          rounding_precision = 32;
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
          fpa11->fpcr |= ROUND_SINGLE;
 #endif
       break;
 
       case ROUND_DOUBLE:
          rounding_precision = 64;
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
          fpa11->fpcr |= ROUND_DOUBLE;
 #endif
       break;
 
       case ROUND_EXTENDED:
          rounding_precision = 80;
-#if MAINTAIN_FPCR
+#ifdef MAINTAIN_FPCR
          fpa11->fpcr |= ROUND_EXTENDED;
 #endif
       break;
@@ -196,7 +191,7 @@ unsigned int EmulateAll(unsigned int opcode, FPA11* qfpa, CPUARMState* qregs)
   if(nRc == 1 && get_float_exception_flags(&fpa11->fp_status))
   {
     //printf("fef 0x%x\n",float_exception_flags);
-    nRc=-get_float_exception_flags(&fpa11->fp_status);
+    nRc = -get_float_exception_flags(&fpa11->fp_status);
   }
 
   //printf("returning %d\n",nRc);
@@ -241,4 +236,3 @@ unsigned int EmulateAll1(unsigned int opcode)
   }
 }
 #endif
-

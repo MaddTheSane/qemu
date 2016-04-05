@@ -1,5 +1,5 @@
 /*
- * QEMU OldWorld PowerMac (currently ~G3 B&W) hardware System Emulator
+ * QEMU OldWorld PowerMac (currently ~G3 Beige) hardware System Emulator
  *
  * Copyright (c) 2004-2007 Fabrice Bellard
  * Copyright (c) 2007 Jocelyn Mayer
@@ -25,15 +25,25 @@
 #include "hw.h"
 #include "ppc.h"
 #include "ppc_mac.h"
+#include "mac_dbdma.h"
 #include "nvram.h"
 #include "pc.h"
 #include "sysemu.h"
 #include "net.h"
 #include "isa.h"
 #include "pci.h"
+#include "usb-ohci.h"
 #include "boards.h"
+#include "fw_cfg.h"
+#include "escc.h"
+#include "ide.h"
+#include "loader.h"
+#include "elf.h"
+#include "kvm.h"
 
 #define MAX_IDE_BUS 2
+#define VGA_BIOS_SIZE 65536
+#define CFG_ADDR 0xf0000510
 
 /* temporary frame buffer OSI calls for the video.x driver. The right
    solution is to modify the driver to use VGA PCI I/Os */
@@ -43,7 +53,9 @@ static int vga_osi_call (CPUState *env)
     static int vga_vbl_enabled;
     int linesize;
 
-    //    printf("osi_call R5=" REGX "\n", ppc_dump_gpr(env, 5));
+#if 0
+    printf("osi_call R5=%016" PRIx64 "\n", ppc_dump_gpr(env, 5));
+#endif
 
     /* same handler as PearPC, coming from the original MOL video
        driver. */
@@ -95,7 +107,7 @@ static int vga_osi_call (CPUState *env)
         /* R6 = x, R7 = y, R8 = visible, R9 = data */
         break;
     default:
-        fprintf(stderr, "unsupported OSI call R5=" REGX "\n",
+        fprintf(stderr, "unsupported OSI call R5=%016" PRIx64 "\n",
                 ppc_dump_gpr(env, 5));
         break;
     }
@@ -103,116 +115,159 @@ static int vga_osi_call (CPUState *env)
     return 1; /* osi_call handled */
 }
 
-static void ppc_heathrow_init (ram_addr_t ram_size, int vga_ram_size,
-                               const char *boot_device, DisplayState *ds,
+static int fw_cfg_boot_set(void *opaque, const char *boot_device)
+{
+    fw_cfg_add_i16(opaque, FW_CFG_BOOT_DEVICE, boot_device[0]);
+    return 0;
+}
+
+static void ppc_heathrow_init (ram_addr_t ram_size,
+                               const char *boot_device,
                                const char *kernel_filename,
                                const char *kernel_cmdline,
                                const char *initrd_filename,
                                const char *cpu_model)
 {
     CPUState *env = NULL, *envs[MAX_CPUS];
-    char buf[1024];
+    char *filename;
     qemu_irq *pic, **heathrow_irqs;
-    nvram_t nvram;
-    m48t59_t *m48t59;
     int linux_boot, i;
-    unsigned long bios_offset, vga_bios_offset;
-    uint32_t kernel_base, kernel_size, initrd_base, initrd_size;
+    ram_addr_t ram_offset, bios_offset, vga_bios_offset;
+    uint32_t kernel_base, initrd_base;
+    int32_t kernel_size, initrd_size;
     PCIBus *pci_bus;
     MacIONVRAMState *nvr;
     int vga_bios_size, bios_size;
-    qemu_irq *dummy_irq;
     int pic_mem_index, nvram_mem_index, dbdma_mem_index, cuda_mem_index;
-    int ide_mem_index[2];
-    int ppc_boot_device;
-    BlockDriverState *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
-    int index;
+    int escc_mem_index, ide_mem_index[2];
+    uint16_t ppc_boot_device;
+    DriveInfo *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
+    void *fw_cfg;
+    void *dbdma;
+    uint8_t *vga_bios_ptr;
 
     linux_boot = (kernel_filename != NULL);
 
     /* init CPUs */
     if (cpu_model == NULL)
-        cpu_model = "default";
+        cpu_model = "G3";
     for (i = 0; i < smp_cpus; i++) {
         env = cpu_init(cpu_model);
         if (!env) {
             fprintf(stderr, "Unable to find PowerPC CPU definition\n");
             exit(1);
         }
-        /* Set time-base frequency to 100 Mhz */
-        cpu_ppc_tb_init(env, 100UL * 1000UL * 1000UL);
+        /* Set time-base frequency to 16.6 Mhz */
+        cpu_ppc_tb_init(env,  16600000UL);
         env->osi_call = vga_osi_call;
-        qemu_register_reset(&cpu_ppc_reset, env);
-        register_savevm("cpu", 0, 3, cpu_save, cpu_load, env);
+        qemu_register_reset((QEMUResetHandler*)&cpu_reset, env);
         envs[i] = env;
     }
-    if (env->nip < 0xFFF80000) {
-        /* Special test for PowerPC 601:
-         * the boot vector is at 0xFFF00100, then we need a 1MB BIOS.
-         * But the NVRAM is located at 0xFFF04000...
-         */
-        cpu_abort(env, "G3BW Mac hardware can not handle 1 MB BIOS\n");
-    }
+
+    /* Make sure all register sets take effect */
+    cpu_synchronize_state(env);
 
     /* allocate RAM */
-    cpu_register_physical_memory(0, ram_size, IO_MEM_RAM);
-
-    /* allocate and load BIOS */
-    bios_offset = ram_size + vga_ram_size;
-    if (bios_name == NULL)
-        bios_name = BIOS_FILENAME;
-    snprintf(buf, sizeof(buf), "%s/%s", bios_dir, bios_name);
-    bios_size = load_image(buf, phys_ram_base + bios_offset);
-    if (bios_size < 0 || bios_size > BIOS_SIZE) {
-        cpu_abort(env, "qemu: could not load PowerPC bios '%s'\n", buf);
+    if (ram_size > (2047 << 20)) {
+        fprintf(stderr,
+                "qemu: Too much memory for this machine: %d MB, maximum 2047 MB\n",
+                ((unsigned int)ram_size / (1 << 20)));
         exit(1);
     }
-    bios_size = (bios_size + 0xfff) & ~0xfff;
-    if (bios_size > 0x00080000) {
-        /* As the NVRAM is located at 0xFFF04000, we cannot use 1 MB BIOSes */
-        cpu_abort(env, "G3BW Mac hardware can not handle 1 MB BIOS\n");
+
+    ram_offset = qemu_ram_alloc(ram_size);
+    cpu_register_physical_memory(0, ram_size, ram_offset);
+
+    /* allocate and load BIOS */
+    bios_offset = qemu_ram_alloc(BIOS_SIZE);
+    if (bios_name == NULL)
+        bios_name = PROM_FILENAME;
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+    cpu_register_physical_memory(PROM_ADDR, BIOS_SIZE, bios_offset | IO_MEM_ROM);
+
+    /* Load OpenBIOS (ELF) */
+    if (filename) {
+        bios_size = load_elf(filename, 0, NULL, NULL, NULL,
+                               1, ELF_MACHINE, 0);
+        qemu_free(filename);
+    } else {
+        bios_size = -1;
     }
-    cpu_register_physical_memory((uint32_t)(-bios_size),
-                                 bios_size, bios_offset | IO_MEM_ROM);
+    if (bios_size < 0 || bios_size > BIOS_SIZE) {
+        hw_error("qemu: could not load PowerPC bios '%s'\n", bios_name);
+        exit(1);
+    }
 
     /* allocate and load VGA BIOS */
-    vga_bios_offset = bios_offset + bios_size;
-    snprintf(buf, sizeof(buf), "%s/%s", bios_dir, VGABIOS_FILENAME);
-    vga_bios_size = load_image(buf, phys_ram_base + vga_bios_offset + 8);
+    vga_bios_offset = qemu_ram_alloc(VGA_BIOS_SIZE);
+    vga_bios_ptr = qemu_get_ram_ptr(vga_bios_offset);
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, VGABIOS_FILENAME);
+    if (filename) {
+        vga_bios_size = load_image(filename, vga_bios_ptr + 8);
+        qemu_free(filename);
+    } else {
+        vga_bios_size = -1;
+    }
     if (vga_bios_size < 0) {
         /* if no bios is present, we can still work */
-        fprintf(stderr, "qemu: warning: could not load VGA bios '%s'\n", buf);
+        fprintf(stderr, "qemu: warning: could not load VGA bios '%s'\n",
+                VGABIOS_FILENAME);
         vga_bios_size = 0;
     } else {
         /* set a specific header (XXX: find real Apple format for NDRV
            drivers) */
-        phys_ram_base[vga_bios_offset] = 'N';
-        phys_ram_base[vga_bios_offset + 1] = 'D';
-        phys_ram_base[vga_bios_offset + 2] = 'R';
-        phys_ram_base[vga_bios_offset + 3] = 'V';
-        cpu_to_be32w((uint32_t *)(phys_ram_base + vga_bios_offset + 4),
-                     vga_bios_size);
+        vga_bios_ptr[0] = 'N';
+        vga_bios_ptr[1] = 'D';
+        vga_bios_ptr[2] = 'R';
+        vga_bios_ptr[3] = 'V';
+        cpu_to_be32w((uint32_t *)(vga_bios_ptr + 4), vga_bios_size);
         vga_bios_size += 8;
+
+        /* Round to page boundary */
+        vga_bios_size = (vga_bios_size + TARGET_PAGE_SIZE - 1) &
+            TARGET_PAGE_MASK;
     }
-    vga_bios_size = (vga_bios_size + 0xfff) & ~0xfff;
 
     if (linux_boot) {
+        uint64_t lowaddr = 0;
+        int bswap_needed;
+
+#ifdef BSWAP_NEEDED
+        bswap_needed = 1;
+#else
+        bswap_needed = 0;
+#endif
         kernel_base = KERNEL_LOAD_ADDR;
-        /* now we can load the kernel */
-        kernel_size = load_image(kernel_filename, phys_ram_base + kernel_base);
+        /* Now we can load the kernel. The first step tries to load the kernel
+           supposing PhysAddr = 0x00000000. If that was wrong the kernel is
+           loaded again, the new PhysAddr being computed from lowaddr. */
+        kernel_size = load_elf(kernel_filename, kernel_base, NULL, &lowaddr, NULL,
+                               1, ELF_MACHINE, 0);
+        if (kernel_size > 0 && lowaddr != KERNEL_LOAD_ADDR) {
+            kernel_size = load_elf(kernel_filename, (2 * kernel_base) - lowaddr,
+                                   NULL, NULL, NULL, 1, ELF_MACHINE, 0);
+        }
+        if (kernel_size < 0)
+            kernel_size = load_aout(kernel_filename, kernel_base,
+                                    ram_size - kernel_base, bswap_needed,
+                                    TARGET_PAGE_SIZE);
+        if (kernel_size < 0)
+            kernel_size = load_image_targphys(kernel_filename,
+                                              kernel_base,
+                                              ram_size - kernel_base);
         if (kernel_size < 0) {
-            cpu_abort(env, "qemu: could not load kernel '%s'\n",
+            hw_error("qemu: could not load kernel '%s'\n",
                       kernel_filename);
             exit(1);
         }
         /* load initrd */
         if (initrd_filename) {
             initrd_base = INITRD_LOAD_ADDR;
-            initrd_size = load_image(initrd_filename,
-                                     phys_ram_base + initrd_base);
+            initrd_size = load_image_targphys(initrd_filename, initrd_base,
+                                              ram_size - initrd_base);
             if (initrd_size < 0) {
-                cpu_abort(env, "qemu: could not load initial ram disk '%s'\n",
-                          initrd_filename);
+                hw_error("qemu: could not load initial ram disk '%s'\n",
+                         initrd_filename);
                 exit(1);
             }
         } else {
@@ -244,7 +299,7 @@ static void ppc_heathrow_init (ram_addr_t ram_size, int vga_ram_size,
 #endif
         }
         if (ppc_boot_device == '\0') {
-            fprintf(stderr, "No valid boot device for Mac99 machine\n");
+            fprintf(stderr, "No valid boot device for G3 Beige machine\n");
             exit(1);
         }
     }
@@ -267,66 +322,42 @@ static void ppc_heathrow_init (ram_addr_t ram_size, int vga_ram_size,
                 ((qemu_irq *)env->irq_inputs)[PPC6xx_INPUT_INT];
             break;
         default:
-            cpu_abort(env, "Bus model not supported on OldWorld Mac machine\n");
-            exit(1);
+            hw_error("Bus model not supported on OldWorld Mac machine\n");
         }
     }
 
     /* init basic PC hardware */
     if (PPC_INPUT(env) != PPC_FLAGS_INPUT_6xx) {
-        cpu_abort(env, "Only 6xx bus is supported on heathrow machine\n");
-        exit(1);
+        hw_error("Only 6xx bus is supported on heathrow machine\n");
     }
     pic = heathrow_pic_init(&pic_mem_index, 1, heathrow_irqs);
     pci_bus = pci_grackle_init(0xfec00000, pic);
-    pci_vga_init(pci_bus, ds, phys_ram_base + ram_size,
-                 ram_size, vga_ram_size,
-                 vga_bios_offset, vga_bios_size);
+    pci_vga_init(pci_bus, vga_bios_offset, vga_bios_size);
 
-    /* XXX: suppress that */
-    dummy_irq = i8259_init(NULL);
+    escc_mem_index = escc_init(0x80013000, pic[0x0f], pic[0x10], serial_hds[0],
+                               serial_hds[1], ESCC_CLOCK, 4);
 
-    /* XXX: use Mac Serial port */
-    serial_init(0x3f8, dummy_irq[4], 115200, serial_hds[0]);
+    for(i = 0; i < nb_nics; i++)
+        pci_nic_init_nofail(&nd_table[i], "ne2k_pci", NULL);
 
-    for(i = 0; i < nb_nics; i++) {
-        if (!nd_table[i].model)
-            nd_table[i].model = "ne2k_pci";
-        pci_nic_init(pci_bus, &nd_table[i], -1);
-    }
-
-    /* First IDE channel is a CMD646 on the PCI bus */
 
     if (drive_get_max_bus(IF_IDE) >= MAX_IDE_BUS) {
         fprintf(stderr, "qemu: too many IDE bus\n");
         exit(1);
     }
-    index = drive_get_index(IF_IDE, 0, 0);
-    if (index == -1)
-        hd[0] = NULL;
-    else
-        hd[0] =  drives_table[index].bdrv;
-    index = drive_get_index(IF_IDE, 0, 1);
-    if (index == -1)
-        hd[1] = NULL;
-    else
-        hd[1] =  drives_table[index].bdrv;
+
+    /* First IDE channel is a MAC IDE on the MacIO bus */
+    hd[0] = drive_get(IF_IDE, 0, 0);
+    hd[1] = drive_get(IF_IDE, 0, 1);
+    dbdma = DBDMA_init(&dbdma_mem_index);
+    ide_mem_index[0] = -1;
+    ide_mem_index[1] = pmac_ide_init(hd, pic[0x0D], dbdma, 0x16, pic[0x02]);
+
+    /* Second IDE channel is a CMD646 on the PCI bus */
+    hd[0] = drive_get(IF_IDE, 1, 0);
+    hd[1] = drive_get(IF_IDE, 1, 1);
     hd[3] = hd[2] = NULL;
     pci_cmd646_ide_init(pci_bus, hd, 0);
-
-    /* Second IDE channel is a MAC IDE on the MacIO bus */
-    index = drive_get_index(IF_IDE, 1, 0);
-    if (index == -1)
-        hd[0] = NULL;
-    else
-        hd[0] =  drives_table[index].bdrv;
-    index = drive_get_index(IF_IDE, 1, 1);
-    if (index == -1)
-        hd[1] = NULL;
-    else
-        hd[1] =  drives_table[index].bdrv;
-    ide_mem_index[0] = -1;
-    ide_mem_index[1] = pmac_ide_init(hd, pic[0x0D]);
 
     /* cuda also initialize ADB */
     cuda_init(&cuda_mem_index, pic[0x12]);
@@ -334,41 +365,56 @@ static void ppc_heathrow_init (ram_addr_t ram_size, int vga_ram_size,
     adb_kbd_init(&adb_bus);
     adb_mouse_init(&adb_bus);
 
-    nvr = macio_nvram_init(&nvram_mem_index, 0x2000);
+    nvr = macio_nvram_init(&nvram_mem_index, 0x2000, 4);
     pmac_format_nvram_partition(nvr, 0x2000);
 
-    dbdma_init(&dbdma_mem_index);
-
-    macio_init(pci_bus, 0x0017, 1, pic_mem_index, dbdma_mem_index,
-               cuda_mem_index, nvr, 2, ide_mem_index);
+    macio_init(pci_bus, PCI_DEVICE_ID_APPLE_343S1201, 1, pic_mem_index,
+               dbdma_mem_index, cuda_mem_index, nvr, 2, ide_mem_index,
+               escc_mem_index);
 
     if (usb_enabled) {
-        usb_ohci_init_pci(pci_bus, 3, -1);
+        usb_ohci_init_pci(pci_bus, -1);
     }
 
     if (graphic_depth != 15 && graphic_depth != 32 && graphic_depth != 8)
         graphic_depth = 15;
 
-    m48t59 = m48t59_init(dummy_irq[8], 0xFFF04000, 0x0074, NVRAM_SIZE, 59);
-    nvram.opaque = m48t59;
-    nvram.read_fn = &m48t59_read;
-    nvram.write_fn = &m48t59_write;
-    PPC_NVRAM_set_params(&nvram, NVRAM_SIZE, "HEATHROW", ram_size,
-                         ppc_boot_device, kernel_base, kernel_size,
-                         kernel_cmdline,
-                         initrd_base, initrd_size,
-                         /* XXX: need an option to load a NVRAM image */
-                         0,
-                         graphic_width, graphic_height, graphic_depth);
     /* No PCI init: the BIOS will do it */
 
-    /* Special port to get debug messages from Open-Firmware */
-    register_ioport_write(0x0F00, 4, 1, &PPC_debug_write, NULL);
+    fw_cfg = fw_cfg_init(0, 0, CFG_ADDR, CFG_ADDR + 2);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_ID, 1);
+    fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, (uint64_t)ram_size);
+    fw_cfg_add_i16(fw_cfg, FW_CFG_MACHINE_ID, ARCH_HEATHROW);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ADDR, kernel_base);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_SIZE, kernel_size);
+    if (kernel_cmdline) {
+        fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_CMDLINE, CMDLINE_ADDR);
+        pstrcpy_targphys("cmdline", CMDLINE_ADDR, TARGET_PAGE_SIZE, kernel_cmdline);
+    } else {
+        fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_CMDLINE, 0);
+    }
+    fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_ADDR, initrd_base);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_SIZE, initrd_size);
+    fw_cfg_add_i16(fw_cfg, FW_CFG_BOOT_DEVICE, ppc_boot_device);
+
+    fw_cfg_add_i16(fw_cfg, FW_CFG_PPC_WIDTH, graphic_width);
+    fw_cfg_add_i16(fw_cfg, FW_CFG_PPC_HEIGHT, graphic_height);
+    fw_cfg_add_i16(fw_cfg, FW_CFG_PPC_DEPTH, graphic_depth);
+
+    qemu_register_boot_set(fw_cfg_boot_set, fw_cfg);
 }
 
-QEMUMachine heathrow_machine = {
-    "g3bw",
-    "Heathrow based PowerMAC",
-    ppc_heathrow_init,
-    BIOS_SIZE + VGA_RAM_SIZE,
+static QEMUMachine heathrow_machine = {
+    .name = "g3beige",
+    .desc = "Heathrow based PowerMAC",
+    .init = ppc_heathrow_init,
+    .max_cpus = MAX_CPUS,
+    .is_default = 1,
 };
+
+static void heathrow_machine_init(void)
+{
+    qemu_register_machine(&heathrow_machine);
+}
+
+machine_init(heathrow_machine_init);

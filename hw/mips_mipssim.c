@@ -31,12 +31,9 @@
 #include "net.h"
 #include "sysemu.h"
 #include "boards.h"
-
-#ifdef TARGET_WORDS_BIGENDIAN
-#define BIOS_FILENAME "mips_bios.bin"
-#else
-#define BIOS_FILENAME "mipsel_bios.bin"
-#endif
+#include "mips-bios.h"
+#include "loader.h"
+#include "elf.h"
 
 #ifdef TARGET_MIPS64
 #define PHYS_TO_VIRT(x) ((x) | ~0x7fffffffULL)
@@ -53,19 +50,31 @@ static struct _loaderparams {
     const char *initrd_filename;
 } loaderparams;
 
-static void load_kernel (CPUState *env)
+typedef struct ResetData {
+    CPUState *env;
+    uint64_t vector;
+} ResetData;
+
+static int64_t load_kernel(void)
 {
     int64_t entry, kernel_low, kernel_high;
     long kernel_size;
     long initrd_size;
     ram_addr_t initrd_offset;
+    int big_endian;
+
+#ifdef TARGET_WORDS_BIGENDIAN
+    big_endian = 1;
+#else
+    big_endian = 0;
+#endif
 
     kernel_size = load_elf(loaderparams.kernel_filename, VIRT_TO_PHYS_ADDEND,
-                           &entry, &kernel_low, &kernel_high);
+                           (uint64_t *)&entry, (uint64_t *)&kernel_low,
+                           (uint64_t *)&kernel_high, big_endian, ELF_MACHINE, 1);
     if (kernel_size >= 0) {
         if ((entry & ~0x7fffffffULL) == 0x80000000)
             entry = (int32_t)entry;
-        env->PC[env->current_tc] = entry;
     } else {
         fprintf(stderr, "qemu: could not load kernel '%s'\n",
                 loaderparams.kernel_filename);
@@ -85,8 +94,8 @@ static void load_kernel (CPUState *env)
                         loaderparams.initrd_filename);
                 exit(1);
             }
-            initrd_size = load_image(loaderparams.initrd_filename,
-                                     phys_ram_base + initrd_offset);
+            initrd_size = load_image_targphys(loaderparams.initrd_filename,
+                initrd_offset, loaderparams.ram_size - initrd_offset);
         }
         if (initrd_size == (target_ulong) -1) {
             fprintf(stderr, "qemu: could not load initial ram disk '%s'\n",
@@ -94,26 +103,29 @@ static void load_kernel (CPUState *env)
             exit(1);
         }
     }
+    return entry;
 }
 
 static void main_cpu_reset(void *opaque)
 {
-    CPUState *env = opaque;
-    cpu_reset(env);
+    ResetData *s = (ResetData *)opaque;
+    CPUState *env = s->env;
 
-    if (loaderparams.kernel_filename)
-        load_kernel (env);
+    cpu_reset(env);
+    env->active_tc.PC = s->vector;
 }
 
 static void
-mips_mipssim_init (ram_addr_t ram_size, int vga_ram_size,
-                   const char *boot_device, DisplayState *ds,
+mips_mipssim_init (ram_addr_t ram_size,
+                   const char *boot_device,
                    const char *kernel_filename, const char *kernel_cmdline,
                    const char *initrd_filename, const char *cpu_model)
 {
-    char buf[1024];
-    unsigned long bios_offset;
+    char *filename;
+    ram_addr_t ram_offset;
+    ram_addr_t bios_offset;
     CPUState *env;
+    ResetData *reset_info;
     int bios_size;
 
     /* Init CPUs. */
@@ -129,30 +141,39 @@ mips_mipssim_init (ram_addr_t ram_size, int vga_ram_size,
         fprintf(stderr, "Unable to find CPU definition\n");
         exit(1);
     }
-    register_savevm("cpu", 0, 3, cpu_save, cpu_load, env);
-    qemu_register_reset(main_cpu_reset, env);
+    reset_info = qemu_mallocz(sizeof(ResetData));
+    reset_info->env = env;
+    reset_info->vector = env->active_tc.PC;
+    qemu_register_reset(main_cpu_reset, reset_info);
 
     /* Allocate RAM. */
-    cpu_register_physical_memory(0, ram_size, IO_MEM_RAM);
+    ram_offset = qemu_ram_alloc(ram_size);
+    bios_offset = qemu_ram_alloc(BIOS_SIZE);
 
+    cpu_register_physical_memory(0, ram_size, ram_offset | IO_MEM_RAM);
+
+    /* Map the BIOS / boot exception handler. */
+    cpu_register_physical_memory(0x1fc00000LL,
+                                 BIOS_SIZE, bios_offset | IO_MEM_ROM);
     /* Load a BIOS / boot exception handler image. */
-    bios_offset = ram_size + vga_ram_size;
     if (bios_name == NULL)
         bios_name = BIOS_FILENAME;
-    snprintf(buf, sizeof(buf), "%s/%s", bios_dir, bios_name);
-    bios_size = load_image(buf, phys_ram_base + bios_offset);
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+    if (filename) {
+        bios_size = load_image_targphys(filename, 0x1fc00000LL, BIOS_SIZE);
+        qemu_free(filename);
+    } else {
+        bios_size = -1;
+    }
     if ((bios_size < 0 || bios_size > BIOS_SIZE) && !kernel_filename) {
         /* Bail out if we have neither a kernel image nor boot vector code. */
         fprintf(stderr,
                 "qemu: Could not load MIPS bios '%s', and no -kernel argument was specified\n",
-                buf);
+                filename);
         exit(1);
     } else {
-        /* Map the BIOS / boot exception handler. */
-        cpu_register_physical_memory(0x1fc00000LL,
-                                     bios_size, bios_offset | IO_MEM_ROM);
         /* We have a boot vector start address. */
-        env->PC[env->current_tc] = (target_long)(int32_t)0xbfc00000;
+        env->active_tc.PC = (target_long)(int32_t)0xbfc00000;
     }
 
     if (kernel_filename) {
@@ -160,13 +181,12 @@ mips_mipssim_init (ram_addr_t ram_size, int vga_ram_size,
         loaderparams.kernel_filename = kernel_filename;
         loaderparams.kernel_cmdline = kernel_cmdline;
         loaderparams.initrd_filename = initrd_filename;
-        load_kernel(env);
+        reset_info->vector = load_kernel();
     }
 
     /* Init CPU internal devices. */
     cpu_mips_irq_init_cpu(env);
     cpu_mips_clock_init(env);
-    cpu_mips_irqctrl_init();
 
     /* Register 64 KB of ISA IO space at 0x1fd00000. */
     isa_mmio_init(0x1fd00000, 0x00010000);
@@ -176,24 +196,20 @@ mips_mipssim_init (ram_addr_t ram_size, int vga_ram_size,
     if (serial_hds[0])
         serial_init(0x3f8, env->irq[4], 115200, serial_hds[0]);
 
-    if (nd_table[0].vlan) {
-        if (nd_table[0].model == NULL
-            || strcmp(nd_table[0].model, "mipsnet") == 0) {
-            /* MIPSnet uses the MIPS CPU INT0, which is interrupt 2. */
-            mipsnet_init(0x4200, env->irq[2], &nd_table[0]);
-        } else if (strcmp(nd_table[0].model, "?") == 0) {
-            fprintf(stderr, "qemu: Supported NICs: mipsnet\n");
-            exit (1);
-        } else {
-            fprintf(stderr, "qemu: Unsupported NIC: %s\n", nd_table[0].model);
-            exit (1);
-        }
-    }
+    if (nd_table[0].vlan)
+        /* MIPSnet uses the MIPS CPU INT0, which is interrupt 2. */
+        mipsnet_init(0x4200, env->irq[2], &nd_table[0]);
 }
 
-QEMUMachine mips_mipssim_machine = {
-    "mipssim",
-    "MIPS MIPSsim platform",
-    mips_mipssim_init,
-    BIOS_SIZE + VGA_RAM_SIZE /* unused */,
+static QEMUMachine mips_mipssim_machine = {
+    .name = "mipssim",
+    .desc = "MIPS MIPSsim platform",
+    .init = mips_mipssim_init,
 };
+
+static void mips_mipssim_machine_init(void)
+{
+    qemu_register_machine(&mips_mipssim_machine);
+}
+
+machine_init(mips_mipssim_machine_init);

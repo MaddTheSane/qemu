@@ -23,14 +23,28 @@
  * THE SOFTWARE.
  */
 #include "hw.h"
+#include "firmware_abi.h"
+#include "sysemu.h"
 #include "ppc_mac.h"
 
+/* debug NVR */
+//#define DEBUG_NVR
+
+#ifdef DEBUG_NVR
+#define NVR_DPRINTF(fmt, ...)                                   \
+    do { printf("NVR: " fmt , ## __VA_ARGS__); } while (0)
+#else
+#define NVR_DPRINTF(fmt, ...)
+#endif
+
 struct MacIONVRAMState {
-    target_phys_addr_t mem_base;
     target_phys_addr_t size;
     int mem_index;
-    uint8_t data[0x2000];
+    unsigned int it_shift;
+    uint8_t *data;
 };
+
+#define DEF_SYSTEM_SIZE 0xc10
 
 /* Direct access to NVRAM */
 uint32_t macio_nvram_read (void *opaque, uint32_t addr)
@@ -38,11 +52,11 @@ uint32_t macio_nvram_read (void *opaque, uint32_t addr)
     MacIONVRAMState *s = opaque;
     uint32_t ret;
 
-    //    printf("%s: %p addr %04x\n", __func__, s, addr);
-    if (addr < 0x2000)
+    if (addr < s->size)
         ret = s->data[addr];
     else
         ret = -1;
+    NVR_DPRINTF("read addr %04x val %x\n", addr, ret);
 
     return ret;
 }
@@ -51,8 +65,8 @@ void macio_nvram_write (void *opaque, uint32_t addr, uint32_t val)
 {
     MacIONVRAMState *s = opaque;
 
-    //    printf("%s: %p addr %04x val %02x\n", __func__, s, addr, val);
-    if (addr < 0x2000)
+    NVR_DPRINTF("write addr %04x val %x\n", addr, val);
+    if (addr < s->size)
         s->data[addr] = val;
 }
 
@@ -62,10 +76,9 @@ static void macio_nvram_writeb (void *opaque,
 {
     MacIONVRAMState *s = opaque;
 
-    addr -= s->mem_base;
-    addr = (addr >> 4) & 0x1fff;
+    addr = (addr >> s->it_shift) & (s->size - 1);
     s->data[addr] = value;
-    //    printf("macio_nvram_writeb %04x = %02x\n", addr, value);
+    NVR_DPRINTF("writeb addr %04x val %x\n", (int)addr, value);
 }
 
 static uint32_t macio_nvram_readb (void *opaque, target_phys_addr_t addr)
@@ -73,36 +86,63 @@ static uint32_t macio_nvram_readb (void *opaque, target_phys_addr_t addr)
     MacIONVRAMState *s = opaque;
     uint32_t value;
 
-    addr -= s->mem_base;
-    addr = (addr >> 4) & 0x1fff;
+    addr = (addr >> s->it_shift) & (s->size - 1);
     value = s->data[addr];
-    //    printf("macio_nvram_readb %04x = %02x\n", addr, value);
+    NVR_DPRINTF("readb addr %04x val %x\n", (int)addr, value);
 
     return value;
 }
 
-static CPUWriteMemoryFunc *nvram_write[] = {
+static CPUWriteMemoryFunc * const nvram_write[] = {
     &macio_nvram_writeb,
     &macio_nvram_writeb,
     &macio_nvram_writeb,
 };
 
-static CPUReadMemoryFunc *nvram_read[] = {
+static CPUReadMemoryFunc * const nvram_read[] = {
     &macio_nvram_readb,
     &macio_nvram_readb,
     &macio_nvram_readb,
 };
 
-MacIONVRAMState *macio_nvram_init (int *mem_index, target_phys_addr_t size)
+static void macio_nvram_save(QEMUFile *f, void *opaque)
+{
+    MacIONVRAMState *s = (MacIONVRAMState *)opaque;
+
+    qemu_put_buffer(f, s->data, s->size);
+}
+
+static int macio_nvram_load(QEMUFile *f, void *opaque, int version_id)
+{
+    MacIONVRAMState *s = (MacIONVRAMState *)opaque;
+
+    if (version_id != 1)
+        return -EINVAL;
+
+    qemu_get_buffer(f, s->data, s->size);
+
+    return 0;
+}
+
+static void macio_nvram_reset(void *opaque)
+{
+}
+
+MacIONVRAMState *macio_nvram_init (int *mem_index, target_phys_addr_t size,
+                                   unsigned int it_shift)
 {
     MacIONVRAMState *s;
 
     s = qemu_mallocz(sizeof(MacIONVRAMState));
-    if (!s)
-        return NULL;
+    s->data = qemu_mallocz(size);
     s->size = size;
-    s->mem_index = cpu_register_io_memory(0, nvram_read, nvram_write, s);
+    s->it_shift = it_shift;
+
+    s->mem_index = cpu_register_io_memory(nvram_read, nvram_write, s);
     *mem_index = s->mem_index;
+    register_savevm("macio_nvram", -1, 1, macio_nvram_save, macio_nvram_load,
+                    s);
+    qemu_register_reset(macio_nvram_reset, s);
 
     return s;
 }
@@ -112,30 +152,43 @@ void macio_nvram_map (void *opaque, target_phys_addr_t mem_base)
     MacIONVRAMState *s;
 
     s = opaque;
-    s->mem_base = mem_base;
-    cpu_register_physical_memory(mem_base, s->size, s->mem_index);
+    cpu_register_physical_memory(mem_base, s->size << s->it_shift,
+                                 s->mem_index);
 }
 
-static uint8_t nvram_chksum (const uint8_t *buf, int n)
-{
-    int sum, i;
-    sum = 0;
-    for(i = 0; i < n; i++)
-        sum += buf[i];
-    return (sum & 0xff) + (sum >> 8);
-}
-
-/* set a free Mac OS NVRAM partition */
+/* Set up a system OpenBIOS NVRAM partition */
 void pmac_format_nvram_partition (MacIONVRAMState *nvr, int len)
 {
-    uint8_t *buf;
-    char partition_name[12] = "wwwwwwwwwwww";
+    unsigned int i;
+    uint32_t start = 0, end;
+    struct OpenBIOS_nvpart_v1 *part_header;
 
-    buf = nvr->data;
-    buf[0] = 0x7f; /* free partition magic */
-    buf[1] = 0; /* checksum */
-    buf[2] = len >> 8;
-    buf[3] = len;
-    memcpy(buf + 4, partition_name, 12);
-    buf[1] = nvram_chksum(buf, 16);
+    // OpenBIOS nvram variables
+    // Variable partition
+    part_header = (struct OpenBIOS_nvpart_v1 *)nvr->data;
+    part_header->signature = OPENBIOS_PART_SYSTEM;
+    pstrcpy(part_header->name, sizeof(part_header->name), "system");
+
+    end = start + sizeof(struct OpenBIOS_nvpart_v1);
+    for (i = 0; i < nb_prom_envs; i++)
+        end = OpenBIOS_set_var(nvr->data, end, prom_envs[i]);
+
+    // End marker
+    nvr->data[end++] = '\0';
+
+    end = start + ((end - start + 15) & ~15);
+    /* XXX: OpenBIOS is not able to grow up a partition. Leave some space for
+       new variables. */
+    if (end < DEF_SYSTEM_SIZE)
+        end = DEF_SYSTEM_SIZE;
+    OpenBIOS_finish_partition(part_header, end - start);
+
+    // free partition
+    start = end;
+    part_header = (struct OpenBIOS_nvpart_v1 *)&nvr->data[start];
+    part_header->signature = OPENBIOS_PART_FREE;
+    pstrcpy(part_header->name, sizeof(part_header->name), "free");
+
+    end = len;
+    OpenBIOS_finish_partition(part_header, end - start);
 }

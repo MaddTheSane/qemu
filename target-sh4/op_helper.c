@@ -14,25 +14,16 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include <assert.h>
+#include <stdlib.h>
 #include "exec.h"
-
-void do_raise_exception(void)
-{
-    cpu_loop_exit();
-}
+#include "helper.h"
 
 #ifndef CONFIG_USER_ONLY
 
 #define MMUSUFFIX _mmu
-#ifdef __s390__
-# define GETPC() ((void*)((unsigned long)__builtin_return_address(0) & 0x7fffffffUL))
-#else
-# define GETPC() (__builtin_return_address(0))
-#endif
 
 #define SHIFT 0
 #include "softmmu_template.h"
@@ -69,43 +60,150 @@ void tlb_fill(target_ulong addr, int is_write, int mmu_idx, void *retaddr)
 		cpu_restore_state(tb, env, pc, NULL);
 	    }
 	}
-	do_raise_exception();
+	cpu_loop_exit();
     }
     env = saved_env;
 }
 
 #endif
 
-void helper_addc_T0_T1(void)
+void helper_ldtlb(void)
+{
+#ifdef CONFIG_USER_ONLY
+    /* XXXXX */
+    assert(0);
+#else
+    cpu_load_tlb(env);
+#endif
+}
+
+void helper_raise_illegal_instruction(void)
+{
+    env->exception_index = 0x180;
+    cpu_loop_exit();
+}
+
+void helper_raise_slot_illegal_instruction(void)
+{
+    env->exception_index = 0x1a0;
+    cpu_loop_exit();
+}
+
+void helper_raise_fpu_disable(void)
+{
+  env->exception_index = 0x800;
+  cpu_loop_exit();
+}
+
+void helper_raise_slot_fpu_disable(void)
+{
+  env->exception_index = 0x820;
+  cpu_loop_exit();
+}
+
+void helper_debug(void)
+{
+    env->exception_index = EXCP_DEBUG;
+    cpu_loop_exit();
+}
+
+void helper_sleep(uint32_t next_pc)
+{
+    env->halted = 1;
+    env->exception_index = EXCP_HLT;
+    env->pc = next_pc;
+    cpu_loop_exit();
+}
+
+void helper_trapa(uint32_t tra)
+{
+    env->tra = tra << 2;
+    env->exception_index = 0x160;
+    cpu_loop_exit();
+}
+
+void helper_movcal(uint32_t address, uint32_t value)
+{
+    if (cpu_sh4_is_cached (env, address))
+    {
+	memory_content *r = malloc (sizeof(memory_content));
+	r->address = address;
+	r->value = value;
+	r->next = NULL;
+
+	*(env->movcal_backup_tail) = r;
+	env->movcal_backup_tail = &(r->next);
+    }
+}
+
+void helper_discard_movcal_backup(void)
+{
+    memory_content *current = env->movcal_backup;
+
+    while(current)
+    {
+	memory_content *next = current->next;
+	free (current);
+	env->movcal_backup = current = next;
+	if (current == NULL)
+	    env->movcal_backup_tail = &(env->movcal_backup);
+    } 
+}
+
+void helper_ocbi(uint32_t address)
+{
+    memory_content **current = &(env->movcal_backup);
+    while (*current)
+    {
+	uint32_t a = (*current)->address;
+	if ((a & ~0x1F) == (address & ~0x1F))
+	{
+	    memory_content *next = (*current)->next;
+	    stl(a, (*current)->value);
+	    
+	    if (next == NULL)
+	    {
+		env->movcal_backup_tail = current;
+	    }
+
+	    free (*current);
+	    *current = next;
+	    break;
+	}
+    }
+}
+
+uint32_t helper_addc(uint32_t arg0, uint32_t arg1)
 {
     uint32_t tmp0, tmp1;
 
-    tmp1 = T0 + T1;
-    tmp0 = T1;
-    T1 = tmp1 + (env->sr & 1);
+    tmp1 = arg0 + arg1;
+    tmp0 = arg1;
+    arg1 = tmp1 + (env->sr & 1);
     if (tmp0 > tmp1)
 	env->sr |= SR_T;
     else
 	env->sr &= ~SR_T;
-    if (tmp1 > T1)
+    if (tmp1 > arg1)
 	env->sr |= SR_T;
+    return arg1;
 }
 
-void helper_addv_T0_T1(void)
+uint32_t helper_addv(uint32_t arg0, uint32_t arg1)
 {
     uint32_t dest, src, ans;
 
-    if ((int32_t) T1 >= 0)
+    if ((int32_t) arg1 >= 0)
 	dest = 0;
     else
 	dest = 1;
-    if ((int32_t) T0 >= 0)
+    if ((int32_t) arg0 >= 0)
 	src = 0;
     else
 	src = 1;
     src += dest;
-    T1 += T0;
-    if ((int32_t) T1 >= 0)
+    arg1 += arg0;
+    if ((int32_t) arg1 >= 0)
 	ans = 0;
     else
 	ans = 1;
@@ -117,6 +215,7 @@ void helper_addv_T0_T1(void)
 	    env->sr &= ~SR_T;
     } else
 	env->sr &= ~SR_T;
+    return arg1;
 }
 
 #define T (env->sr & SR_T)
@@ -129,27 +228,27 @@ void helper_addv_T0_T1(void)
 #define SETM env->sr |= SR_M
 #define CLRM env->sr &= ~SR_M
 
-void helper_div1_T0_T1(void)
+uint32_t helper_div1(uint32_t arg0, uint32_t arg1)
 {
     uint32_t tmp0, tmp2;
     uint8_t old_q, tmp1 = 0xff;
 
-    //printf("div1 T0=0x%08x T1=0x%08x M=%d Q=%d T=%d\n", T0, T1, M, Q, T);
+    //printf("div1 arg0=0x%08x arg1=0x%08x M=%d Q=%d T=%d\n", arg0, arg1, M, Q, T);
     old_q = Q;
-    if ((0x80000000 & T1) != 0)
+    if ((0x80000000 & arg1) != 0)
 	SETQ;
     else
 	CLRQ;
-    tmp2 = T0;
-    T1 <<= 1;
-    T1 |= T;
+    tmp2 = arg0;
+    arg1 <<= 1;
+    arg1 |= T;
     switch (old_q) {
     case 0:
 	switch (M) {
 	case 0:
-	    tmp0 = T1;
-	    T1 -= tmp2;
-	    tmp1 = T1 > tmp0;
+	    tmp0 = arg1;
+	    arg1 -= tmp2;
+	    tmp1 = arg1 > tmp0;
 	    switch (Q) {
 	    case 0:
 		if (tmp1)
@@ -166,9 +265,9 @@ void helper_div1_T0_T1(void)
 	    }
 	    break;
 	case 1:
-	    tmp0 = T1;
-	    T1 += tmp2;
-	    tmp1 = T1 < tmp0;
+	    tmp0 = arg1;
+	    arg1 += tmp2;
+	    tmp1 = arg1 < tmp0;
 	    switch (Q) {
 	    case 0:
 		if (tmp1 == 0)
@@ -189,9 +288,9 @@ void helper_div1_T0_T1(void)
     case 1:
 	switch (M) {
 	case 0:
-	    tmp0 = T1;
-	    T1 += tmp2;
-	    tmp1 = T1 < tmp0;
+	    tmp0 = arg1;
+	    arg1 += tmp2;
+	    tmp1 = arg1 < tmp0;
 	    switch (Q) {
 	    case 0:
 		if (tmp1)
@@ -208,9 +307,9 @@ void helper_div1_T0_T1(void)
 	    }
 	    break;
 	case 1:
-	    tmp0 = T1;
-	    T1 -= tmp2;
-	    tmp1 = T1 > tmp0;
+	    tmp0 = arg1;
+	    arg1 -= tmp2;
+	    tmp1 = arg1 > tmp0;
 	    switch (Q) {
 	    case 0:
 		if (tmp1 == 0)
@@ -233,33 +332,16 @@ void helper_div1_T0_T1(void)
 	SETT;
     else
 	CLRT;
-    //printf("Output: T1=0x%08x M=%d Q=%d T=%d\n", T1, M, Q, T);
+    //printf("Output: arg1=0x%08x M=%d Q=%d T=%d\n", arg1, M, Q, T);
+    return arg1;
 }
 
-void helper_dmulsl_T0_T1()
-{
-    int64_t res;
-
-    res = (int64_t) (int32_t) T0 *(int64_t) (int32_t) T1;
-    env->mach = (res >> 32) & 0xffffffff;
-    env->macl = res & 0xffffffff;
-}
-
-void helper_dmulul_T0_T1()
-{
-    uint64_t res;
-
-    res = (uint64_t) (uint32_t) T0 *(uint64_t) (uint32_t) T1;
-    env->mach = (res >> 32) & 0xffffffff;
-    env->macl = res & 0xffffffff;
-}
-
-void helper_macl_T0_T1()
+void helper_macl(uint32_t arg0, uint32_t arg1)
 {
     int64_t res;
 
     res = ((uint64_t) env->mach << 32) | env->macl;
-    res += (int64_t) (int32_t) T0 *(int64_t) (int32_t) T1;
+    res += (int64_t) (int32_t) arg0 *(int64_t) (int32_t) arg1;
     env->mach = (res >> 32) & 0xffffffff;
     env->macl = res & 0xffffffff;
     if (env->sr & SR_S) {
@@ -270,12 +352,12 @@ void helper_macl_T0_T1()
     }
 }
 
-void helper_macw_T0_T1()
+void helper_macw(uint32_t arg0, uint32_t arg1)
 {
     int64_t res;
 
     res = ((uint64_t) env->mach << 32) | env->macl;
-    res += (int64_t) (int16_t) T0 *(int64_t) (int16_t) T1;
+    res += (int64_t) (int16_t) arg0 *(int64_t) (int16_t) arg1;
     env->mach = (res >> 32) & 0xffffffff;
     env->macl = res & 0xffffffff;
     if (env->sr & SR_S) {
@@ -289,50 +371,52 @@ void helper_macw_T0_T1()
     }
 }
 
-void helper_negc_T0()
+uint32_t helper_negc(uint32_t arg)
 {
     uint32_t temp;
 
-    temp = -T0;
-    T0 = temp - (env->sr & SR_T);
+    temp = -arg;
+    arg = temp - (env->sr & SR_T);
     if (0 < temp)
 	env->sr |= SR_T;
     else
 	env->sr &= ~SR_T;
-    if (temp < T0)
+    if (temp < arg)
 	env->sr |= SR_T;
+    return arg;
 }
 
-void helper_subc_T0_T1()
+uint32_t helper_subc(uint32_t arg0, uint32_t arg1)
 {
     uint32_t tmp0, tmp1;
 
-    tmp1 = T1 - T0;
-    tmp0 = T1;
-    T1 = tmp1 - (env->sr & SR_T);
+    tmp1 = arg1 - arg0;
+    tmp0 = arg1;
+    arg1 = tmp1 - (env->sr & SR_T);
     if (tmp0 < tmp1)
 	env->sr |= SR_T;
     else
 	env->sr &= ~SR_T;
-    if (tmp1 < T1)
+    if (tmp1 < arg1)
 	env->sr |= SR_T;
+    return arg1;
 }
 
-void helper_subv_T0_T1()
+uint32_t helper_subv(uint32_t arg0, uint32_t arg1)
 {
     int32_t dest, src, ans;
 
-    if ((int32_t) T1 >= 0)
+    if ((int32_t) arg1 >= 0)
 	dest = 0;
     else
 	dest = 1;
-    if ((int32_t) T0 >= 0)
+    if ((int32_t) arg0 >= 0)
 	src = 0;
     else
 	src = 1;
     src += dest;
-    T1 -= T0;
-    if ((int32_t) T1 >= 0)
+    arg1 -= arg0;
+    if ((int32_t) arg1 >= 0)
 	ans = 0;
     else
 	ans = 1;
@@ -344,28 +428,241 @@ void helper_subv_T0_T1()
 	    env->sr &= ~SR_T;
     } else
 	env->sr &= ~SR_T;
+    return arg1;
 }
 
-void helper_rotcl(uint32_t * addr)
+static inline void set_t(void)
 {
-    uint32_t new;
-
-    new = (*addr << 1) | (env->sr & SR_T);
-    if (*addr & 0x80000000)
-	env->sr |= SR_T;
-    else
-	env->sr &= ~SR_T;
-    *addr = new;
+    env->sr |= SR_T;
 }
 
-void helper_rotcr(uint32_t * addr)
+static inline void clr_t(void)
 {
-    uint32_t new;
+    env->sr &= ~SR_T;
+}
 
-    new = (*addr >> 1) | ((env->sr & SR_T) ? 0x80000000 : 0);
-    if (*addr & 1)
-	env->sr |= SR_T;
+void helper_ld_fpscr(uint32_t val)
+{
+    env->fpscr = val & 0x003fffff;
+    if (val & 0x01)
+	set_float_rounding_mode(float_round_to_zero, &env->fp_status);
     else
-	env->sr &= ~SR_T;
-    *addr = new;
+	set_float_rounding_mode(float_round_nearest_even, &env->fp_status);
+}
+
+uint32_t helper_fabs_FT(uint32_t t0)
+{
+    CPU_FloatU f;
+    f.l = t0;
+    f.f = float32_abs(f.f);
+    return f.l;
+}
+
+uint64_t helper_fabs_DT(uint64_t t0)
+{
+    CPU_DoubleU d;
+    d.ll = t0;
+    d.d = float64_abs(d.d);
+    return d.ll;
+}
+
+uint32_t helper_fadd_FT(uint32_t t0, uint32_t t1)
+{
+    CPU_FloatU f0, f1;
+    f0.l = t0;
+    f1.l = t1;
+    f0.f = float32_add(f0.f, f1.f, &env->fp_status);
+    return f0.l;
+}
+
+uint64_t helper_fadd_DT(uint64_t t0, uint64_t t1)
+{
+    CPU_DoubleU d0, d1;
+    d0.ll = t0;
+    d1.ll = t1;
+    d0.d = float64_add(d0.d, d1.d, &env->fp_status);
+    return d0.ll;
+}
+
+void helper_fcmp_eq_FT(uint32_t t0, uint32_t t1)
+{
+    CPU_FloatU f0, f1;
+    f0.l = t0;
+    f1.l = t1;
+
+    if (float32_compare(f0.f, f1.f, &env->fp_status) == 0)
+	set_t();
+    else
+	clr_t();
+}
+
+void helper_fcmp_eq_DT(uint64_t t0, uint64_t t1)
+{
+    CPU_DoubleU d0, d1;
+    d0.ll = t0;
+    d1.ll = t1;
+
+    if (float64_compare(d0.d, d1.d, &env->fp_status) == 0)
+	set_t();
+    else
+	clr_t();
+}
+
+void helper_fcmp_gt_FT(uint32_t t0, uint32_t t1)
+{
+    CPU_FloatU f0, f1;
+    f0.l = t0;
+    f1.l = t1;
+
+    if (float32_compare(f0.f, f1.f, &env->fp_status) == 1)
+	set_t();
+    else
+	clr_t();
+}
+
+void helper_fcmp_gt_DT(uint64_t t0, uint64_t t1)
+{
+    CPU_DoubleU d0, d1;
+    d0.ll = t0;
+    d1.ll = t1;
+
+    if (float64_compare(d0.d, d1.d, &env->fp_status) == 1)
+	set_t();
+    else
+	clr_t();
+}
+
+uint64_t helper_fcnvsd_FT_DT(uint32_t t0)
+{
+    CPU_DoubleU d;
+    CPU_FloatU f;
+    f.l = t0;
+    d.d = float32_to_float64(f.f, &env->fp_status);
+    return d.ll;
+}
+
+uint32_t helper_fcnvds_DT_FT(uint64_t t0)
+{
+    CPU_DoubleU d;
+    CPU_FloatU f;
+    d.ll = t0;
+    f.f = float64_to_float32(d.d, &env->fp_status);
+    return f.l;
+}
+
+uint32_t helper_fdiv_FT(uint32_t t0, uint32_t t1)
+{
+    CPU_FloatU f0, f1;
+    f0.l = t0;
+    f1.l = t1;
+    f0.f = float32_div(f0.f, f1.f, &env->fp_status);
+    return f0.l;
+}
+
+uint64_t helper_fdiv_DT(uint64_t t0, uint64_t t1)
+{
+    CPU_DoubleU d0, d1;
+    d0.ll = t0;
+    d1.ll = t1;
+    d0.d = float64_div(d0.d, d1.d, &env->fp_status);
+    return d0.ll;
+}
+
+uint32_t helper_float_FT(uint32_t t0)
+{
+    CPU_FloatU f;
+    f.f = int32_to_float32(t0, &env->fp_status);
+    return f.l;
+}
+
+uint64_t helper_float_DT(uint32_t t0)
+{
+    CPU_DoubleU d;
+    d.d = int32_to_float64(t0, &env->fp_status);
+    return d.ll;
+}
+
+uint32_t helper_fmac_FT(uint32_t t0, uint32_t t1, uint32_t t2)
+{
+    CPU_FloatU f0, f1, f2;
+    f0.l = t0;
+    f1.l = t1;
+    f2.l = t2;
+    f0.f = float32_mul(f0.f, f1.f, &env->fp_status);
+    f0.f = float32_add(f0.f, f2.f, &env->fp_status);
+    return f0.l;
+}
+
+uint32_t helper_fmul_FT(uint32_t t0, uint32_t t1)
+{
+    CPU_FloatU f0, f1;
+    f0.l = t0;
+    f1.l = t1;
+    f0.f = float32_mul(f0.f, f1.f, &env->fp_status);
+    return f0.l;
+}
+
+uint64_t helper_fmul_DT(uint64_t t0, uint64_t t1)
+{
+    CPU_DoubleU d0, d1;
+    d0.ll = t0;
+    d1.ll = t1;
+    d0.d = float64_mul(d0.d, d1.d, &env->fp_status);
+    return d0.ll;
+}
+
+uint32_t helper_fneg_T(uint32_t t0)
+{
+    CPU_FloatU f;
+    f.l = t0;
+    f.f = float32_chs(f.f);
+    return f.l;
+}
+
+uint32_t helper_fsqrt_FT(uint32_t t0)
+{
+    CPU_FloatU f;
+    f.l = t0;
+    f.f = float32_sqrt(f.f, &env->fp_status);
+    return f.l;
+}
+
+uint64_t helper_fsqrt_DT(uint64_t t0)
+{
+    CPU_DoubleU d;
+    d.ll = t0;
+    d.d = float64_sqrt(d.d, &env->fp_status);
+    return d.ll;
+}
+
+uint32_t helper_fsub_FT(uint32_t t0, uint32_t t1)
+{
+    CPU_FloatU f0, f1;
+    f0.l = t0;
+    f1.l = t1;
+    f0.f = float32_sub(f0.f, f1.f, &env->fp_status);
+    return f0.l;
+}
+
+uint64_t helper_fsub_DT(uint64_t t0, uint64_t t1)
+{
+    CPU_DoubleU d0, d1;
+    d0.ll = t0;
+    d1.ll = t1;
+    d0.d = float64_sub(d0.d, d1.d, &env->fp_status);
+    return d0.ll;
+}
+
+uint32_t helper_ftrc_FT(uint32_t t0)
+{
+    CPU_FloatU f;
+    f.l = t0;
+    return float32_to_int32_round_to_zero(f.f, &env->fp_status);
+}
+
+uint32_t helper_ftrc_DT(uint64_t t0)
+{
+    CPU_DoubleU d;
+    d.ll = t0;
+    return float64_to_int32_round_to_zero(d.d, &env->fp_status);
 }

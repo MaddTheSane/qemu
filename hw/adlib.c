@@ -22,7 +22,6 @@
  * THE SOFTWARE.
  */
 
-#include <assert.h>
 #include "hw.h"
 #include "audiodev.h"
 #include "audio/audio.h"
@@ -116,7 +115,7 @@ static void adlib_kill_timers (AdlibState *s)
     }
 }
 
-static IO_WRITE_PROTO(adlib_write)
+static IO_WRITE_PROTO (adlib_write)
 {
     AdlibState *s = opaque;
     int a = nport & 3;
@@ -134,7 +133,7 @@ static IO_WRITE_PROTO(adlib_write)
 #endif
 }
 
-static IO_READ_PROTO(adlib_read)
+static IO_READ_PROTO (adlib_read)
 {
     AdlibState *s = opaque;
     uint8_t data;
@@ -166,7 +165,7 @@ static void timer_handler (int c, double interval_Sec)
 
     s->ticking[n] = 1;
 #ifdef DEBUG
-    interval = ticks_per_sec * interval_Sec;
+    interval = get_ticks_per_sec() * interval_Sec;
     exp = qemu_get_clock (vm_clock) + interval;
     s->exp[n] = exp;
 #endif
@@ -277,15 +276,10 @@ static void Adlib_fini (AdlibState *s)
     AUD_remove_card (&s->card);
 }
 
-int Adlib_init (AudioState *audio, qemu_irq *pic)
+int Adlib_init (qemu_irq *pic)
 {
     AdlibState *s = &glob_adlib;
-    audsettings_t as;
-
-    if (!audio) {
-        dolog ("No audio state\n");
-        return -1;
-    }
+    struct audsettings as;
 
 #ifdef HAS_YMF262
     if (YMF262Init (1, 14318180, conf.freq)) {
@@ -313,7 +307,7 @@ int Adlib_init (AudioState *audio, qemu_irq *pic)
     as.fmt = AUD_FMT_S16;
     as.endianness = AUDIO_HOST_ENDIANNESS;
 
-    AUD_register_card (audio, "adlib", &s->card);
+    AUD_register_card ("adlib", &s->card);
 
     s->voice = AUD_open_out (
         &s->card,
@@ -330,13 +324,6 @@ int Adlib_init (AudioState *audio, qemu_irq *pic)
 
     s->samples = AUD_get_buffer_size_out (s->voice) >> SHIFT;
     s->mixbuf = qemu_mallocz (s->samples << SHIFT);
-
-    if (!s->mixbuf) {
-        dolog ("Could not allocate mixing buffer, %d samples (each %d bytes)\n",
-               s->samples, 1 << SHIFT);
-        Adlib_fini (s);
-        return -1;
-    }
 
     register_ioport_read (0x388, 4, 1, adlib_read, s);
     register_ioport_write (0x388, 4, 1, adlib_write, s);

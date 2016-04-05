@@ -26,7 +26,7 @@
    here.  */
 
 #include "qemu-common.h"
-#include "scsi-disk.h"
+#include "scsi.h"
 
 static void lba_to_msf(uint8_t *buf, int lba)
 {
@@ -153,5 +153,3 @@ int cdrom_read_toc_raw(int nb_sectors, uint8_t *buf, int msf, int session_num)
     cpu_to_be16wu((uint16_t *)buf, len - 2);
     return len;
 }
-
-

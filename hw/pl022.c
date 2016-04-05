@@ -7,20 +7,21 @@
  * This code is licenced under the GPL.
  */
 
-#include "hw.h"
+#include "sysbus.h"
+#include "ssi.h"
 #include "primecell.h"
 
 //#define DEBUG_PL022 1
 
 #ifdef DEBUG_PL022
-#define DPRINTF(fmt, args...) \
-do { printf("pl022: " fmt , ##args); } while (0)
-#define BADF(fmt, args...) \
-do { fprintf(stderr, "pl022: error: " fmt , ##args); exit(1);} while (0)
+#define DPRINTF(fmt, ...) \
+do { printf("pl022: " fmt , ## __VA_ARGS__); } while (0)
+#define BADF(fmt, ...) \
+do { fprintf(stderr, "pl022: error: " fmt , ## __VA_ARGS__); exit(1);} while (0)
 #else
-#define DPRINTF(fmt, args...) do {} while(0)
-#define BADF(fmt, args...) \
-do { fprintf(stderr, "pl022: error: " fmt , ##args);} while (0)
+#define DPRINTF(fmt, ...) do {} while(0)
+#define BADF(fmt, ...) \
+do { fprintf(stderr, "pl022: error: " fmt , ## __VA_ARGS__);} while (0)
 #endif
 
 #define PL022_CR1_LBM 0x01
@@ -40,7 +41,7 @@ do { fprintf(stderr, "pl022: error: " fmt , ##args);} while (0)
 #define PL022_INT_TX  0x08
 
 typedef struct {
-    uint32_t base;
+    SysBusDevice busdev;
     uint32_t cr0;
     uint32_t cr1;
     uint32_t bitmask;
@@ -56,8 +57,7 @@ typedef struct {
     uint16_t tx_fifo[8];
     uint16_t rx_fifo[8];
     qemu_irq irq;
-    int (*xfer_cb)(void *, int);
-    void *opaque;
+    SSIBus *ssi;
 } pl022_state;
 
 static const unsigned char pl022_id[8] =
@@ -117,10 +117,8 @@ static void pl022_xfer(pl022_state *s)
         val = s->tx_fifo[i];
         if (s->cr1 & PL022_CR1_LBM) {
             /* Loopback mode.  */
-        } else if (s->xfer_cb) {
-            val = s->xfer_cb(s->opaque, val);
         } else {
-            val = 0;
+            val = ssi_transfer(s->ssi, val);
         }
         s->rx_fifo[o] = val & s->bitmask;
         i = (i + 1) & 7;
@@ -137,7 +135,6 @@ static uint32_t pl022_read(void *opaque, target_phys_addr_t offset)
     pl022_state *s = (pl022_state *)opaque;
     int val;
 
-    offset -= s->base;
     if (offset >= 0xfe0 && offset < 0x1000) {
         return pl022_id[(offset - 0xfe0) >> 2];
     }
@@ -170,8 +167,7 @@ static uint32_t pl022_read(void *opaque, target_phys_addr_t offset)
         /* Not implemented.  */
         return 0;
     default:
-        cpu_abort (cpu_single_env, "pl022_read: Bad offset %x\n",
-                   (int)offset);
+        hw_error("pl022_read: Bad offset %x\n", (int)offset);
         return 0;
     }
 }
@@ -181,7 +177,6 @@ static void pl022_write(void *opaque, target_phys_addr_t offset,
 {
     pl022_state *s = (pl022_state *)opaque;
 
-    offset -= s->base;
     switch (offset) {
     case 0x00: /* CR0 */
         s->cr0 = value;
@@ -214,12 +209,12 @@ static void pl022_write(void *opaque, target_phys_addr_t offset,
         pl022_update(s);
         break;
     case 0x20: /* DMACR */
-        if (value)
-            cpu_abort (cpu_single_env, "pl022: DMA not implemented\n");
+        if (value) {
+            hw_error("pl022: DMA not implemented\n");
+        }
         break;
     default:
-        cpu_abort (cpu_single_env, "pl022_write: Bad offset %x\n",
-                   (int)offset);
+        hw_error("pl022_write: Bad offset %x\n", (int)offset);
     }
 }
 
@@ -232,34 +227,85 @@ static void pl022_reset(pl022_state *s)
     s->sr = PL022_SR_TFE | PL022_SR_TNF;
 }
 
-static CPUReadMemoryFunc *pl022_readfn[] = {
+static CPUReadMemoryFunc * const pl022_readfn[] = {
    pl022_read,
    pl022_read,
    pl022_read
 };
 
-static CPUWriteMemoryFunc *pl022_writefn[] = {
+static CPUWriteMemoryFunc * const pl022_writefn[] = {
    pl022_write,
    pl022_write,
    pl022_write
 };
 
-void pl022_init(uint32_t base, qemu_irq irq, int (*xfer_cb)(void *, int),
-                void * opaque)
+static void pl022_save(QEMUFile *f, void *opaque)
 {
-    int iomemtype;
-    pl022_state *s;
+    pl022_state *s = (pl022_state *)opaque;
+    int i;
 
-    s = (pl022_state *)qemu_mallocz(sizeof(pl022_state));
-    iomemtype = cpu_register_io_memory(0, pl022_readfn,
-                                       pl022_writefn, s);
-    cpu_register_physical_memory(base, 0x00001000, iomemtype);
-    s->base = base;
-    s->irq = irq;
-    s->xfer_cb = xfer_cb;
-    s->opaque = opaque;
-    pl022_reset(s);
-    /* ??? Save/restore.  */
+    qemu_put_be32(f, s->cr0);
+    qemu_put_be32(f, s->cr1);
+    qemu_put_be32(f, s->bitmask);
+    qemu_put_be32(f, s->sr);
+    qemu_put_be32(f, s->cpsr);
+    qemu_put_be32(f, s->is);
+    qemu_put_be32(f, s->im);
+    qemu_put_be32(f, s->tx_fifo_head);
+    qemu_put_be32(f, s->rx_fifo_head);
+    qemu_put_be32(f, s->tx_fifo_len);
+    qemu_put_be32(f, s->rx_fifo_len);
+    for (i = 0; i < 8; i++) {
+        qemu_put_be16(f, s->tx_fifo[i]);
+        qemu_put_be16(f, s->rx_fifo[i]);
+    }
 }
 
+static int pl022_load(QEMUFile *f, void *opaque, int version_id)
+{
+    pl022_state *s = (pl022_state *)opaque;
+    int i;
 
+    if (version_id != 1)
+        return -EINVAL;
+
+    s->cr0 = qemu_get_be32(f);
+    s->cr1 = qemu_get_be32(f);
+    s->bitmask = qemu_get_be32(f);
+    s->sr = qemu_get_be32(f);
+    s->cpsr = qemu_get_be32(f);
+    s->is = qemu_get_be32(f);
+    s->im = qemu_get_be32(f);
+    s->tx_fifo_head = qemu_get_be32(f);
+    s->rx_fifo_head = qemu_get_be32(f);
+    s->tx_fifo_len = qemu_get_be32(f);
+    s->rx_fifo_len = qemu_get_be32(f);
+    for (i = 0; i < 8; i++) {
+        s->tx_fifo[i] = qemu_get_be16(f);
+        s->rx_fifo[i] = qemu_get_be16(f);
+    }
+
+    return 0;
+}
+
+static int pl022_init(SysBusDevice *dev)
+{
+    pl022_state *s = FROM_SYSBUS(pl022_state, dev);
+    int iomemtype;
+
+    iomemtype = cpu_register_io_memory(pl022_readfn,
+                                       pl022_writefn, s);
+    sysbus_init_mmio(dev, 0x1000, iomemtype);
+    sysbus_init_irq(dev, &s->irq);
+    s->ssi = ssi_create_bus(&dev->qdev, "ssi");
+    pl022_reset(s);
+    register_savevm("pl022_ssp", -1, 1, pl022_save, pl022_load, s);
+    return 0;
+}
+
+static void pl022_register_devices(void)
+{
+    sysbus_register_dev("pl022", sizeof(pl022_state), pl022_init);
+}
+
+device_init(pl022_register_devices)

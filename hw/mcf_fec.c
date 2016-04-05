@@ -14,17 +14,19 @@
 //#define DEBUG_FEC 1
 
 #ifdef DEBUG_FEC
-#define DPRINTF(fmt, args...) \
-do { printf("mcf_fec: " fmt , ##args); } while (0)
+#define DPRINTF(fmt, ...) \
+do { printf("mcf_fec: " fmt , ## __VA_ARGS__); } while (0)
 #else
-#define DPRINTF(fmt, args...) do {} while(0)
+#define DPRINTF(fmt, ...) do {} while(0)
 #endif
 
 #define FEC_MAX_FRAME_SIZE 2032
 
 typedef struct {
     qemu_irq *irq;
-    VLANClientState *vc;
+    int mmio_index;
+    NICState *nic;
+    NICConf conf;
     uint32_t irq_state;
     uint32_t eir;
     uint32_t eimr;
@@ -41,7 +43,6 @@ typedef struct {
     uint32_t erdsr;
     uint32_t etdsr;
     uint32_t emrbr;
-    uint8_t macaddr[6];
 } mcf_fec_state;
 
 #define FEC_INT_HB   0x80000000
@@ -171,7 +172,7 @@ static void mcf_fec_do_tx(mcf_fec_state *s)
         if (bd.flags & FEC_BD_L) {
             /* Last buffer in frame.  */
             DPRINTF("Sending packet\n");
-            qemu_send_packet(s->vc, frame, len);
+            qemu_send_packet(&s->nic->nc, frame, len);
             ptr = frame;
             frame_size = 0;
             s->eir |= FEC_INT_TXF;
@@ -228,11 +229,11 @@ static uint32_t mcf_fec_read(void *opaque, target_phys_addr_t addr)
     case 0x084: return s->rcr;
     case 0x0c4: return s->tcr;
     case 0x0e4: /* PALR */
-        return (s->macaddr[0] << 24) | (s->macaddr[1] << 16)
-              | (s->macaddr[2] << 8) | s->macaddr[3];
+        return (s->conf.macaddr.a[0] << 24) | (s->conf.macaddr.a[1] << 16)
+              | (s->conf.macaddr.a[2] << 8) | s->conf.macaddr.a[3];
         break;
     case 0x0e8: /* PAUR */
-        return (s->macaddr[4] << 24) | (s->macaddr[5] << 16) | 0x8808;
+        return (s->conf.macaddr.a[4] << 24) | (s->conf.macaddr.a[5] << 16) | 0x8808;
     case 0x0ec: return 0x10000; /* OPD */
     case 0x118: return 0;
     case 0x11c: return 0;
@@ -245,8 +246,7 @@ static uint32_t mcf_fec_read(void *opaque, target_phys_addr_t addr)
     case 0x184: return s->etdsr;
     case 0x188: return s->emrbr;
     default:
-        cpu_abort(cpu_single_env, "mcf_fec_read: Bad address 0x%x\n",
-                  (int)addr);
+        hw_error("mcf_fec_read: Bad address 0x%x\n", (int)addr);
         return 0;
     }
 }
@@ -303,14 +303,14 @@ static void mcf_fec_write(void *opaque, target_phys_addr_t addr, uint32_t value)
             s->eir |= FEC_INT_GRA;
         break;
     case 0x0e4: /* PALR */
-        s->macaddr[0] = value >> 24;
-        s->macaddr[1] = value >> 16;
-        s->macaddr[2] = value >> 8;
-        s->macaddr[3] = value;
+        s->conf.macaddr.a[0] = value >> 24;
+        s->conf.macaddr.a[1] = value >> 16;
+        s->conf.macaddr.a[2] = value >> 8;
+        s->conf.macaddr.a[3] = value;
         break;
     case 0x0e8: /* PAUR */
-        s->macaddr[4] = value >> 24;
-        s->macaddr[5] = value >> 16;
+        s->conf.macaddr.a[4] = value >> 24;
+        s->conf.macaddr.a[5] = value >> 16;
         break;
     case 0x0ec:
         /* OPD */
@@ -342,21 +342,20 @@ static void mcf_fec_write(void *opaque, target_phys_addr_t addr, uint32_t value)
         s->emrbr = value & 0x7f0;
         break;
     default:
-        cpu_abort(cpu_single_env, "mcf_fec_write Bad address 0x%x\n",
-                  (int)addr);
+        hw_error("mcf_fec_write Bad address 0x%x\n", (int)addr);
     }
     mcf_fec_update(s);
 }
 
-static int mcf_fec_can_receive(void *opaque)
+static int mcf_fec_can_receive(VLANClientState *nc)
 {
-    mcf_fec_state *s = (mcf_fec_state *)opaque;
+    mcf_fec_state *s = DO_UPCAST(NICState, nc, nc)->opaque;
     return s->rx_enabled;
 }
 
-static void mcf_fec_receive(void *opaque, const uint8_t *buf, int size)
+static ssize_t mcf_fec_receive(VLANClientState *nc, const uint8_t *buf, size_t size)
 {
-    mcf_fec_state *s = (mcf_fec_state *)opaque;
+    mcf_fec_state *s = DO_UPCAST(NICState, nc, nc)->opaque;
     mcf_fec_bd bd;
     uint32_t flags = 0;
     uint32_t addr;
@@ -427,32 +426,55 @@ static void mcf_fec_receive(void *opaque, const uint8_t *buf, int size)
     s->rx_descriptor = addr;
     mcf_fec_enable_rx(s);
     mcf_fec_update(s);
+    return size;
 }
 
-static CPUReadMemoryFunc *mcf_fec_readfn[] = {
+static CPUReadMemoryFunc * const mcf_fec_readfn[] = {
    mcf_fec_read,
    mcf_fec_read,
    mcf_fec_read
 };
 
-static CPUWriteMemoryFunc *mcf_fec_writefn[] = {
+static CPUWriteMemoryFunc * const mcf_fec_writefn[] = {
    mcf_fec_write,
    mcf_fec_write,
    mcf_fec_write
 };
 
+static void mcf_fec_cleanup(VLANClientState *nc)
+{
+    mcf_fec_state *s = DO_UPCAST(NICState, nc, nc)->opaque;
+
+    cpu_unregister_io_memory(s->mmio_index);
+
+    qemu_free(s);
+}
+
+static NetClientInfo net_mcf_fec_info = {
+    .type = NET_CLIENT_TYPE_NIC,
+    .size = sizeof(NICState),
+    .can_receive = mcf_fec_can_receive,
+    .receive = mcf_fec_receive,
+    .cleanup = mcf_fec_cleanup,
+};
+
 void mcf_fec_init(NICInfo *nd, target_phys_addr_t base, qemu_irq *irq)
 {
     mcf_fec_state *s;
-    int iomemtype;
+
+    qemu_check_nic_model(nd, "mcf_fec");
 
     s = (mcf_fec_state *)qemu_mallocz(sizeof(mcf_fec_state));
     s->irq = irq;
-    iomemtype = cpu_register_io_memory(0, mcf_fec_readfn,
-                                       mcf_fec_writefn, s);
-    cpu_register_physical_memory(base, 0x400, iomemtype);
+    s->mmio_index = cpu_register_io_memory(mcf_fec_readfn,
+                                           mcf_fec_writefn, s);
+    cpu_register_physical_memory(base, 0x400, s->mmio_index);
 
-    s->vc = qemu_new_vlan_client(nd->vlan, mcf_fec_receive,
-                                 mcf_fec_can_receive, s);
-    memcpy(s->macaddr, nd->macaddr, 6);
+    memcpy(s->conf.macaddr.a, nd->macaddr, sizeof(nd->macaddr));
+    s->conf.vlan = nd->vlan;
+    s->conf.peer = nd->netdev;
+
+    s->nic = qemu_new_nic(&net_mcf_fec_info, &s->conf, nd->model, nd->name, s);
+
+    qemu_format_nic_info_str(&s->nic->nc, s->conf.macaddr.a);
 }

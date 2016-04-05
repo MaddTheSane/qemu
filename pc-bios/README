@@ -1,5 +1,5 @@
-- The PC BIOS comes from the Bochs project
-  (http://bochs.sourceforge.net/). A patch from bios.diff was applied.
+- SeaBIOS (bios.bin) is the successor of pc bios.
+  See http://www.seabios.org/ for more information.
 
 - The VGA BIOS and the Cirrus VGA BIOS come from the LGPL VGA bios
   project (http://www.nongnu.org/vgabios/).
@@ -14,11 +14,16 @@
 - OpenBIOS (http://www.openbios.org/) is a free (GPL v2) portable
   firmware implementation. The goal is to implement a 100% IEEE
   1275-1994 (referred to as Open Firmware) compliant firmware.
-  The included Sparc32 image is built from SVN revision 185
-  and Sparc64 from SVN revision 181.
+  The included images for Sparc32, Sparc64 and PowerPC (for 32 and 64 bit
+  PPC CPUs) are built from OpenBIOS SVN revision 569.
 
-- The PXE roms come from Rom-o-Matic etherboot 5.4.2.
-  pcnet32:pcnet32 -- [0x1022,0x2000]
-  ns8390:winbond940 -- [0x1050,0x0940]
-  rtl8139:rtl8139 -- [0x10ec,0x8139]
+- The PXE roms come from Rom-o-Matic gPXE 0.9.9 with BANNER_TIMEOUT=0
+
+  e1000 8086:100E
+  pcnet32 1022:2000
+  ns8390 1050:0940
+  rtl8139 10ec:8139
+  eepro100 8086:1209
+  virtio 1af4:1000
+
   http://rom-o-matic.net/

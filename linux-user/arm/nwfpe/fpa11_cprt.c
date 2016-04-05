@@ -27,8 +27,6 @@
 //#include "fpmodule.h"
 //#include "fpmodule.inl"
 
-void SetRoundingMode(const unsigned int opcode);
-
 unsigned int PerformFLT(const unsigned int opcode);
 unsigned int PerformFIX(const unsigned int opcode);
 
@@ -149,7 +147,7 @@ unsigned int PerformFIX(const unsigned int opcode)
 }
 
 
-static unsigned int __inline__
+static __inline unsigned int
 PerformComparisonOperation(floatx80 Fn, floatx80 Fm)
 {
    FPA11 *fpa11 = GET_FPA11();

@@ -7,13 +7,12 @@
  * This code is licenced under the GPL.
  */
 
-#include "hw.h"
-#include "primecell.h"
+#include "sysbus.h"
 #include "ps2.h"
 
 typedef struct {
+    SysBusDevice busdev;
     void *dev;
-    uint32_t base;
     uint32_t cr;
     uint32_t clk;
     uint32_t last;
@@ -47,7 +46,6 @@ static void pl050_update(void *opaque, int level)
 static uint32_t pl050_read(void *opaque, target_phys_addr_t offset)
 {
     pl050_state *s = (pl050_state *)opaque;
-    offset -= s->base;
     if (offset >= 0xfe0 && offset < 0x1000)
         return pl050_id[(offset - 0xfe0) >> 2];
 
@@ -81,7 +79,7 @@ static uint32_t pl050_read(void *opaque, target_phys_addr_t offset)
     case 4: /* KMIIR */
         return s->pending | 2;
     default:
-        cpu_abort (cpu_single_env, "pl050_read: Bad offset %x\n", (int)offset);
+        hw_error("pl050_read: Bad offset %x\n", (int)offset);
         return 0;
     }
 }
@@ -90,7 +88,6 @@ static void pl050_write(void *opaque, target_phys_addr_t offset,
                           uint32_t value)
 {
     pl050_state *s = (pl050_state *)opaque;
-    offset -= s->base;
     switch (offset >> 2) {
     case 0: /* KMICR */
         s->cr = value;
@@ -110,37 +107,55 @@ static void pl050_write(void *opaque, target_phys_addr_t offset,
         s->clk = value;
         return;
     default:
-        cpu_abort (cpu_single_env, "pl050_write: Bad offset %x\n", (int)offset);
+        hw_error("pl050_write: Bad offset %x\n", (int)offset);
     }
 }
-static CPUReadMemoryFunc *pl050_readfn[] = {
+static CPUReadMemoryFunc * const pl050_readfn[] = {
    pl050_read,
    pl050_read,
    pl050_read
 };
 
-static CPUWriteMemoryFunc *pl050_writefn[] = {
+static CPUWriteMemoryFunc * const pl050_writefn[] = {
    pl050_write,
    pl050_write,
    pl050_write
 };
 
-void pl050_init(uint32_t base, qemu_irq irq, int is_mouse)
+static int pl050_init(SysBusDevice *dev, int is_mouse)
 {
+    pl050_state *s = FROM_SYSBUS(pl050_state, dev);
     int iomemtype;
-    pl050_state *s;
 
-    s = (pl050_state *)qemu_mallocz(sizeof(pl050_state));
-    iomemtype = cpu_register_io_memory(0, pl050_readfn,
+    iomemtype = cpu_register_io_memory(pl050_readfn,
                                        pl050_writefn, s);
-    cpu_register_physical_memory(base, 0x00001000, iomemtype);
-    s->base = base;
-    s->irq = irq;
+    sysbus_init_mmio(dev, 0x1000, iomemtype);
+    sysbus_init_irq(dev, &s->irq);
     s->is_mouse = is_mouse;
-    if (is_mouse)
+    if (s->is_mouse)
         s->dev = ps2_mouse_init(pl050_update, s);
     else
         s->dev = ps2_kbd_init(pl050_update, s);
     /* ??? Save/restore.  */
+    return 0;
 }
 
+static int pl050_init_keyboard(SysBusDevice *dev)
+{
+    return pl050_init(dev, 0);
+}
+
+static int pl050_init_mouse(SysBusDevice *dev)
+{
+    return pl050_init(dev, 1);
+}
+
+static void pl050_register_devices(void)
+{
+    sysbus_register_dev("pl050_keyboard", sizeof(pl050_state),
+                        pl050_init_keyboard);
+    sysbus_register_dev("pl050_mouse", sizeof(pl050_state),
+                        pl050_init_mouse);
+}
+
+device_init(pl050_register_devices)

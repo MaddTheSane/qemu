@@ -13,17 +13,15 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
- * MA 02111-1307 USA
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "hw.h"
 #include "console.h"
 #include "omap.h"
+#include "framebuffer.h"
 
 struct omap_lcd_panel_s {
-    target_phys_addr_t base;
     qemu_irq irq;
     DisplayState *state;
     ram_addr_t imif_base;
@@ -70,8 +68,7 @@ static void omap_lcd_interrupts(struct omap_lcd_panel_s *s)
 
 #include "pixel_ops.h"
 
-typedef void draw_line_func(
-                uint8_t *d, const uint8_t *s, int width, const uint16_t *pal);
+#define draw_line_func drawfn
 
 #define DEPTH 8
 #include "omap_lcd_template.h"
@@ -82,32 +79,32 @@ typedef void draw_line_func(
 #define DEPTH 32
 #include "omap_lcd_template.h"
 
-static draw_line_func *draw_line_table2[33] = {
-    [0 ... 32]	= 0,
+static draw_line_func draw_line_table2[33] = {
+    [0 ... 32]	= NULL,
     [8]		= draw_line2_8,
     [15]	= draw_line2_15,
     [16]	= draw_line2_16,
     [32]	= draw_line2_32,
-}, *draw_line_table4[33] = {
-    [0 ... 32]	= 0,
+}, draw_line_table4[33] = {
+    [0 ... 32]	= NULL,
     [8]		= draw_line4_8,
     [15]	= draw_line4_15,
     [16]	= draw_line4_16,
     [32]	= draw_line4_32,
-}, *draw_line_table8[33] = {
-    [0 ... 32]	= 0,
+}, draw_line_table8[33] = {
+    [0 ... 32]	= NULL,
     [8]		= draw_line8_8,
     [15]	= draw_line8_15,
     [16]	= draw_line8_16,
     [32]	= draw_line8_32,
-}, *draw_line_table12[33] = {
-    [0 ... 32]	= 0,
+}, draw_line_table12[33] = {
+    [0 ... 32]	= NULL,
     [8]		= draw_line12_8,
     [15]	= draw_line12_15,
     [16]	= draw_line12_16,
     [32]	= draw_line12_32,
-}, *draw_line_table16[33] = {
-    [0 ... 32]	= 0,
+}, draw_line_table16[33] = {
+    [0 ... 32]	= NULL,
     [8]		= draw_line16_8,
     [15]	= draw_line16_15,
     [16]	= draw_line16_16,
@@ -117,21 +114,20 @@ static draw_line_func *draw_line_table2[33] = {
 static void omap_update_display(void *opaque)
 {
     struct omap_lcd_panel_s *omap_lcd = (struct omap_lcd_panel_s *) opaque;
-    draw_line_func *draw_line;
-    int size, dirty[2], minline, maxline, height;
-    int line, width, linesize, step, bpp, frame_offset;
-    ram_addr_t frame_base, scanline, newline, x;
-    uint8_t *s, *d;
+    draw_line_func draw_line;
+    int size, height, first, last;
+    int width, linesize, step, bpp, frame_offset;
+    target_phys_addr_t frame_base;
 
     if (!omap_lcd || omap_lcd->plm == 1 ||
-                    !omap_lcd->enable || !omap_lcd->state->depth)
+                    !omap_lcd->enable || !ds_get_bits_per_pixel(omap_lcd->state))
         return;
 
     frame_offset = 0;
     if (omap_lcd->plm != 2) {
-        memcpy(omap_lcd->palette, phys_ram_base +
-                        omap_lcd->dma->phys_framebuffer[
-                        omap_lcd->dma->current_frame], 0x200);
+        cpu_physical_memory_read(omap_lcd->dma->phys_framebuffer[
+                                  omap_lcd->dma->current_frame],
+                                 (void *)omap_lcd->palette, 0x200);
         switch (omap_lcd->palette[0] >> 12 & 7) {
         case 3 ... 7:
             frame_offset += 0x200;
@@ -144,25 +140,25 @@ static void omap_update_display(void *opaque)
     /* Colour depth */
     switch ((omap_lcd->palette[0] >> 12) & 7) {
     case 1:
-        draw_line = draw_line_table2[omap_lcd->state->depth];
+        draw_line = draw_line_table2[ds_get_bits_per_pixel(omap_lcd->state)];
         bpp = 2;
         break;
 
     case 2:
-        draw_line = draw_line_table4[omap_lcd->state->depth];
+        draw_line = draw_line_table4[ds_get_bits_per_pixel(omap_lcd->state)];
         bpp = 4;
         break;
 
     case 3:
-        draw_line = draw_line_table8[omap_lcd->state->depth];
+        draw_line = draw_line_table8[ds_get_bits_per_pixel(omap_lcd->state)];
         bpp = 8;
         break;
 
     case 4 ... 7:
         if (!omap_lcd->tft)
-            draw_line = draw_line_table12[omap_lcd->state->depth];
+            draw_line = draw_line_table12[ds_get_bits_per_pixel(omap_lcd->state)];
         else
-            draw_line = draw_line_table16[omap_lcd->state->depth];
+            draw_line = draw_line_table16[ds_get_bits_per_pixel(omap_lcd->state)];
         bpp = 16;
         break;
 
@@ -173,10 +169,10 @@ static void omap_update_display(void *opaque)
 
     /* Resolution */
     width = omap_lcd->width;
-    if (width != omap_lcd->state->width ||
-            omap_lcd->height != omap_lcd->state->height) {
-        dpy_resize(omap_lcd->state,
-                omap_lcd->width, omap_lcd->height);
+    if (width != ds_get_width(omap_lcd->state) ||
+            omap_lcd->height != ds_get_height(omap_lcd->state)) {
+        qemu_console_resize(omap_lcd->state,
+                            omap_lcd->width, omap_lcd->height);
         omap_lcd->invalidate = 1;
     }
 
@@ -201,52 +197,31 @@ static void omap_update_display(void *opaque)
     if (omap_lcd->dma->dual)
         omap_lcd->dma->current_frame ^= 1;
 
-    if (!omap_lcd->state->depth)
+    if (!ds_get_bits_per_pixel(omap_lcd->state))
         return;
 
-    line = 0;
+    first = 0;
     height = omap_lcd->height;
     if (omap_lcd->subpanel & (1 << 31)) {
         if (omap_lcd->subpanel & (1 << 29))
-            line = (omap_lcd->subpanel >> 16) & 0x3ff;
+            first = (omap_lcd->subpanel >> 16) & 0x3ff;
         else
             height = (omap_lcd->subpanel >> 16) & 0x3ff;
         /* TODO: fill the rest of the panel with DPD */
     }
+
     step = width * bpp >> 3;
-    scanline = frame_base + step * line;
-    s = (uint8_t *) (phys_ram_base + scanline);
-    d = omap_lcd->state->data;
-    linesize = omap_lcd->state->linesize;
-
-    dirty[0] = dirty[1] =
-            cpu_physical_memory_get_dirty(scanline, VGA_DIRTY_FLAG);
-    minline = height;
-    maxline = line;
-    for (; line < height; line ++) {
-        newline = scanline + step;
-        for (x = scanline + TARGET_PAGE_SIZE; x < newline;
-                        x += TARGET_PAGE_SIZE) {
-            dirty[1] = cpu_physical_memory_get_dirty(x, VGA_DIRTY_FLAG);
-            dirty[0] |= dirty[1];
-        }
-        if (dirty[0] || omap_lcd->invalidate) {
-            draw_line(d, s, width, omap_lcd->palette);
-            if (line < minline)
-                minline = line;
-            maxline = line + 1;
-        }
-        scanline = newline;
-        dirty[0] = dirty[1];
-        s += step;
-        d += linesize;
+    linesize = ds_get_linesize(omap_lcd->state);
+    framebuffer_update_display(omap_lcd->state,
+                               frame_base, width, height,
+                               step, linesize, 0,
+                               omap_lcd->invalidate,
+                               draw_line, omap_lcd->palette,
+                               &first, &last);
+    if (first >= 0) {
+        dpy_update(omap_lcd->state, 0, first, width, last - first + 1);
     }
-
-    if (maxline >= minline) {
-        dpy_update(omap_lcd->state, 0, minline, width, maxline);
-        cpu_physical_memory_reset_dirty(frame_base + step * minline,
-                        frame_base + step * maxline, VGA_DIRTY_FLAG);
-    }
+    omap_lcd->invalidate = 0;
 }
 
 static int ppm_save(const char *filename, uint8_t *data,
@@ -292,10 +267,10 @@ static int ppm_save(const char *filename, uint8_t *data,
 static void omap_screen_dump(void *opaque, const char *filename) {
     struct omap_lcd_panel_s *omap_lcd = opaque;
     omap_update_display(opaque);
-    if (omap_lcd && omap_lcd->state->data)
-        ppm_save(filename, omap_lcd->state->data,
+    if (omap_lcd && ds_get_data(omap_lcd->state))
+        ppm_save(filename, ds_get_data(omap_lcd->state),
                 omap_lcd->width, omap_lcd->height,
-                omap_lcd->state->linesize);
+                ds_get_linesize(omap_lcd->state));
 }
 
 static void omap_invalidate_display(void *opaque) {
@@ -338,25 +313,13 @@ static void omap_lcd_update(struct omap_lcd_panel_s *s) {
         return;
     }
 
-     if (s->dma->src == imif) {
-        /* Framebuffers are in SRAM */
-        s->dma->phys_framebuffer[0] = s->imif_base +
-                s->dma->src_f1_top - OMAP_IMIF_BASE;
-
-        s->dma->phys_framebuffer[1] = s->imif_base +
-                s->dma->src_f2_top - OMAP_IMIF_BASE;
-    } else {
-        /* Framebuffers are in RAM */
-        s->dma->phys_framebuffer[0] = s->emiff_base +
-                s->dma->src_f1_top - OMAP_EMIFF_BASE;
-
-        s->dma->phys_framebuffer[1] = s->emiff_base +
-                s->dma->src_f2_top - OMAP_EMIFF_BASE;
-    }
+    s->dma->phys_framebuffer[0] = s->dma->src_f1_top;
+    s->dma->phys_framebuffer[1] = s->dma->src_f2_top;
 
     if (s->plm != 2 && !s->palette_done) {
-        memcpy(s->palette, phys_ram_base +
-                s->dma->phys_framebuffer[s->dma->current_frame], 0x200);
+        cpu_physical_memory_read(
+            s->dma->phys_framebuffer[s->dma->current_frame],
+            (void *)s->palette, 0x200);
         s->palette_done = 1;
         omap_lcd_interrupts(s);
     }
@@ -365,9 +328,8 @@ static void omap_lcd_update(struct omap_lcd_panel_s *s) {
 static uint32_t omap_lcdc_read(void *opaque, target_phys_addr_t addr)
 {
     struct omap_lcd_panel_s *s = (struct omap_lcd_panel_s *) opaque;
-    int offset = addr - s->base;
 
-    switch (offset) {
+    switch (addr) {
     case 0x00:	/* LCD_CONTROL */
         return (s->tft << 23) | (s->plm << 20) |
                 (s->tft << 7) | (s->interrupts << 3) |
@@ -399,9 +361,8 @@ static void omap_lcdc_write(void *opaque, target_phys_addr_t addr,
                 uint32_t value)
 {
     struct omap_lcd_panel_s *s = (struct omap_lcd_panel_s *) opaque;
-    int offset = addr - s->base;
 
-    switch (offset) {
+    switch (addr) {
     case 0x00:	/* LCD_CONTROL */
         s->plm = (value >> 20) & 3;
         s->tft = (value >> 7) & 1;
@@ -440,13 +401,13 @@ static void omap_lcdc_write(void *opaque, target_phys_addr_t addr,
     }
 }
 
-static CPUReadMemoryFunc *omap_lcdc_readfn[] = {
+static CPUReadMemoryFunc * const omap_lcdc_readfn[] = {
     omap_lcdc_read,
     omap_lcdc_read,
     omap_lcdc_read,
 };
 
-static CPUWriteMemoryFunc *omap_lcdc_writefn[] = {
+static CPUWriteMemoryFunc * const omap_lcdc_writefn[] = {
     omap_lcdc_write,
     omap_lcdc_write,
     omap_lcdc_write,
@@ -475,7 +436,7 @@ void omap_lcdc_reset(struct omap_lcd_panel_s *s)
 }
 
 struct omap_lcd_panel_s *omap_lcdc_init(target_phys_addr_t base, qemu_irq irq,
-                struct omap_dma_lcd_channel_s *dma, DisplayState *ds,
+                struct omap_dma_lcd_channel_s *dma,
                 ram_addr_t imif_base, ram_addr_t emiff_base, omap_clk clk)
 {
     int iomemtype;
@@ -484,18 +445,17 @@ struct omap_lcd_panel_s *omap_lcdc_init(target_phys_addr_t base, qemu_irq irq,
 
     s->irq = irq;
     s->dma = dma;
-    s->base = base;
-    s->state = ds;
     s->imif_base = imif_base;
     s->emiff_base = emiff_base;
     omap_lcdc_reset(s);
 
-    iomemtype = cpu_register_io_memory(0, omap_lcdc_readfn,
+    iomemtype = cpu_register_io_memory(omap_lcdc_readfn,
                     omap_lcdc_writefn, s);
-    cpu_register_physical_memory(s->base, 0x100, iomemtype);
+    cpu_register_physical_memory(base, 0x100, iomemtype);
 
-    graphic_console_init(ds, omap_update_display,
-                    omap_invalidate_display, omap_screen_dump, NULL, s);
+    s->state = graphic_console_init(omap_update_display,
+                                    omap_invalidate_display,
+                                    omap_screen_dump, NULL, s);
 
     return s;
 }

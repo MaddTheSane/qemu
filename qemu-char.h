@@ -1,11 +1,20 @@
 #ifndef QEMU_CHAR_H
 #define QEMU_CHAR_H
 
+#include "qemu-common.h"
+#include "qemu-queue.h"
+#include "qemu-option.h"
+#include "qemu-config.h"
+#include "qobject.h"
+
 /* character device */
 
-#define CHR_EVENT_BREAK 0 /* serial break char */
-#define CHR_EVENT_FOCUS 1 /* focus to this terminal (modal input needed) */
-#define CHR_EVENT_RESET 2 /* new connection established */
+#define CHR_EVENT_BREAK   0 /* serial break char */
+#define CHR_EVENT_FOCUS   1 /* focus to this terminal (modal input needed) */
+#define CHR_EVENT_OPENED  2 /* new connection established */
+#define CHR_EVENT_MUX_IN  3 /* mux-focus was set to this terminal */
+#define CHR_EVENT_MUX_OUT 4 /* mux-focus will move on */
+#define CHR_EVENT_CLOSED  5 /* connection closed */
 
 
 #define CHR_IOCTL_SERIAL_SET_PARAMS   1
@@ -27,13 +36,26 @@ typedef struct {
 #define CHR_IOCTL_PP_EPP_READ         9
 #define CHR_IOCTL_PP_EPP_WRITE_ADDR  10
 #define CHR_IOCTL_PP_EPP_WRITE       11
+#define CHR_IOCTL_PP_DATA_DIR        12
+
+#define CHR_IOCTL_SERIAL_SET_TIOCM   13
+#define CHR_IOCTL_SERIAL_GET_TIOCM   14
+
+#define CHR_TIOCM_CTS	0x020
+#define CHR_TIOCM_CAR	0x040
+#define CHR_TIOCM_DSR	0x100
+#define CHR_TIOCM_RI	0x080
+#define CHR_TIOCM_DTR	0x002
+#define CHR_TIOCM_RTS	0x004
 
 typedef void IOEventHandler(void *opaque, int event);
 
 struct CharDriverState {
+    void (*init)(struct CharDriverState *s);
     int (*chr_write)(struct CharDriverState *s, const uint8_t *buf, int len);
     void (*chr_update_read_handler)(struct CharDriverState *s);
     int (*chr_ioctl)(struct CharDriverState *s, int cmd, void *arg);
+    int (*get_msgfd)(struct CharDriverState *s);
     IOEventHandler *chr_event;
     IOCanRWHandler *chr_can_read;
     IOReadHandler *chr_read;
@@ -42,11 +64,16 @@ struct CharDriverState {
     void (*chr_close)(struct CharDriverState *chr);
     void (*chr_accept_input)(struct CharDriverState *chr);
     void *opaque;
-    int focus;
     QEMUBH *bh;
+    char *label;
+    char *filename;
+    QTAILQ_ENTRY(CharDriverState) next;
 };
 
-CharDriverState *qemu_chr_open(const char *filename);
+QemuOpts *qemu_chr_parse_compat(const char *label, const char *filename);
+CharDriverState *qemu_chr_open_opts(QemuOpts *opts,
+                                    void (*init)(struct CharDriverState *s));
+CharDriverState *qemu_chr_open(const char *label, const char *filename, void (*init)(struct CharDriverState *s));
 void qemu_chr_close(CharDriverState *chr);
 void qemu_chr_printf(CharDriverState *s, const char *fmt, ...);
 int qemu_chr_write(CharDriverState *s, const uint8_t *buf, int len);
@@ -57,10 +84,16 @@ void qemu_chr_add_handlers(CharDriverState *s,
                            IOEventHandler *fd_event,
                            void *opaque);
 int qemu_chr_ioctl(CharDriverState *s, int cmd, void *arg);
-void qemu_chr_reset(CharDriverState *s);
+void qemu_chr_generic_open(CharDriverState *s);
 int qemu_chr_can_read(CharDriverState *s);
 void qemu_chr_read(CharDriverState *s, uint8_t *buf, int len);
+int qemu_chr_get_msgfd(CharDriverState *s);
 void qemu_chr_accept_input(CharDriverState *s);
+void qemu_chr_info_print(Monitor *mon, const QObject *ret_data);
+void qemu_chr_info(Monitor *mon, QObject **ret_data);
+CharDriverState *qemu_chr_find(const char *name);
+
+extern int term_escape_char;
 
 /* async I/O support */
 

@@ -15,8 +15,7 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdio.h>
@@ -28,7 +27,17 @@
 #include "exec-all.h"
 #include "host-utils.h"
 
+
+//#define CRIS_HELPER_DEBUG
+
+
+#ifdef CRIS_HELPER_DEBUG
+#define D(x) x
+#define D_LOG(...) qemu_log(__VA__ARGS__)
+#else
 #define D(x)
+#define D_LOG(...) do { } while (0)
+#endif
 
 #if defined(CONFIG_USER_ONLY)
 
@@ -42,9 +51,8 @@ int cpu_cris_handle_mmu_fault(CPUState * env, target_ulong address, int rw,
                              int mmu_idx, int is_softmmu)
 {
 	env->exception_index = 0xaa;
-	env->debug1 = address;
+	env->pregs[PR_EDA] = address;
 	cpu_dump_state(env, stderr, fprintf, 0);
-	env->pregs[PR_ERP] = env->pc;
 	return 1;
 }
 
@@ -68,38 +76,43 @@ static void cris_shift_ccs(CPUState *env)
 int cpu_cris_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
                                int mmu_idx, int is_softmmu)
 {
-	struct cris_mmu_result_t res;
+	struct cris_mmu_result res;
 	int prot, miss;
 	int r = -1;
 	target_ulong phy;
 
 	D(printf ("%s addr=%x pc=%x rw=%x\n", __func__, address, env->pc, rw));
-	address &= TARGET_PAGE_MASK;
-	prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
-	miss = cris_mmu_translate(&res, env, address, rw, mmu_idx);
+	miss = cris_mmu_translate(&res, env, address & TARGET_PAGE_MASK,
+				  rw, mmu_idx);
 	if (miss)
 	{
-		if (env->exception_index == EXCP_MMU_FAULT)
+		if (env->exception_index == EXCP_BUSFAULT)
 			cpu_abort(env, 
 				  "CRIS: Illegal recursive bus fault."
 				  "addr=%x rw=%d\n",
 				  address, rw);
 
-		env->exception_index = EXCP_MMU_FAULT;
+		env->pregs[PR_EDA] = address;
+		env->exception_index = EXCP_BUSFAULT;
 		env->fault_vector = res.bf_vec;
 		r = 1;
 	}
 	else
 	{
-		phy = res.phy;
+		/*
+		 * Mask off the cache selection bit. The ETRAX busses do not
+		 * see the top bit.
+		 */
+		phy = res.phy & ~0x80000000;
 		prot = res.prot;
-		address &= TARGET_PAGE_MASK;
-		r = tlb_set_page(env, address, phy, prot, mmu_idx, is_softmmu);
+		r = tlb_set_page(env, address & TARGET_PAGE_MASK,
+				 phy, prot, mmu_idx, is_softmmu);
 	}
 	if (r > 0)
-		D(fprintf(logfile, "%s returns %d irqreq=%x addr=%x ismmu=%d vec=%x\n", 
-			 __func__, r, env->interrupt_request, 
-			 address, is_softmmu, res.bf_vec));
+		D_LOG("%s returns %d irqreq=%x addr=%x"
+			  " phy=%x ismmu=%d vec=%x pc=%x\n", 
+			  __func__, r, env->interrupt_request, 
+			  address, res.phy, is_softmmu, res.bf_vec, env->pc);
 	return r;
 }
 
@@ -107,9 +120,9 @@ void do_interrupt(CPUState *env)
 {
 	int ex_vec = -1;
 
-	D(fprintf (logfile, "exception index=%d interrupt_req=%d\n",
+	D_LOG( "exception index=%d interrupt_req=%d\n",
 		   env->exception_index,
-		   env->interrupt_request));
+		   env->interrupt_request);
 
 	switch (env->exception_index)
 	{
@@ -117,20 +130,23 @@ void do_interrupt(CPUState *env)
 			/* These exceptions are genereated by the core itself.
 			   ERP should point to the insn following the brk.  */
 			ex_vec = env->trap_vector;
-			env->pregs[PR_ERP] = env->pc + 2;
+			env->pregs[PR_ERP] = env->pc;
 			break;
 
-		case EXCP_MMU_FAULT:
+		case EXCP_NMI:
+			/* NMI is hardwired to vector zero.  */
+			ex_vec = 0;
+			env->pregs[PR_CCS] &= ~M_FLAG;
+			env->pregs[PR_NRP] = env->pc;
+			break;
+
+		case EXCP_BUSFAULT:
 			ex_vec = env->fault_vector;
 			env->pregs[PR_ERP] = env->pc;
 			break;
 
 		default:
-			/* Is the core accepting interrupts?  */
-			if (!(env->pregs[PR_CCS] & I_FLAG))
-				return;
-			/* The interrupt controller gives us the
-			   vector.  */
+			/* The interrupt controller gives us the vector.  */
 			ex_vec = env->interrupt_vector;
 			/* Normal interrupts are taken between
 			   TB's.  env->pc is valid here.  */
@@ -138,17 +154,24 @@ void do_interrupt(CPUState *env)
 			break;
 	}
 
-	if ((env->pregs[PR_CCS] & U_FLAG)) {
-		D(fprintf(logfile, "excp isr=%x PC=%x SP=%x ERP=%x pid=%x ccs=%x cc=%d %x\n",
-			  ex_vec, env->pc,
+	/* Fill in the IDX field.  */
+	env->pregs[PR_EXS] = (ex_vec & 0xff) << 8;
+
+	if (env->dslot) {
+		D_LOG("excp isr=%x PC=%x ds=%d SP=%x"
+			  " ERP=%x pid=%x ccs=%x cc=%d %x\n",
+			  ex_vec, env->pc, env->dslot,
 			  env->regs[R_SP],
 			  env->pregs[PR_ERP], env->pregs[PR_PID],
 			  env->pregs[PR_CCS],
-			  env->cc_op, env->cc_mask));
+			  env->cc_op, env->cc_mask);
+		/* We loose the btarget, btaken state here so rexec the
+		   branch.  */
+		env->pregs[PR_ERP] -= env->dslot;
+		/* Exception starts with dslot cleared.  */
+		env->dslot = 0;
 	}
 	
-	env->pc = ldl_code(env->pregs[PR_EBP] + ex_vec * 4);
-
 	if (env->pregs[PR_CCS] & U_FLAG) {
 		/* Swap stack pointers.  */
 		env->pregs[PR_USP] = env->regs[R_SP];
@@ -157,17 +180,21 @@ void do_interrupt(CPUState *env)
 
 	/* Apply the CRIS CCS shift. Clears U if set.  */
 	cris_shift_ccs(env);
-	D(fprintf (logfile, "%s isr=%x vec=%x ccs=%x pid=%d erp=%x\n", 
+
+	/* Now that we are in kernel mode, load the handlers address.  */
+	env->pc = ldl_code(env->pregs[PR_EBP] + ex_vec * 4);
+
+	D_LOG("%s isr=%x vec=%x ccs=%x pid=%d erp=%x\n", 
 		   __func__, env->pc, ex_vec, 
 		   env->pregs[PR_CCS],
 		   env->pregs[PR_PID], 
-		   env->pregs[PR_ERP]));
+		   env->pregs[PR_ERP]);
 }
 
 target_phys_addr_t cpu_get_phys_page_debug(CPUState * env, target_ulong addr)
 {
 	uint32_t phy = addr;
-	struct cris_mmu_result_t res;
+	struct cris_mmu_result res;
 	int miss;
 	miss = cris_mmu_translate(&res, env, addr, 0, 0);
 	if (!miss)

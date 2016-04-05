@@ -15,28 +15,26 @@
  * General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #ifndef CPU_CRIS_H
 #define CPU_CRIS_H
 
 #define TARGET_LONG_BITS 32
 
-#include "cpu-defs.h"
+#define CPUState struct CPUCRISState
 
-#include "softfloat.h"
+#include "cpu-defs.h"
 
 #define TARGET_HAS_ICE 1
 
 #define ELF_MACHINE	EM_CRIS
 
-#define EXCP_MMU_EXEC    0
-#define EXCP_MMU_READ    1
-#define EXCP_MMU_WRITE   2
-#define EXCP_MMU_FLUSH   3
-#define EXCP_MMU_FAULT   4
-#define EXCP_BREAK      16 /* trap.  */
+#define EXCP_NMI        1
+#define EXCP_GURU       2
+#define EXCP_BUSFAULT   3
+#define EXCP_IRQ        4
+#define EXCP_BREAK      5
 
 /* Register aliases. R0 - R15 */
 #define R_FP  8
@@ -56,15 +54,16 @@
 #define PR_EBP 9
 #define PR_ERP 10
 #define PR_SRP 11
+#define PR_NRP 12
 #define PR_CCS 13
 #define PR_USP 14
 #define PR_SPC 15
 
 /* CPU flags.  */
+#define Q_FLAG 0x80000000
+#define M_FLAG 0x40000000
 #define S_FLAG 0x200
 #define R_FLAG 0x100
-#define P_FLAG 0x80
-#define U_FLAG 0x40
 #define P_FLAG 0x80
 #define U_FLAG 0x40
 #define I_FLAG 0x20
@@ -93,9 +92,6 @@
 #define CC_A   14
 #define CC_P   15
 
-/* Internal flags for the implementation.  */
-#define F_DELAYSLOT 1
-
 #define NB_MMU_MODES 2
 
 typedef struct CPUCRISState {
@@ -109,11 +105,10 @@ typedef struct CPUCRISState {
 	/* Pseudo register for the kernel stack.  */
 	uint32_t ksp;
 
-	/* These are setup up by the guest code just before transfering the
-	   control back to the host.  */
-	int jmp;
-	uint32_t btarget;
+	/* Branch.  */
+	int dslot;
 	int btaken;
+	uint32_t btarget;
 
 	/* Condition flag tracking.  */
 	uint32_t cc_op;
@@ -121,30 +116,14 @@ typedef struct CPUCRISState {
 	uint32_t cc_dest;
 	uint32_t cc_src;
 	uint32_t cc_result;
-
 	/* size of the operation, 1 = byte, 2 = word, 4 = dword.  */
 	int cc_size;
-
-	/* Extended arithmetics.  */
-	int cc_x_live;
+	/* X flag at the time of cc snapshot.  */
 	int cc_x;
 
-	int exception_index;
-	int interrupt_request;
 	int interrupt_vector;
 	int fault_vector;
 	int trap_vector;
-
-	uint32_t debug1;
-	uint32_t debug2;
-	uint32_t debug3;
-
-	struct
-	{
-		int exec_insns;
-		int exec_loads;
-		int exec_stores;
-	} stats;
 
 	/* FIXME: add a check in the translator to avoid writing to support
 	   register sets beyond the 4th. The ISA allows up to 256! but in
@@ -154,6 +133,11 @@ typedef struct CPUCRISState {
 	   core. Accesses do not pass down the normal hierarchy.
 	*/
 	uint32_t sregs[4][16];
+
+	/* Linear feedback shift reg in the mmu. Used to provide pseudo
+	   randomness for the 'hint' the mmu gives to sw for chosing valid
+	   sets on TLB refills.  */
+	uint32_t mmu_rand_lfsr;
 
 	/*
 	 * We just store the stores to the tlbset here for later evaluation
@@ -167,11 +151,6 @@ typedef struct CPUCRISState {
 		uint32_t lo;
 	} tlbsets[2][4][16];
 
-	int features;
-	int user_mode_only;
-	int halted;
-
-	jmp_buf jmp_env;
 	CPU_COMMON
 } CPUCRISState;
 
@@ -184,20 +163,12 @@ void do_interrupt(CPUCRISState *env);
    is returned if the signal was handled by the virtual CPU.  */
 int cpu_cris_signal_handler(int host_signum, void *pinfo,
                            void *puc);
-void cpu_cris_flush_flags(CPUCRISState *, int);
-
-
-void do_unassigned_access(target_phys_addr_t addr, int is_write, int is_exec,
-                          int is_asi);
 
 enum {
     CC_OP_DYNAMIC, /* Use env->cc_op  */
     CC_OP_FLAGS,
-    CC_OP_LOGIC,
     CC_OP_CMP,
     CC_OP_MOVE,
-    CC_OP_MOVE_PD,
-    CC_OP_MOVE_SD,
     CC_OP_ADD,
     CC_OP_ADDC,
     CC_OP_MCP,
@@ -220,41 +191,16 @@ enum {
     CC_OP_LZ
 };
 
-#define CCF_C 0x01
-#define CCF_V 0x02
-#define CCF_Z 0x04
-#define CCF_N 0x08
-#define CCF_X 0x10
-
-#define CRIS_SSP    0
-#define CRIS_USP    1
-
-void cris_set_irq_level(CPUCRISState *env, int level, uint8_t vector);
-void cris_set_macsr(CPUCRISState *env, uint32_t val);
-void cris_switch_sp(CPUCRISState *env);
-
-void do_cris_semihosting(CPUCRISState *env, int nr);
-
-enum cris_features {
-    CRIS_FEATURE_CF_ISA_MUL,
-};
-
-static inline int cris_feature(CPUCRISState *env, int feature)
-{
-    return (env->features & (1u << feature)) != 0;
-}
-
-void register_cris_insns (CPUCRISState *env);
-
 /* CRIS uses 8k pages.  */
 #define TARGET_PAGE_BITS 13
 #define MMAP_SHIFT TARGET_PAGE_BITS
 
-#define CPUState CPUCRISState
 #define cpu_init cpu_cris_init
 #define cpu_exec cpu_cris_exec
 #define cpu_gen_code cpu_cris_gen_code
 #define cpu_signal_handler cpu_cris_signal_handler
+
+#define CPU_SAVE_VERSION 1
 
 /* MMU modes definitions */
 #define MMU_MODE0_SUFFIX _kernel
@@ -263,6 +209,24 @@ void register_cris_insns (CPUCRISState *env);
 static inline int cpu_mmu_index (CPUState *env)
 {
 	return !!(env->pregs[PR_CCS] & U_FLAG);
+}
+
+int cpu_cris_handle_mmu_fault(CPUState *env, target_ulong address, int rw,
+                              int mmu_idx, int is_softmmu);
+#define cpu_handle_mmu_fault cpu_cris_handle_mmu_fault
+
+#if defined(CONFIG_USER_ONLY)
+static inline void cpu_clone_regs(CPUState *env, target_ulong newsp)
+{
+    if (newsp)
+        env->regs[14] = newsp;
+    env->regs[10] = 0;
+}
+#endif
+
+static inline void cpu_set_tls(CPUCRISState *env, target_ulong newtls)
+{
+	env->pregs[PR_PID] = (env->pregs[PR_PID] & 0xff) | newtls;
 }
 
 /* Support function regs.  */
@@ -276,4 +240,20 @@ static inline int cpu_mmu_index (CPUState *env)
 #define SFR_RW_MM_TLB_HI   env->pregs[PR_SRS]][6
 
 #include "cpu-all.h"
+#include "exec-all.h"
+
+static inline void cpu_pc_from_tb(CPUState *env, TranslationBlock *tb)
+{
+    env->pc = tb->pc;
+}
+
+static inline void cpu_get_tb_cpu_state(CPUState *env, target_ulong *pc,
+                                        target_ulong *cs_base, int *flags)
+{
+    *pc = env->pc;
+    *cs_base = 0;
+    *flags = env->dslot |
+            (env->pregs[PR_CCS] & (S_FLAG | P_FLAG | U_FLAG | X_FLAG));
+}
+
 #endif

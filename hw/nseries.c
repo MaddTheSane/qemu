@@ -14,10 +14,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
- * MA 02111-1307 USA
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "qemu-common.h"
@@ -31,6 +29,8 @@
 #include "devices.h"
 #include "flash.h"
 #include "hw.h"
+#include "bt.h"
+#include "loader.h"
 
 /* Nokia N8x0 support */
 struct n800_s {
@@ -40,26 +40,30 @@ struct n800_s {
     struct {
         void *opaque;
         uint32_t (*txrx)(void *opaque, uint32_t value, int len);
-        struct uwire_slave_s *chip;
+        uWireSlave *chip;
     } ts;
     i2c_bus *i2c;
 
     int keymap[0x80];
+    i2c_slave *kbd;
 
-    struct tusb_s *usb;
+    TUSBState *usb;
     void *retu;
     void *tahvo;
+    void *nand;
 };
 
 /* GPIO pins */
 #define N8X0_TUSB_ENABLE_GPIO		0
 #define N800_MMC2_WP_GPIO		8
 #define N800_UNKNOWN_GPIO0		9	/* out */
-#define N800_UNKNOWN_GPIO1		10	/* out */
+#define N810_MMC2_VIOSD_GPIO		9
+#define N810_HEADSET_AMP_GPIO		10
 #define N800_CAM_TURN_GPIO		12
 #define N810_GPS_RESET_GPIO		12
 #define N800_BLIZZARD_POWERDOWN_GPIO	15
 #define N800_MMC1_WP_GPIO		23
+#define N810_MMC2_VSD_GPIO		23
 #define N8X0_ONENAND_GPIO		26
 #define N810_BLIZZARD_RESET_GPIO	30
 #define N800_UNKNOWN_GPIO2		53	/* out */
@@ -79,7 +83,7 @@ struct n800_s {
 #define N8X0_MMC_CS_GPIO		96
 #define N8X0_WLAN_PWR_GPIO		97
 #define N8X0_BT_HOST_WKUP_GPIO		98
-#define N800_UNKNOWN_GPIO3		101	/* out */
+#define N810_SPEAKER_AMP_GPIO		101
 #define N810_KB_LOCK_GPIO		102
 #define N800_TSC_TS_GPIO		103
 #define N810_TSC_TS_GPIO		106
@@ -92,21 +96,31 @@ struct n800_s {
 #define N8X0_TAHVO_GPIO			111
 #define N800_UNKNOWN_GPIO4		112	/* out */
 #define N810_SLEEPX_LED_GPIO		112
-#define N810_TSC_UNKNOWN_GPIO		118	/* out */
-#define N800_TSC_RESET_GPIO		119	/* ? */
+#define N800_TSC_RESET_GPIO		118	/* ? */
+#define N810_AIC33_RESET_GPIO		118
+#define N800_TSC_UNKNOWN_GPIO		119	/* out */
 #define N8X0_TMP105_GPIO		125
 
 /* Config */
+#define BT_UART				0
 #define XLDR_LL_UART			1
 
-/* Addresses on the I2C bus */
-#define N8X0_TMP105_ADDR		0x48
-#define N8X0_MENELAUS_ADDR		0x72
+/* Addresses on the I2C bus 0 */
+#define N810_TLV320AIC33_ADDR		0x18	/* Audio CODEC */
+#define N8X0_TCM825x_ADDR		0x29	/* Camera */
+#define N810_LP5521_ADDR		0x32	/* LEDs */
+#define N810_TSL2563_ADDR		0x3d	/* Light sensor */
+#define N810_LM8323_ADDR		0x45	/* Keyboard */
+/* Addresses on the I2C bus 1 */
+#define N8X0_TMP105_ADDR		0x48	/* Temperature sensor */
+#define N8X0_MENELAUS_ADDR		0x72	/* Power management */
 
 /* Chipselects on GPMC NOR interface */
 #define N8X0_ONENAND_CS			0
 #define N8X0_USB_ASYNC_CS		1
 #define N8X0_USB_SYNC_CS		4
+
+#define N8X0_BD_ADDR			0x00, 0x1a, 0x89, 0x9e, 0x3e, 0x81
 
 static void n800_mmc_cs_cb(void *opaque, int line, int level)
 {
@@ -125,41 +139,69 @@ static void n8x0_gpio_setup(struct n800_s *s)
     qemu_irq_lower(omap2_gpio_in_get(s->cpu->gpif, N800_BAT_COVER_GPIO)[0]);
 }
 
+#define MAEMO_CAL_HEADER(...)				\
+    'C',  'o',  'n',  'F',  0x02, 0x00, 0x04, 0x00,	\
+    __VA_ARGS__,					\
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+static const uint8_t n8x0_cal_wlan_mac[] = {
+    MAEMO_CAL_HEADER('w', 'l', 'a', 'n', '-', 'm', 'a', 'c')
+    0x1c, 0x00, 0x00, 0x00, 0x47, 0xd6, 0x69, 0xb3,
+    0x30, 0x08, 0xa0, 0x83, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00,
+    0x89, 0x00, 0x00, 0x00, 0x9e, 0x00, 0x00, 0x00,
+    0x5d, 0x00, 0x00, 0x00, 0xc1, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t n8x0_cal_bt_id[] = {
+    MAEMO_CAL_HEADER('b', 't', '-', 'i', 'd', 0, 0, 0)
+    0x0a, 0x00, 0x00, 0x00, 0xa3, 0x4b, 0xf6, 0x96,
+    0xa8, 0xeb, 0xb2, 0x41, 0x00, 0x00, 0x00, 0x00,
+    N8X0_BD_ADDR,
+};
+
 static void n8x0_nand_setup(struct n800_s *s)
 {
+    char *otp_region;
+
     /* Either ec40xx or ec48xx are OK for the ID */
     omap_gpmc_attach(s->cpu->gpmc, N8X0_ONENAND_CS, 0, onenand_base_update,
                     onenand_base_unmap,
-                    onenand_init(0xec4800, 1,
-                            omap2_gpio_in_get(s->cpu->gpif,
-                                    N8X0_ONENAND_GPIO)[0]));
+                    (s->nand = onenand_init(0xec4800, 1,
+                                            omap2_gpio_in_get(s->cpu->gpif,
+                                                    N8X0_ONENAND_GPIO)[0])));
+    otp_region = onenand_raw_otp(s->nand);
+
+    memcpy(otp_region + 0x000, n8x0_cal_wlan_mac, sizeof(n8x0_cal_wlan_mac));
+    memcpy(otp_region + 0x800, n8x0_cal_bt_id, sizeof(n8x0_cal_bt_id));
+    /* XXX: in theory should also update the OOB for both pages */
 }
 
 static void n8x0_i2c_setup(struct n800_s *s)
 {
+    DeviceState *dev;
     qemu_irq tmp_irq = omap2_gpio_in_get(s->cpu->gpif, N8X0_TMP105_GPIO)[0];
 
     /* Attach the CPU on one end of our I2C bus.  */
     s->i2c = omap_i2c_bus(s->cpu->i2c[0]);
 
     /* Attach a menelaus PM chip */
-    i2c_set_slave_address(
-                    twl92230_init(s->i2c,
-                            s->cpu->irq[0][OMAP_INT_24XX_SYS_NIRQ]),
-                    N8X0_MENELAUS_ADDR);
+    dev = i2c_create_slave(s->i2c, "twl92230", N8X0_MENELAUS_ADDR);
+    qdev_connect_gpio_out(dev, 3, s->cpu->irq[0][OMAP_INT_24XX_SYS_NIRQ]);
 
     /* Attach a TMP105 PM chip (A0 wired to ground) */
-    i2c_set_slave_address(tmp105_init(s->i2c, tmp_irq), N8X0_TMP105_ADDR);
+    dev = i2c_create_slave(s->i2c, "tmp105", N8X0_TMP105_ADDR);
+    qdev_connect_gpio_out(dev, 0, tmp_irq);
 }
 
 /* Touchscreen and keypad controller */
-static struct mouse_transform_info_s n800_pointercal = {
+static MouseTransformInfo n800_pointercal = {
     .x = 800,
     .y = 480,
     .a = { 14560, -68, -3455208, -39, -9621, 35152972, 65536 },
 };
 
-static struct mouse_transform_info_s n810_pointercal = {
+static MouseTransformInfo n810_pointercal = {
     .x = 800,
     .y = 480,
     .a = { 15041, 148, -4731056, 171, -10238, 35933380, 65536 },
@@ -190,12 +232,12 @@ static const int n800_keys[16] = {
     28,	/* Enter */
     77,	/* Right */
     -1,
-    1,	/* Cycle (ESC) */
+     1,	/* Cycle (ESC) */
     80,	/* Down */
     62,	/* Menu (F4) */
     -1,
     66,	/* Zoom- (F8) */
-    64,	/* FS (F6) */
+    64,	/* FullScreen (F6) */
     65,	/* Zoom+ (F7) */
     -1,
 };
@@ -206,11 +248,11 @@ static void n800_tsc_kbd_setup(struct n800_s *s)
 
     /* XXX: are the three pins inverted inside the chip between the
      * tsc and the cpu (N4111)?  */
-    qemu_irq penirq = 0;	/* NC */
+    qemu_irq penirq = NULL;	/* NC */
     qemu_irq kbirq = omap2_gpio_in_get(s->cpu->gpif, N800_TSC_KP_IRQ_GPIO)[0];
     qemu_irq dav = omap2_gpio_in_get(s->cpu->gpif, N800_TSC_TS_GPIO)[0];
 
-    s->ts.chip = tsc2301_init(penirq, kbirq, dav, 0);
+    s->ts.chip = tsc2301_init(penirq, kbirq, dav);
     s->ts.opaque = s->ts.chip->opaque;
     s->ts.txrx = tsc210x_txrx;
 
@@ -233,6 +275,108 @@ static void n810_tsc_setup(struct n800_s *s)
     s->ts.txrx = tsc2005_txrx;
 
     tsc2005_set_transform(s->ts.opaque, &n810_pointercal);
+}
+
+/* N810 Keyboard controller */
+static void n810_key_event(void *opaque, int keycode)
+{
+    struct n800_s *s = (struct n800_s *) opaque;
+    int code = s->keymap[keycode & 0x7f];
+
+    if (code == -1) {
+        if ((keycode & 0x7f) == RETU_KEYCODE)
+            retu_key_event(s->retu, !(keycode & 0x80));
+        return;
+    }
+
+    lm832x_key_event(s->kbd, code, !(keycode & 0x80));
+}
+
+#define M	0
+
+static int n810_keys[0x80] = {
+    [0x01] = 16,	/* Q */
+    [0x02] = 37,	/* K */
+    [0x03] = 24,	/* O */
+    [0x04] = 25,	/* P */
+    [0x05] = 14,	/* Backspace */
+    [0x06] = 30,	/* A */
+    [0x07] = 31,	/* S */
+    [0x08] = 32,	/* D */
+    [0x09] = 33,	/* F */
+    [0x0a] = 34,	/* G */
+    [0x0b] = 35,	/* H */
+    [0x0c] = 36,	/* J */
+
+    [0x11] = 17,	/* W */
+    [0x12] = 62,	/* Menu (F4) */
+    [0x13] = 38,	/* L */
+    [0x14] = 40,	/* ' (Apostrophe) */
+    [0x16] = 44,	/* Z */
+    [0x17] = 45,	/* X */
+    [0x18] = 46,	/* C */
+    [0x19] = 47,	/* V */
+    [0x1a] = 48,	/* B */
+    [0x1b] = 49,	/* N */
+    [0x1c] = 42,	/* Shift (Left shift) */
+    [0x1f] = 65,	/* Zoom+ (F7) */
+
+    [0x21] = 18,	/* E */
+    [0x22] = 39,	/* ; (Semicolon) */
+    [0x23] = 12,	/* - (Minus) */
+    [0x24] = 13,	/* = (Equal) */
+    [0x2b] = 56,	/* Fn (Left Alt) */
+    [0x2c] = 50,	/* M */
+    [0x2f] = 66,	/* Zoom- (F8) */
+
+    [0x31] = 19,	/* R */
+    [0x32] = 29 | M,	/* Right Ctrl */
+    [0x34] = 57,	/* Space */
+    [0x35] = 51,	/* , (Comma) */
+    [0x37] = 72 | M,	/* Up */
+    [0x3c] = 82 | M,	/* Compose (Insert) */
+    [0x3f] = 64,	/* FullScreen (F6) */
+
+    [0x41] = 20,	/* T */
+    [0x44] = 52,	/* . (Dot) */
+    [0x46] = 77 | M,	/* Right */
+    [0x4f] = 63,	/* Home (F5) */
+    [0x51] = 21,	/* Y */
+    [0x53] = 80 | M,	/* Down */
+    [0x55] = 28,	/* Enter */
+    [0x5f] =  1,	/* Cycle (ESC) */
+
+    [0x61] = 22,	/* U */
+    [0x64] = 75 | M,	/* Left */
+
+    [0x71] = 23,	/* I */
+#if 0
+    [0x75] = 28 | M,	/* KP Enter (KP Enter) */
+#else
+    [0x75] = 15,	/* KP Enter (Tab) */
+#endif
+};
+
+#undef M
+
+static void n810_kbd_setup(struct n800_s *s)
+{
+    qemu_irq kbd_irq = omap2_gpio_in_get(s->cpu->gpif, N810_KEYBOARD_GPIO)[0];
+    DeviceState *dev;
+    int i;
+
+    for (i = 0; i < 0x80; i ++)
+        s->keymap[i] = -1;
+    for (i = 0; i < 0x80; i ++)
+        if (n810_keys[i] > 0)
+            s->keymap[n810_keys[i]] = i;
+
+    qemu_add_kbd_event_handler(n810_key_event, s);
+
+    /* Attach the LM8322 keyboard to the I2C bus,
+     * should happen in n8x0_i2c_setup and s->kbd be initialised here.  */
+    dev = i2c_create_slave(s->i2c, "lm8323", N810_LM8323_ADDR);
+    qdev_connect_gpio_out(dev, 0, kbd_irq);
 }
 
 /* LCD MIPI DBI-C controller (URAL) */
@@ -285,10 +429,9 @@ static uint32_t mipid_txrx(void *opaque, uint32_t cmd, int len)
     uint8_t ret;
 
     if (len > 9)
-        cpu_abort(cpu_single_env, "%s: FIXME: bad SPI word width %i\n",
-                        __FUNCTION__, len);
+        hw_error("%s: FIXME: bad SPI word width %i\n", __FUNCTION__, len);
 
-    if (s->p >= sizeof(s->resp) / sizeof(*s->resp))
+    if (s->p >= ARRAY_SIZE(s->resp))
         ret = 0;
     else
         ret = s->resp[s->p ++];
@@ -568,12 +711,12 @@ static void n800_dss_init(struct rfbi_chip_s *chip)
     fb_blank = memset(qemu_malloc(800 * 480 * 2), 0xff, 800 * 480 * 2);
     /* Display Memory Data Port */
     chip->block(chip->opaque, 1, fb_blank, 800 * 480 * 2, 800);
-    free(fb_blank);
+    qemu_free(fb_blank);
 }
 
-static void n8x0_dss_setup(struct n800_s *s, DisplayState *ds)
+static void n8x0_dss_setup(struct n800_s *s)
 {
-    s->blizzard.opaque = s1d13745_init(0, ds);
+    s->blizzard.opaque = s1d13745_init(NULL);
     s->blizzard.block = s1d13745_write_block;
     s->blizzard.write = s1d13745_write;
     s->blizzard.read = s1d13745_read;
@@ -587,7 +730,7 @@ static void n8x0_cbus_setup(struct n800_s *s)
     qemu_irq retu_irq = omap2_gpio_in_get(s->cpu->gpif, N8X0_RETU_GPIO)[0];
     qemu_irq tahvo_irq = omap2_gpio_in_get(s->cpu->gpif, N8X0_TAHVO_GPIO)[0];
 
-    struct cbus_s *cbus = cbus_init(dat_out);
+    CBus *cbus = cbus_init(dat_out);
 
     omap2_gpio_out_set(s->cpu->gpif, N8X0_CBUS_CLK_GPIO, cbus->clk);
     omap2_gpio_out_set(s->cpu->gpif, N8X0_CBUS_DAT_GPIO, cbus->dat);
@@ -595,6 +738,20 @@ static void n8x0_cbus_setup(struct n800_s *s)
 
     cbus_attach(cbus, s->retu = retu_init(retu_irq, 1));
     cbus_attach(cbus, s->tahvo = tahvo_init(tahvo_irq, 1));
+}
+
+static void n8x0_uart_setup(struct n800_s *s)
+{
+    CharDriverState *radio = uart_hci_init(
+                    omap2_gpio_in_get(s->cpu->gpif,
+                            N8X0_BT_HOST_WKUP_GPIO)[0]);
+
+    omap2_gpio_out_set(s->cpu->gpif, N8X0_BT_RESET_GPIO,
+                    csrhci_pins_get(radio)[csrhci_pin_reset]);
+    omap2_gpio_out_set(s->cpu->gpif, N8X0_BT_WKUP_GPIO,
+                    csrhci_pins_get(radio)[csrhci_pin_wakeup]);
+
+    omap_uart_attach(s->cpu->uart[BT_UART], radio);
 }
 
 static void n8x0_usb_power_cb(void *opaque, int line, int level)
@@ -608,16 +765,186 @@ static void n8x0_usb_setup(struct n800_s *s)
 {
     qemu_irq tusb_irq = omap2_gpio_in_get(s->cpu->gpif, N8X0_TUSB_INT_GPIO)[0];
     qemu_irq tusb_pwr = qemu_allocate_irqs(n8x0_usb_power_cb, s, 1)[0];
-    struct tusb_s *tusb = tusb6010_init(tusb_irq);
+    TUSBState *tusb = tusb6010_init(tusb_irq);
 
     /* Using the NOR interface */
     omap_gpmc_attach(s->cpu->gpmc, N8X0_USB_ASYNC_CS,
-                    tusb6010_async_io(tusb), 0, 0, tusb);
+                    tusb6010_async_io(tusb), NULL, NULL, tusb);
     omap_gpmc_attach(s->cpu->gpmc, N8X0_USB_SYNC_CS,
-                    tusb6010_sync_io(tusb), 0, 0, tusb);
+                    tusb6010_sync_io(tusb), NULL, NULL, tusb);
 
     s->usb = tusb;
     omap2_gpio_out_set(s->cpu->gpif, N8X0_TUSB_ENABLE_GPIO, tusb_pwr);
+}
+
+/* Setup done before the main bootloader starts by some early setup code
+ * - used when we want to run the main bootloader in emulation.  This
+ * isn't documented.  */
+static uint32_t n800_pinout[104] = {
+    0x080f00d8, 0x00d40808, 0x03080808, 0x080800d0,
+    0x00dc0808, 0x0b0f0f00, 0x080800b4, 0x00c00808,
+    0x08080808, 0x180800c4, 0x00b80000, 0x08080808,
+    0x080800bc, 0x00cc0808, 0x08081818, 0x18180128,
+    0x01241800, 0x18181818, 0x000000f0, 0x01300000,
+    0x00001b0b, 0x1b0f0138, 0x00e0181b, 0x1b031b0b,
+    0x180f0078, 0x00740018, 0x0f0f0f1a, 0x00000080,
+    0x007c0000, 0x00000000, 0x00000088, 0x00840000,
+    0x00000000, 0x00000094, 0x00980300, 0x0f180003,
+    0x0000008c, 0x00900f0f, 0x0f0f1b00, 0x0f00009c,
+    0x01140000, 0x1b1b0f18, 0x0818013c, 0x01400008,
+    0x00001818, 0x000b0110, 0x010c1800, 0x0b030b0f,
+    0x181800f4, 0x00f81818, 0x00000018, 0x000000fc,
+    0x00401808, 0x00000000, 0x0f1b0030, 0x003c0008,
+    0x00000000, 0x00000038, 0x00340000, 0x00000000,
+    0x1a080070, 0x00641a1a, 0x08080808, 0x08080060,
+    0x005c0808, 0x08080808, 0x08080058, 0x00540808,
+    0x08080808, 0x0808006c, 0x00680808, 0x08080808,
+    0x000000a8, 0x00b00000, 0x08080808, 0x000000a0,
+    0x00a40000, 0x00000000, 0x08ff0050, 0x004c0808,
+    0xffffffff, 0xffff0048, 0x0044ffff, 0xffffffff,
+    0x000000ac, 0x01040800, 0x08080b0f, 0x18180100,
+    0x01081818, 0x0b0b1808, 0x1a0300e4, 0x012c0b1a,
+    0x02020018, 0x0b000134, 0x011c0800, 0x0b1b1b00,
+    0x0f0000c8, 0x00ec181b, 0x000f0f02, 0x00180118,
+    0x01200000, 0x0f0b1b1b, 0x0f0200e8, 0x0000020b,
+};
+
+static void n800_setup_nolo_tags(void *sram_base)
+{
+    int i;
+    uint32_t *p = sram_base + 0x8000;
+    uint32_t *v = sram_base + 0xa000;
+
+    memset(p, 0, 0x3000);
+
+    strcpy((void *) (p + 0), "QEMU N800");
+
+    strcpy((void *) (p + 8), "F5");
+
+    stl_raw(p + 10, 0x04f70000);
+    strcpy((void *) (p + 9), "RX-34");
+
+    /* RAM size in MB? */
+    stl_raw(p + 12, 0x80);
+
+    /* Pointer to the list of tags */
+    stl_raw(p + 13, OMAP2_SRAM_BASE + 0x9000);
+
+    /* The NOLO tags start here */
+    p = sram_base + 0x9000;
+#define ADD_TAG(tag, len)				\
+    stw_raw((uint16_t *) p + 0, tag);			\
+    stw_raw((uint16_t *) p + 1, len); p ++;		\
+    stl_raw(p ++, OMAP2_SRAM_BASE | (((void *) v - sram_base) & 0xffff));
+
+    /* OMAP STI console? Pin out settings? */
+    ADD_TAG(0x6e01, 414);
+    for (i = 0; i < ARRAY_SIZE(n800_pinout); i ++)
+        stl_raw(v ++, n800_pinout[i]);
+
+    /* Kernel memsize? */
+    ADD_TAG(0x6e05, 1);
+    stl_raw(v ++, 2);
+
+    /* NOLO serial console */
+    ADD_TAG(0x6e02, 4);
+    stl_raw(v ++, XLDR_LL_UART);	/* UART number (1 - 3) */
+
+#if 0
+    /* CBUS settings (Retu/AVilma) */
+    ADD_TAG(0x6e03, 6);
+    stw_raw((uint16_t *) v + 0, 65);	/* CBUS GPIO0 */
+    stw_raw((uint16_t *) v + 1, 66);	/* CBUS GPIO1 */
+    stw_raw((uint16_t *) v + 2, 64);	/* CBUS GPIO2 */
+    v += 2;
+#endif
+
+    /* Nokia ASIC BB5 (Retu/Tahvo) */
+    ADD_TAG(0x6e0a, 4);
+    stw_raw((uint16_t *) v + 0, 111);	/* "Retu" interrupt GPIO */
+    stw_raw((uint16_t *) v + 1, 108);	/* "Tahvo" interrupt GPIO */
+    v ++;
+
+    /* LCD console? */
+    ADD_TAG(0x6e04, 4);
+    stw_raw((uint16_t *) v + 0, 30);	/* ??? */
+    stw_raw((uint16_t *) v + 1, 24);	/* ??? */
+    v ++;
+
+#if 0
+    /* LCD settings */
+    ADD_TAG(0x6e06, 2);
+    stw_raw((uint16_t *) (v ++), 15);	/* ??? */
+#endif
+
+    /* I^2C (Menelaus) */
+    ADD_TAG(0x6e07, 4);
+    stl_raw(v ++, 0x00720000);		/* ??? */
+
+    /* Unknown */
+    ADD_TAG(0x6e0b, 6);
+    stw_raw((uint16_t *) v + 0, 94);	/* ??? */
+    stw_raw((uint16_t *) v + 1, 23);	/* ??? */
+    stw_raw((uint16_t *) v + 2, 0);	/* ??? */
+    v += 2;
+
+    /* OMAP gpio switch info */
+    ADD_TAG(0x6e0c, 80);
+    strcpy((void *) v, "bat_cover");	v += 3;
+    stw_raw((uint16_t *) v + 0, 110);	/* GPIO num ??? */
+    stw_raw((uint16_t *) v + 1, 1);	/* GPIO num ??? */
+    v += 2;
+    strcpy((void *) v, "cam_act");	v += 3;
+    stw_raw((uint16_t *) v + 0, 95);	/* GPIO num ??? */
+    stw_raw((uint16_t *) v + 1, 32);	/* GPIO num ??? */
+    v += 2;
+    strcpy((void *) v, "cam_turn");	v += 3;
+    stw_raw((uint16_t *) v + 0, 12);	/* GPIO num ??? */
+    stw_raw((uint16_t *) v + 1, 33);	/* GPIO num ??? */
+    v += 2;
+    strcpy((void *) v, "headphone");	v += 3;
+    stw_raw((uint16_t *) v + 0, 107);	/* GPIO num ??? */
+    stw_raw((uint16_t *) v + 1, 17);	/* GPIO num ??? */
+    v += 2;
+
+    /* Bluetooth */
+    ADD_TAG(0x6e0e, 12);
+    stl_raw(v ++, 0x5c623d01);		/* ??? */
+    stl_raw(v ++, 0x00000201);		/* ??? */
+    stl_raw(v ++, 0x00000000);		/* ??? */
+
+    /* CX3110x WLAN settings */
+    ADD_TAG(0x6e0f, 8);
+    stl_raw(v ++, 0x00610025);		/* ??? */
+    stl_raw(v ++, 0xffff0057);		/* ??? */
+
+    /* MMC host settings */
+    ADD_TAG(0x6e10, 12);
+    stl_raw(v ++, 0xffff000f);		/* ??? */
+    stl_raw(v ++, 0xffffffff);		/* ??? */
+    stl_raw(v ++, 0x00000060);		/* ??? */
+
+    /* OneNAND chip select */
+    ADD_TAG(0x6e11, 10);
+    stl_raw(v ++, 0x00000401);		/* ??? */
+    stl_raw(v ++, 0x0002003a);		/* ??? */
+    stl_raw(v ++, 0x00000002);		/* ??? */
+
+    /* TEA5761 sensor settings */
+    ADD_TAG(0x6e12, 2);
+    stl_raw(v ++, 93);			/* GPIO num ??? */
+
+#if 0
+    /* Unknown tag */
+    ADD_TAG(6e09, 0);
+
+    /* Kernel UART / console */
+    ADD_TAG(6e12, 0);
+#endif
+
+    /* End of the list */
+    stl_raw(p ++, 0x00000000);
+    stl_raw(p ++, 0x00000000);
 }
 
 /* This task is normally performed by the bootloader.  If we're loading
@@ -691,6 +1018,10 @@ static void n8x0_boot_init(void *opaque)
     /* CPU setup */
     s->cpu->env->regs[15] = s->cpu->env->boot_info->loader_start;
     s->cpu->env->GE = 0x5;
+
+    /* If the machine has a slided keyboard, open it */
+    if (s->kbd)
+        qemu_irq_raise(omap2_gpio_in_get(s->cpu->gpif, N810_SLIDE_GPIO)[0]);
 }
 
 #define OMAP_TAG_NOKIA_BT	0x4e01
@@ -716,7 +1047,7 @@ static struct omap_gpiosw_info_s {
         "headphone", N8X0_HEADPHONE_GPIO,
         OMAP_GPIOSW_TYPE_CONNECTION | OMAP_GPIOSW_INVERTED,
     },
-    { 0 }
+    { NULL }
 }, n810_gpiosw_info[] = {
     {
         "gps_reset", N810_GPS_RESET_GPIO,
@@ -737,7 +1068,7 @@ static struct omap_gpiosw_info_s {
         "slide", N810_SLIDE_GPIO,
         OMAP_GPIOSW_TYPE_COVER | OMAP_GPIOSW_INVERTED,
     },
-    { 0 }
+    { NULL }
 };
 
 static struct omap_partition_info_s {
@@ -752,7 +1083,7 @@ static struct omap_partition_info_s {
     { 0x00280000, 0x00200000, 0x3, "initfs" },
     { 0x00480000, 0x0fb80000, 0x3, "rootfs" },
 
-    { 0, 0, 0, 0 }
+    { 0, 0, 0, NULL }
 }, n810_part_info[] = {
     { 0x00000000, 0x00020000, 0x3, "bootloader" },
     { 0x00020000, 0x00060000, 0x0, "config" },
@@ -760,8 +1091,10 @@ static struct omap_partition_info_s {
     { 0x002a0000, 0x00400000, 0x0, "initfs" },
     { 0x006a0000, 0x0f960000, 0x0, "rootfs" },
 
-    { 0, 0, 0, 0 }
+    { 0, 0, 0, NULL }
 };
+
+static bdaddr_t n8x0_bd_addr = {{ N8X0_BD_ADDR }};
 
 static int n8x0_atag_setup(void *p, int model)
 {
@@ -782,7 +1115,7 @@ static int n8x0_atag_setup(void *p, int model)
 #if 0
     stw_raw(w ++, OMAP_TAG_SERIAL_CONSOLE);	/* u16 tag */
     stw_raw(w ++, 4);				/* u16 len */
-    stw_raw(w ++, XLDR_LL_UART);		/* u8 console_uart */
+    stw_raw(w ++, XLDR_LL_UART + 1);		/* u8 console_uart */
     stw_raw(w ++, 115200);			/* u32 console_speed */
 #endif
 
@@ -826,8 +1159,8 @@ static int n8x0_atag_setup(void *p, int model)
     stb_raw(b ++, N8X0_BT_WKUP_GPIO);		/* u8 bt_wakeup_gpio */
     stb_raw(b ++, N8X0_BT_HOST_WKUP_GPIO);	/* u8 host_wakeup_gpio */
     stb_raw(b ++, N8X0_BT_RESET_GPIO);		/* u8 reset_gpio */
-    stb_raw(b ++, 1);				/* u8 bt_uart */
-    memset(b, 0, 6);				/* u8 bd_addr[6] */
+    stb_raw(b ++, BT_UART + 1);			/* u8 bt_uart */
+    memcpy(b, &n8x0_bd_addr, 6);		/* u8 bd_addr[6] */
     b += 6;
     stb_raw(b ++, 0x02);			/* u8 bt_sysclk (38.4) */
     w = (void *) b;
@@ -933,32 +1266,54 @@ static int n810_atag_setup(struct arm_boot_info *info, void *p)
 }
 
 static void n8x0_init(ram_addr_t ram_size, const char *boot_device,
-                DisplayState *ds, const char *kernel_filename,
+                const char *kernel_filename,
                 const char *kernel_cmdline, const char *initrd_filename,
                 const char *cpu_model, struct arm_boot_info *binfo, int model)
 {
     struct n800_s *s = (struct n800_s *) qemu_mallocz(sizeof(*s));
     int sdram_size = binfo->ram_size;
-    int onenandram_size = 0x00010000;
+    DisplayState *ds;
 
-    if (ram_size < sdram_size + onenandram_size + OMAP242X_SRAM_SIZE) {
-        fprintf(stderr, "This architecture uses %i bytes of memory\n",
-                        sdram_size + onenandram_size + OMAP242X_SRAM_SIZE);
-        exit(1);
-    }
+    s->cpu = omap2420_mpu_init(sdram_size, cpu_model);
 
-    s->cpu = omap2420_mpu_init(sdram_size, NULL, cpu_model);
-
+    /* Setup peripherals
+     *
+     * Believed external peripherals layout in the N810:
+     * (spi bus 1)
+     *   tsc2005
+     *   lcd_mipid
+     * (spi bus 2)
+     *   Conexant cx3110x (WLAN)
+     *   optional: pc2400m (WiMAX)
+     * (i2c bus 0)
+     *   TLV320AIC33 (audio codec)
+     *   TCM825x (camera by Toshiba)
+     *   lp5521 (clever LEDs)
+     *   tsl2563 (light sensor, hwmon, model 7, rev. 0)
+     *   lm8323 (keypad, manf 00, rev 04)
+     * (i2c bus 1)
+     *   tmp105 (temperature sensor, hwmon)
+     *   menelaus (pm)
+     * (somewhere on i2c - maybe N800-only)
+     *   tea5761 (FM tuner)
+     * (serial 0)
+     *   GPS
+     * (some serial port)
+     *   csr41814 (Bluetooth)
+     */
     n8x0_gpio_setup(s);
     n8x0_nand_setup(s);
     n8x0_i2c_setup(s);
     if (model == 800)
         n800_tsc_kbd_setup(s);
-    else if (model == 810)
+    else if (model == 810) {
         n810_tsc_setup(s);
+        n810_kbd_setup(s);
+    }
     n8x0_spi_setup(s);
-    n8x0_dss_setup(s, ds);
+    n8x0_dss_setup(s);
     n8x0_cbus_setup(s);
+    n8x0_uart_setup(s);
     if (usb_enabled)
         n8x0_usb_setup(s);
 
@@ -978,7 +1333,35 @@ static void n8x0_init(ram_addr_t ram_size, const char *boot_device,
         n8x0_boot_init(s);
     }
 
-    dpy_resize(ds, 800, 480);
+    if (option_rom[0] && (boot_device[0] == 'n' || !kernel_filename)) {
+        int rom_size;
+        uint8_t nolo_tags[0x10000];
+        /* No, wait, better start at the ROM.  */
+        s->cpu->env->regs[15] = OMAP2_Q2_BASE + 0x400000;
+
+        /* This is intended for loading the `secondary.bin' program from
+         * Nokia images (the NOLO bootloader).  The entry point seems
+         * to be at OMAP2_Q2_BASE + 0x400000.
+         *
+         * The `2nd.bin' files contain some kind of earlier boot code and
+         * for them the entry point needs to be set to OMAP2_SRAM_BASE.
+         *
+         * The code above is for loading the `zImage' file from Nokia
+         * images.  */
+        rom_size = load_image_targphys(option_rom[0],
+                                       OMAP2_Q2_BASE + 0x400000,
+                                       sdram_size - 0x400000);
+        printf("%i bytes of image loaded\n", rom_size);
+
+        n800_setup_nolo_tags(nolo_tags);
+        cpu_physical_memory_write(OMAP2_SRAM_BASE, nolo_tags, 0x10000);
+    }
+    /* FIXME: We shouldn't really be doing this here.  The LCD controller
+       will set the size once configured, so this just sets an initial
+       size until the guest activates the display.  */
+    ds = get_displaystate();
+    ds->surface = qemu_resize_displaysurface(ds, 800, 480);
+    dpy_resize(ds);
 }
 
 static struct arm_boot_info n800_binfo = {
@@ -1000,36 +1383,42 @@ static struct arm_boot_info n810_binfo = {
     .atag_board = n810_atag_setup,
 };
 
-static void n800_init(ram_addr_t ram_size, int vga_ram_size,
-                const char *boot_device, DisplayState *ds,
+static void n800_init(ram_addr_t ram_size,
+                const char *boot_device,
                 const char *kernel_filename, const char *kernel_cmdline,
                 const char *initrd_filename, const char *cpu_model)
 {
-    return n8x0_init(ram_size, boot_device, ds,
+    return n8x0_init(ram_size, boot_device,
                     kernel_filename, kernel_cmdline, initrd_filename,
                     cpu_model, &n800_binfo, 800);
 }
 
-static void n810_init(ram_addr_t ram_size, int vga_ram_size,
-                const char *boot_device, DisplayState *ds,
+static void n810_init(ram_addr_t ram_size,
+                const char *boot_device,
                 const char *kernel_filename, const char *kernel_cmdline,
                 const char *initrd_filename, const char *cpu_model)
 {
-    return n8x0_init(ram_size, boot_device, ds,
+    return n8x0_init(ram_size, boot_device,
                     kernel_filename, kernel_cmdline, initrd_filename,
                     cpu_model, &n810_binfo, 810);
 }
 
-QEMUMachine n800_machine = {
-    "n800",
-    "Nokia N800 tablet aka. RX-34 (OMAP2420)",
-    n800_init,
-    (0x08000000 + 0x00010000 + OMAP242X_SRAM_SIZE) | RAMSIZE_FIXED,
+static QEMUMachine n800_machine = {
+    .name = "n800",
+    .desc = "Nokia N800 tablet aka. RX-34 (OMAP2420)",
+    .init = n800_init,
 };
 
-QEMUMachine n810_machine = {
-    "n810",
-    "Nokia N810 tablet aka. RX-44 (OMAP2420)",
-    n810_init,
-    (0x08000000 + 0x00010000 + OMAP242X_SRAM_SIZE) | RAMSIZE_FIXED,
+static QEMUMachine n810_machine = {
+    .name = "n810",
+    .desc = "Nokia N810 tablet aka. RX-44 (OMAP2420)",
+    .init = n810_init,
 };
+
+static void nseries_machine_init(void)
+{
+    qemu_register_machine(&n800_machine);
+    qemu_register_machine(&n810_machine);
+}
+
+machine_init(nseries_machine_init);

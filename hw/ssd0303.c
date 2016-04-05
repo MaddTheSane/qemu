@@ -10,21 +10,20 @@
 /* The controller can support a variety of different displays, but we only
    implement one.  Most of the commends relating to brightness and geometry
    setup are ignored. */
-#include "hw.h"
 #include "i2c.h"
 #include "console.h"
 
 //#define DEBUG_SSD0303 1
 
 #ifdef DEBUG_SSD0303
-#define DPRINTF(fmt, args...) \
-do { printf("ssd0303: " fmt , ##args); } while (0)
-#define BADF(fmt, args...) \
-do { fprintf(stderr, "ssd0303: error: " fmt , ##args); exit(1);} while (0)
+#define DPRINTF(fmt, ...) \
+do { printf("ssd0303: " fmt , ## __VA_ARGS__); } while (0)
+#define BADF(fmt, ...) \
+do { fprintf(stderr, "ssd0303: error: " fmt , ## __VA_ARGS__); exit(1);} while (0)
 #else
-#define DPRINTF(fmt, args...) do {} while(0)
-#define BADF(fmt, args...) \
-do { fprintf(stderr, "ssd0303: error: " fmt , ##args);} while (0)
+#define DPRINTF(fmt, ...) do {} while(0)
+#define BADF(fmt, ...) \
+do { fprintf(stderr, "ssd0303: error: " fmt , ## __VA_ARGS__);} while (0)
 #endif
 
 /* Scaling factor for pixels.  */
@@ -202,55 +201,57 @@ static void ssd0303_update_display(void *opaque)
     int dest_width;
     uint8_t mask;
 
-    if (s->redraw) {
-        switch (s->ds->depth) {
-        case 0:
-            return;
-        case 15:
-            dest_width = 2;
-            break;
-        case 16:
-            dest_width = 2;
-            break;
-        case 24:
-            dest_width = 3;
-            break;
-        case 32:
-            dest_width = 4;
-            break;
-        default:
-            BADF("Bad color depth\n");
-            return;
+    if (!s->redraw)
+        return;
+
+    switch (ds_get_bits_per_pixel(s->ds)) {
+    case 0:
+        return;
+    case 15:
+        dest_width = 2;
+        break;
+    case 16:
+        dest_width = 2;
+        break;
+    case 24:
+        dest_width = 3;
+        break;
+    case 32:
+        dest_width = 4;
+        break;
+    default:
+        BADF("Bad color depth\n");
+        return;
+    }
+    dest_width *= MAGNIFY;
+    memset(colortab, 0xff, dest_width);
+    memset(colortab + dest_width, 0, dest_width);
+    if (s->flash) {
+        colors[0] = colortab;
+        colors[1] = colortab;
+    } else if (s->inverse) {
+        colors[0] = colortab;
+        colors[1] = colortab + dest_width;
+    } else {
+        colors[0] = colortab + dest_width;
+        colors[1] = colortab;
+    }
+    dest = ds_get_data(s->ds);
+    for (y = 0; y < 16; y++) {
+        line = (y + s->start_line) & 63;
+        src = s->framebuffer + 132 * (line >> 3) + 36;
+        mask = 1 << (line & 7);
+        for (x = 0; x < 96; x++) {
+            memcpy(dest, colors[(*src & mask) != 0], dest_width);
+            dest += dest_width;
+            src++;
         }
-        dest_width *= MAGNIFY;
-        memset(colortab, 0xff, dest_width);
-        memset(colortab + dest_width, 0, dest_width);
-        if (s->flash) {
-            colors[0] = colortab;
-            colors[1] = colortab;
-        } else if (s->inverse) {
-            colors[0] = colortab;
-            colors[1] = colortab + dest_width;
-        } else {
-            colors[0] = colortab + dest_width;
-            colors[1] = colortab;
-        }
-        dest = s->ds->data;
-        for (y = 0; y < 16; y++) {
-            line = (y + s->start_line) & 63;
-            src = s->framebuffer + 132 * (line >> 3) + 36;
-            mask = 1 << (line & 7);
-            for (x = 0; x < 96; x++) {
-                memcpy(dest, colors[(*src & mask) != 0], dest_width);
-                dest += dest_width;
-                src++;
-            }
-            for (x = 1; x < MAGNIFY; x++) {
-                memcpy(dest, dest - dest_width * 96, dest_width * 96);
-                dest += dest_width * 96;
-            }
+        for (x = 1; x < MAGNIFY; x++) {
+            memcpy(dest, dest - dest_width * 96, dest_width * 96);
+            dest += dest_width * 96;
         }
     }
+    s->redraw = 0;
     dpy_update(s->ds, 0, 0, 96 * MAGNIFY, 16 * MAGNIFY);
 }
 
@@ -260,16 +261,52 @@ static void ssd0303_invalidate_display(void * opaque)
     s->redraw = 1;
 }
 
-void ssd0303_init(DisplayState *ds, i2c_bus *bus, int address)
-{
-    ssd0303_state *s;
+static const VMStateDescription vmstate_ssd0303 = {
+    .name = "ssd0303_oled",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .minimum_version_id_old = 1,
+    .fields      = (VMStateField []) {
+        VMSTATE_INT32(row, ssd0303_state),
+        VMSTATE_INT32(col, ssd0303_state),
+        VMSTATE_INT32(start_line, ssd0303_state),
+        VMSTATE_INT32(mirror, ssd0303_state),
+        VMSTATE_INT32(flash, ssd0303_state),
+        VMSTATE_INT32(enabled, ssd0303_state),
+        VMSTATE_INT32(inverse, ssd0303_state),
+        VMSTATE_INT32(redraw, ssd0303_state),
+        VMSTATE_UINT32(mode, ssd0303_state),
+        VMSTATE_UINT32(cmd_state, ssd0303_state),
+        VMSTATE_BUFFER(framebuffer, ssd0303_state),
+        VMSTATE_I2C_SLAVE(i2c, ssd0303_state),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
-    s = (ssd0303_state *)i2c_slave_init(bus, address, sizeof(ssd0303_state));
-    s->ds = ds;
-    s->i2c.event = ssd0303_event;
-    s->i2c.recv = ssd0303_recv;
-    s->i2c.send = ssd0303_send;
-    graphic_console_init(ds, ssd0303_update_display, ssd0303_invalidate_display,
-                         NULL, NULL, s);
-    dpy_resize(s->ds, 96 * MAGNIFY, 16 * MAGNIFY);
+static int ssd0303_init(i2c_slave *i2c)
+{
+    ssd0303_state *s = FROM_I2C_SLAVE(ssd0303_state, i2c);
+
+    s->ds = graphic_console_init(ssd0303_update_display,
+                                 ssd0303_invalidate_display,
+                                 NULL, NULL, s);
+    qemu_console_resize(s->ds, 96 * MAGNIFY, 16 * MAGNIFY);
+    return 0;
 }
+
+static I2CSlaveInfo ssd0303_info = {
+    .qdev.name = "ssd0303",
+    .qdev.size = sizeof(ssd0303_state),
+    .qdev.vmsd = &vmstate_ssd0303,
+    .init = ssd0303_init,
+    .event = ssd0303_event,
+    .recv = ssd0303_recv,
+    .send = ssd0303_send
+};
+
+static void ssd0303_register_devices(void)
+{
+    i2c_register_slave(&ssd0303_info);
+}
+
+device_init(ssd0303_register_devices)

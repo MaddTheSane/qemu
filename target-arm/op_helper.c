@@ -14,8 +14,7 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "exec.h"
 #include "helpers.h"
@@ -31,7 +30,7 @@ void raise_exception(int tt)
 
 /* thread support */
 
-spinlock_t global_cpu_lock = SPIN_LOCK_UNLOCKED;
+static spinlock_t global_cpu_lock = SPIN_LOCK_UNLOCKED;
 
 void cpu_lock(void)
 {
@@ -56,7 +55,7 @@ uint32_t HELPER(neon_tbl)(uint32_t ireg, uint32_t def,
     for (shift = 0; shift < 32; shift += 8) {
         index = (ireg >> shift) & 0xff;
         if (index < maxindex) {
-            tmp = (table[index >> 3] >> (index & 7)) & 0xff;
+            tmp = (table[index >> 3] >> ((index & 7) << 3)) & 0xff;
             val |= tmp << shift;
         } else {
             val |= def & (0xff << shift);
@@ -68,11 +67,6 @@ uint32_t HELPER(neon_tbl)(uint32_t ireg, uint32_t def,
 #if !defined(CONFIG_USER_ONLY)
 
 #define MMUSUFFIX _mmu
-#ifdef __s390__
-# define GETPC() ((void*)((unsigned long)__builtin_return_address(0) & 0x7fffffffUL))
-#else
-# define GETPC() (__builtin_return_address(0))
-#endif
 
 #define SHIFT 0
 #include "softmmu_template.h"
@@ -102,7 +96,7 @@ void tlb_fill (target_ulong addr, int is_write, int mmu_idx, void *retaddr)
     saved_env = env;
     env = cpu_single_env;
     ret = cpu_arm_handle_mmu_fault(env, addr, is_write, mmu_idx, 1);
-    if (__builtin_expect(ret, 0)) {
+    if (unlikely(ret)) {
         if (retaddr) {
             /* now we have a real cpu fault */
             pc = (unsigned long)retaddr;
@@ -190,7 +184,6 @@ static inline uint32_t do_ssat(int32_t val, int shift)
     int32_t top;
     uint32_t mask;
 
-    shift = PARAM1;
     top = val >> shift;
     mask = (1u << shift) - 1;
     if (top > 0) {
@@ -208,7 +201,6 @@ static inline uint32_t do_usat(int32_t val, int shift)
 {
     uint32_t max;
 
-    shift = PARAM1;
     max = (1u << shift) - 1;
     if (val < 0) {
         env->QF = 1;
@@ -314,7 +306,7 @@ void HELPER(set_user_reg)(uint32_t regno, uint32_t val)
 uint32_t HELPER (add_cc)(uint32_t a, uint32_t b)
 {
     uint32_t result;
-    result = T0 + T1;
+    result = a + b;
     env->NF = env->ZF = result;
     env->CF = result < a;
     env->VF = (a ^ b ^ -1) & (a ^ result);
@@ -385,14 +377,6 @@ uint32_t HELPER(sar)(uint32_t x, uint32_t i)
     if (shift >= 32)
         shift = 31;
     return (int32_t)x >> shift;
-}
-
-uint32_t HELPER(ror)(uint32_t x, uint32_t i)
-{
-    int shift = i & 0xff;
-    if (shift == 0)
-        return x;
-    return (x >> shift) | (x << (32 - shift));
 }
 
 uint32_t HELPER(shl_cc)(uint32_t x, uint32_t i)
@@ -502,67 +486,4 @@ uint64_t HELPER(neon_sub_saturate_u64)(uint64_t src1, uint64_t src2)
         res = src1 - src2;
     }
     return res;
-}
-
-/* These need to return a pair of value, so still use T0/T1.  */
-/* Transpose.  Argument order is rather strange to avoid special casing
-   the tranlation code.
-   On input T0 = rm, T1 = rd.  On output T0 = rd, T1 = rm  */
-void HELPER(neon_trn_u8)(void)
-{
-    uint32_t rd;
-    uint32_t rm;
-    rd = ((T0 & 0x00ff00ff) << 8) | (T1 & 0x00ff00ff);
-    rm = ((T1 & 0xff00ff00) >> 8) | (T0 & 0xff00ff00);
-    T0 = rd;
-    T1 = rm;
-    FORCE_RET();
-}
-
-void HELPER(neon_trn_u16)(void)
-{
-    uint32_t rd;
-    uint32_t rm;
-    rd = (T0 << 16) | (T1 & 0xffff);
-    rm = (T1 >> 16) | (T0 & 0xffff0000);
-    T0 = rd;
-    T1 = rm;
-    FORCE_RET();
-}
-
-/* Worker routines for zip and unzip.  */
-void HELPER(neon_unzip_u8)(void)
-{
-    uint32_t rd;
-    uint32_t rm;
-    rd = (T0 & 0xff) | ((T0 >> 8) & 0xff00)
-         | ((T1 << 16) & 0xff0000) | ((T1 << 8) & 0xff000000);
-    rm = ((T0 >> 8) & 0xff) | ((T0 >> 16) & 0xff00)
-         | ((T1 << 8) & 0xff0000) | (T1 & 0xff000000);
-    T0 = rd;
-    T1 = rm;
-    FORCE_RET();
-}
-
-void HELPER(neon_zip_u8)(void)
-{
-    uint32_t rd;
-    uint32_t rm;
-    rd = (T0 & 0xff) | ((T1 << 8) & 0xff00)
-         | ((T0 << 16) & 0xff0000) | ((T1 << 24) & 0xff000000);
-    rm = ((T0 >> 16) & 0xff) | ((T1 >> 8) & 0xff00)
-         | ((T0 >> 8) & 0xff0000) | (T1 & 0xff000000);
-    T0 = rd;
-    T1 = rm;
-    FORCE_RET();
-}
-
-void HELPER(neon_zip_u16)(void)
-{
-    uint32_t tmp;
-
-    tmp = (T0 & 0xffff) | (T1 << 16);
-    T1 = (T1 & 0xffff0000) | (T0 >> 16);
-    T0 = tmp;
-    FORCE_RET();
 }

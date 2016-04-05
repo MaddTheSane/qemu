@@ -10,21 +10,20 @@
 /* The controller can support a variety of different displays, but we only
    implement one.  Most of the commends relating to brightness and geometry
    setup are ignored. */
-#include "hw.h"
-#include "devices.h"
+#include "ssi.h"
 #include "console.h"
 
 //#define DEBUG_SSD0323 1
 
 #ifdef DEBUG_SSD0323
-#define DPRINTF(fmt, args...) \
-do { printf("ssd0323: " fmt , ##args); } while (0)
-#define BADF(fmt, args...) \
-do { fprintf(stderr, "ssd0323: error: " fmt , ##args); exit(1);} while (0)
+#define DPRINTF(fmt, ...) \
+do { printf("ssd0323: " fmt , ## __VA_ARGS__); } while (0)
+#define BADF(fmt, ...) \
+do { fprintf(stderr, "ssd0323: error: " fmt , ## __VA_ARGS__); exit(1);} while (0)
 #else
-#define DPRINTF(fmt, args...) do {} while(0)
-#define BADF(fmt, args...) \
-do { fprintf(stderr, "ssd0323: error: " fmt , ##args);} while (0)
+#define DPRINTF(fmt, ...) do {} while(0)
+#define BADF(fmt, ...) \
+do { fprintf(stderr, "ssd0323: error: " fmt , ## __VA_ARGS__);} while (0)
 #endif
 
 /* Scaling factor for pixels.  */
@@ -43,6 +42,7 @@ enum ssd0323_mode
 };
 
 typedef struct {
+    SSISlave ssidev;
     DisplayState *ds;
 
     int cmd_len;
@@ -60,9 +60,10 @@ typedef struct {
     uint8_t framebuffer[128 * 80 / 2];
 } ssd0323_state;
 
-int ssd0323_xfer_ssi(void *opaque, int data)
+static uint32_t ssd0323_transfer(SSISlave *dev, uint32_t data)
 {
-    ssd0323_state *s = (ssd0323_state *)opaque;
+    ssd0323_state *s = FROM_SSI_SLAVE(ssd0323_state, dev);
+
     switch (s->mode) {
     case SSD0323_DATA:
         DPRINTF("data 0x%02x\n", data);
@@ -183,78 +184,80 @@ static void ssd0323_update_display(void *opaque)
     char *p;
     int dest_width;
 
-    if (s->redraw) {
-        switch (s->ds->depth) {
-        case 0:
-            return;
+    if (!s->redraw)
+        return;
+
+    switch (ds_get_bits_per_pixel(s->ds)) {
+    case 0:
+        return;
+    case 15:
+        dest_width = 2;
+        break;
+    case 16:
+        dest_width = 2;
+        break;
+    case 24:
+        dest_width = 3;
+        break;
+    case 32:
+        dest_width = 4;
+        break;
+    default:
+        BADF("Bad color depth\n");
+        return;
+    }
+    p = colortab;
+    for (i = 0; i < 16; i++) {
+        int n;
+        colors[i] = p;
+        switch (ds_get_bits_per_pixel(s->ds)) {
         case 15:
-            dest_width = 2;
+            n = i * 2 + (i >> 3);
+            p[0] = n | (n << 5);
+            p[1] = (n << 2) | (n >> 3);
             break;
         case 16:
-            dest_width = 2;
+            n = i * 2 + (i >> 3);
+            p[0] = n | (n << 6) | ((n << 1) & 0x20);
+            p[1] = (n << 3) | (n >> 2);
             break;
         case 24:
-            dest_width = 3;
-            break;
         case 32:
-            dest_width = 4;
+            n = (i << 4) | i;
+            p[0] = p[1] = p[2] = n;
             break;
         default:
             BADF("Bad color depth\n");
             return;
         }
-        p = colortab;
-        for (i = 0; i < 16; i++) {
-            int n;
-            colors[i] = p;
-            switch (s->ds->depth) {
-            case 15:
-                n = i * 2 + (i >> 3);
-                p[0] = n | (n << 5);
-                p[1] = (n << 2) | (n >> 3);
-                break;
-            case 16:
-                n = i * 2 + (i >> 3);
-                p[0] = n | (n << 6) | ((n << 1) & 0x20);
-                p[1] = (n << 3) | (n >> 2);
-                break;
-            case 24:
-            case 32:
-                n = (i << 4) | i;
-                p[0] = p[1] = p[2] = n;
-                break;
-            default:
-                BADF("Bad color depth\n");
-                return;
+        p += dest_width;
+    }
+    /* TODO: Implement row/column remapping.  */
+    dest = ds_get_data(s->ds);
+    for (y = 0; y < 64; y++) {
+        line = y;
+        src = s->framebuffer + 64 * line;
+        for (x = 0; x < 64; x++) {
+            int val;
+            val = *src >> 4;
+            for (i = 0; i < MAGNIFY; i++) {
+                memcpy(dest, colors[val], dest_width);
+                dest += dest_width;
             }
-            p += dest_width;
+            val = *src & 0xf;
+            for (i = 0; i < MAGNIFY; i++) {
+                memcpy(dest, colors[val], dest_width);
+                dest += dest_width;
+            }
+            src++;
         }
-        /* TODO: Implement row/column remapping.  */
-        dest = s->ds->data;
-        for (y = 0; y < 64; y++) {
-            line = y;
-            src = s->framebuffer + 64 * line;
-            for (x = 0; x < 64; x++) {
-                int val;
-                val = *src >> 4;
-                for (i = 0; i < MAGNIFY; i++) {
-                    memcpy(dest, colors[val], dest_width);
-                    dest += dest_width;
-                }
-                val = *src & 0xf;
-                for (i = 0; i < MAGNIFY; i++) {
-                    memcpy(dest, colors[val], dest_width);
-                    dest += dest_width;
-                }
-                src++;
-            }
-            for (i = 1; i < MAGNIFY; i++) {
-                memcpy(dest, dest - dest_width * MAGNIFY * 128,
-                       dest_width * 128 * MAGNIFY);
-                dest += dest_width * 128 * MAGNIFY;
-            }
+        for (i = 1; i < MAGNIFY; i++) {
+            memcpy(dest, dest - dest_width * MAGNIFY * 128,
+                   dest_width * 128 * MAGNIFY);
+            dest += dest_width * 128 * MAGNIFY;
         }
     }
+    s->redraw = 0;
     dpy_update(s->ds, 0, 0, 128 * MAGNIFY, 64 * MAGNIFY);
 }
 
@@ -272,21 +275,80 @@ static void ssd0323_cd(void *opaque, int n, int level)
     s->mode = level ? SSD0323_DATA : SSD0323_CMD;
 }
 
-void *ssd0323_init(DisplayState *ds, qemu_irq *cmd_p)
+static void ssd0323_save(QEMUFile *f, void *opaque)
 {
-    ssd0323_state *s;
-    qemu_irq *cmd;
+    ssd0323_state *s = (ssd0323_state *)opaque;
+    int i;
 
-    s = (ssd0323_state *)qemu_mallocz(sizeof(ssd0323_state));
-    s->ds = ds;
-    graphic_console_init(ds, ssd0323_update_display, ssd0323_invalidate_display,
-                         NULL, NULL, s);
-    dpy_resize(s->ds, 128 * MAGNIFY, 64 * MAGNIFY);
+    qemu_put_be32(f, s->cmd_len);
+    qemu_put_be32(f, s->cmd);
+    for (i = 0; i < 8; i++)
+        qemu_put_be32(f, s->cmd_data[i]);
+    qemu_put_be32(f, s->row);
+    qemu_put_be32(f, s->row_start);
+    qemu_put_be32(f, s->row_end);
+    qemu_put_be32(f, s->col);
+    qemu_put_be32(f, s->col_start);
+    qemu_put_be32(f, s->col_end);
+    qemu_put_be32(f, s->redraw);
+    qemu_put_be32(f, s->remap);
+    qemu_put_be32(f, s->mode);
+    qemu_put_buffer(f, s->framebuffer, sizeof(s->framebuffer));
+}
+
+static int ssd0323_load(QEMUFile *f, void *opaque, int version_id)
+{
+    ssd0323_state *s = (ssd0323_state *)opaque;
+    int i;
+
+    if (version_id != 1)
+        return -EINVAL;
+
+    s->cmd_len = qemu_get_be32(f);
+    s->cmd = qemu_get_be32(f);
+    for (i = 0; i < 8; i++)
+        s->cmd_data[i] = qemu_get_be32(f);
+    s->row = qemu_get_be32(f);
+    s->row_start = qemu_get_be32(f);
+    s->row_end = qemu_get_be32(f);
+    s->col = qemu_get_be32(f);
+    s->col_start = qemu_get_be32(f);
+    s->col_end = qemu_get_be32(f);
+    s->redraw = qemu_get_be32(f);
+    s->remap = qemu_get_be32(f);
+    s->mode = qemu_get_be32(f);
+    qemu_get_buffer(f, s->framebuffer, sizeof(s->framebuffer));
+
+    return 0;
+}
+
+static int ssd0323_init(SSISlave *dev)
+{
+    ssd0323_state *s = FROM_SSI_SLAVE(ssd0323_state, dev);
+
     s->col_end = 63;
     s->row_end = 79;
+    s->ds = graphic_console_init(ssd0323_update_display,
+                                 ssd0323_invalidate_display,
+                                 NULL, NULL, s);
+    qemu_console_resize(s->ds, 128 * MAGNIFY, 64 * MAGNIFY);
 
-    cmd = qemu_allocate_irqs(ssd0323_cd, s, 1);
-    *cmd_p = *cmd;
+    qdev_init_gpio_in(&dev->qdev, ssd0323_cd, 1);
 
-    return s;
+    register_savevm("ssd0323_oled", -1, 1, ssd0323_save, ssd0323_load, s);
+    return 0;
 }
+
+static SSISlaveInfo ssd0323_info = {
+    .qdev.name = "ssd0323",
+    .qdev.size = sizeof(ssd0323_state),
+    .init = ssd0323_init,
+    .transfer = ssd0323_transfer
+};
+
+static void ssd03232_register_devices(void)
+{
+    ssi_register_slave(&ssd0323_info);
+}
+
+device_init(ssd03232_register_devices)

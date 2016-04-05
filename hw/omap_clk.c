@@ -15,10 +15,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
- * MA 02111-1307 USA
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "hw.h"
 #include "omap.h"
@@ -510,18 +508,25 @@ static struct clk clk32k = {
     .parent	= &xtal_osc32k,
 };
 
+static struct clk ref_clk = {
+    .name	= "ref_clk",
+    .flags	= CLOCK_IN_OMAP242X | CLOCK_IN_OMAP243X | ALWAYS_ENABLED,
+    .rate	= 12000000,	/* 12 MHz or 13 MHz or 19.2 MHz */
+    /*.parent	= sys.xtalin */
+};
+
 static struct clk apll_96m = {
     .name	= "apll_96m",
     .flags	= CLOCK_IN_OMAP242X | CLOCK_IN_OMAP243X | ALWAYS_ENABLED,
     .rate	= 96000000,
-    /*.parent	= sys.xtalin */
+    /*.parent	= ref_clk */
 };
 
 static struct clk apll_54m = {
     .name	= "apll_54m",
     .flags	= CLOCK_IN_OMAP242X | CLOCK_IN_OMAP243X | ALWAYS_ENABLED,
     .rate	= 54000000,
-    /*.parent	= sys.xtalin */
+    /*.parent	= ref_clk */
 };
 
 static struct clk sys_clk = {
@@ -541,13 +546,13 @@ static struct clk sleep_clk = {
 static struct clk dpll_ck = {
     .name	= "dpll",
     .flags	= CLOCK_IN_OMAP242X | CLOCK_IN_OMAP243X | ALWAYS_ENABLED,
-    /*.parent	= sys.xtalin */
+    .parent	= &ref_clk,
 };
 
 static struct clk dpll_x2_ck = {
     .name	= "dpll_x2",
     .flags	= CLOCK_IN_OMAP242X | CLOCK_IN_OMAP243X | ALWAYS_ENABLED,
-    /*.parent	= sys.xtalin */
+    .parent	= &ref_clk,
 };
 
 static struct clk wdt1_sys_clk = {
@@ -600,7 +605,7 @@ static struct clk sys_clkout2 = {
 static struct clk core_clk = {
     .name	= "core_clk",
     .flags	= CLOCK_IN_OMAP242X | CLOCK_IN_OMAP243X,
-    .parent	= &dpll_ck,
+    .parent	= &dpll_x2_ck,	/* Switchable between dpll_ck and clk32k */
 };
 
 static struct clk l3_clk = {
@@ -1009,6 +1014,7 @@ static struct clk *onchip_clks[] = {
 
     /* OMAP 2 */
 
+    &ref_clk,
     &apll_96m,
     &apll_54m,
     &sys_clk,
@@ -1080,7 +1086,7 @@ static struct clk *onchip_clks[] = {
     &dss_l4_iclk,
     &omapctrl_clk,
 
-    0
+    NULL
 };
 
 void omap_clk_adduser(struct clk *clk, qemu_irq user)
@@ -1091,23 +1097,6 @@ void omap_clk_adduser(struct clk *clk, qemu_irq user)
     *i = user;
 }
 
-/* If a clock is allowed to idle, it is disabled automatically when
- * all of clock domains using it are disabled.  */
-int omap_clk_is_idle(struct clk *clk)
-{
-    struct clk *chld;
-
-    if (!clk->enabled && (!clk->usecount || !(clk->flags && ALWAYS_ENABLED)))
-        return 1;
-    if (clk->usecount)
-        return 0;
-
-    for (chld = clk->child1; chld; chld = chld->sibling)
-        if (!omap_clk_is_idle(chld))
-            return 0;
-    return 1;
-}
-
 struct clk *omap_findclk(struct omap_mpu_state_s *mpu, const char *name)
 {
     struct clk *i;
@@ -1115,7 +1104,7 @@ struct clk *omap_findclk(struct omap_mpu_state_s *mpu, const char *name)
     for (i = mpu->clks; i->name; i ++)
         if (!strcmp(i->name, name) || (i->alias && !strcmp(i->alias, name)))
             return i;
-    cpu_abort(mpu->env, "%s: %s not found\n", __FUNCTION__, name);
+    hw_error("%s: %s not found\n", __FUNCTION__, name);
 }
 
 void omap_clk_get(struct clk *clk)
@@ -1126,8 +1115,7 @@ void omap_clk_get(struct clk *clk)
 void omap_clk_put(struct clk *clk)
 {
     if (!(clk->usecount --))
-        cpu_abort(cpu_single_env, "%s: %s is not in use\n",
-                        __FUNCTION__, clk->name);
+        hw_error("%s: %s is not in use\n", __FUNCTION__, clk->name);
 }
 
 static void omap_clk_update(struct clk *clk)
@@ -1196,7 +1184,7 @@ void omap_clk_reparent(struct clk *clk, struct clk *parent)
         omap_clk_update(clk);
         omap_clk_rate_update(clk);
     } else
-        clk->sibling = 0;
+        clk->sibling = NULL;
 }
 
 void omap_clk_onoff(struct clk *clk, int on)

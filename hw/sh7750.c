@@ -23,13 +23,14 @@
  * THE SOFTWARE.
  */
 #include <stdio.h>
-#include <assert.h>
 #include "hw.h"
 #include "sh.h"
 #include "sysemu.h"
 #include "sh7750_regs.h"
 #include "sh7750_regnames.h"
 #include "sh_intc.h"
+#include "exec-all.h"
+#include "cpu.h"
 
 #define NB_DEVICES 4
 
@@ -39,7 +40,13 @@ typedef struct SH7750State {
     /* Peripheral frequency in Hz */
     uint32_t periph_freq;
     /* SDRAM controller */
+    uint32_t bcr1;
+    uint16_t bcr2;
+    uint16_t bcr3;
+    uint32_t bcr4;
     uint16_t rfcr;
+    /* PCMCIA controller */
+    uint16_t pcr;
     /* IO ports */
     uint16_t gpioic;
     uint32_t pctra;
@@ -56,14 +63,16 @@ typedef struct SH7750State {
     uint16_t periph_portdirb;	/* Direction seen from the peripherals */
     sh7750_io_device *devices[NB_DEVICES];	/* External peripherals */
 
-    uint16_t icr;
     /* Cache */
     uint32_t ccr;
 
     struct intc_desc intc;
 } SH7750State;
 
-
+static inline int has_bcr3_and_bcr4(SH7750State * s)
+{
+	return (s->cpu->features & SH_FEATURE_BCR3_AND_BCR4);
+}
 /**********************************************************************
  I/O ports
 **********************************************************************/
@@ -182,13 +191,13 @@ static void portb_changed(SH7750State * s, uint16_t prev)
 
 static void error_access(const char *kind, target_phys_addr_t addr)
 {
-    fprintf(stderr, "%s to %s (0x%08x) not supported\n",
+    fprintf(stderr, "%s to %s (0x" TARGET_FMT_plx ") not supported\n",
 	    kind, regname(addr), addr);
 }
 
 static void ignore_access(const char *kind, target_phys_addr_t addr)
 {
-    fprintf(stderr, "%s to %s (0x%08x) ignored\n",
+    fprintf(stderr, "%s to %s (0x" TARGET_FMT_plx ") ignored\n",
 	    kind, regname(addr), addr);
 }
 
@@ -206,8 +215,16 @@ static uint32_t sh7750_mem_readw(void *opaque, target_phys_addr_t addr)
     SH7750State *s = opaque;
 
     switch (addr) {
+    case SH7750_BCR2_A7:
+	return s->bcr2;
+    case SH7750_BCR3_A7:
+	if(!has_bcr3_and_bcr4(s))
+	    error_access("word read", addr);
+	return s->bcr3;
     case SH7750_FRQCR_A7:
 	return 0;
+    case SH7750_PCR_A7:
+	return s->pcr;
     case SH7750_RFCR_A7:
 	fprintf(stderr,
 		"Read access to refresh count register, incrementing\n");
@@ -216,8 +233,11 @@ static uint32_t sh7750_mem_readw(void *opaque, target_phys_addr_t addr)
 	return porta_lines(s);
     case SH7750_PDTRB_A7:
 	return portb_lines(s);
-    case 0x1fd00000:
-        return s->icr;
+    case SH7750_RTCOR_A7:
+    case SH7750_RTCNT_A7:
+    case SH7750_RTCSR_A7:
+	ignore_access("word read", addr);
+	return 0;
     default:
 	error_access("word read", addr);
 	assert(0);
@@ -229,6 +249,18 @@ static uint32_t sh7750_mem_readl(void *opaque, target_phys_addr_t addr)
     SH7750State *s = opaque;
 
     switch (addr) {
+    case SH7750_BCR1_A7:
+	return s->bcr1;
+    case SH7750_BCR4_A7:
+	if(!has_bcr3_and_bcr4(s))
+	    error_access("long read", addr);
+	return s->bcr4;
+    case SH7750_WCR1_A7:
+    case SH7750_WCR2_A7:
+    case SH7750_WCR3_A7:
+    case SH7750_MCR_A7:
+        ignore_access("long read", addr);
+        return 0;
     case SH7750_MMUCR_A7:
 	return s->cpu->mmucr;
     case SH7750_PTEH_A7:
@@ -247,31 +279,31 @@ static uint32_t sh7750_mem_readl(void *opaque, target_phys_addr_t addr)
 	return s->cpu->intevt;
     case SH7750_CCR_A7:
 	return s->ccr;
-    case 0x1f000030:		/* Processor version PVR */
-	return 0x00050000;	/* SH7750R */
-    case 0x1f000040:		/* Processor version CVR */
-	return 0x00110000;	/* Minimum caches */
-    case 0x1f000044:		/* Processor version PRR */
-	return 0x00000100;	/* SH7750R */
+    case 0x1f000030:		/* Processor version */
+	return s->cpu->pvr;
+    case 0x1f000040:		/* Cache version */
+	return s->cpu->cvr;
+    case 0x1f000044:		/* Processor revision */
+	return s->cpu->prr;
     default:
 	error_access("long read", addr);
 	assert(0);
     }
 }
 
+#define is_in_sdrmx(a, x) (a >= SH7750_SDMR ## x ## _A7 \
+			&& a <= (SH7750_SDMR ## x ## _A7 + SH7750_SDMR ## x ## _REGNB))
 static void sh7750_mem_writeb(void *opaque, target_phys_addr_t addr,
 			      uint32_t mem_value)
 {
-    switch (addr) {
-	/* PRECHARGE ? XXXXX */
-    case SH7750_PRECHARGE0_A7:
-    case SH7750_PRECHARGE1_A7:
+
+    if (is_in_sdrmx(addr, 2) || is_in_sdrmx(addr, 3)) {
 	ignore_access("byte write", addr);
 	return;
-    default:
-	error_access("byte write", addr);
-	assert(0);
     }
+
+    error_access("byte write", addr);
+    assert(0);
 }
 
 static void sh7750_mem_writew(void *opaque, target_phys_addr_t addr,
@@ -283,9 +315,18 @@ static void sh7750_mem_writew(void *opaque, target_phys_addr_t addr,
     switch (addr) {
 	/* SDRAM controller */
     case SH7750_BCR2_A7:
+        s->bcr2 = mem_value;
+        return;
     case SH7750_BCR3_A7:
-    case SH7750_RTCOR_A7:
+	if(!has_bcr3_and_bcr4(s))
+	    error_access("word write", addr);
+	s->bcr3 = mem_value;
+	return;
+    case SH7750_PCR_A7:
+	s->pcr = mem_value;
+	return;
     case SH7750_RTCNT_A7:
+    case SH7750_RTCOR_A7:
     case SH7750_RTCSR_A7:
 	ignore_access("word write", addr);
 	return;
@@ -311,9 +352,6 @@ static void sh7750_mem_writew(void *opaque, target_phys_addr_t addr,
 	    assert(0);
 	}
 	return;
-    case 0x1fd00000:
-        s->icr = mem_value;
-	return;
     default:
 	error_access("word write", addr);
 	assert(0);
@@ -329,7 +367,13 @@ static void sh7750_mem_writel(void *opaque, target_phys_addr_t addr,
     switch (addr) {
 	/* SDRAM controller */
     case SH7750_BCR1_A7:
+        s->bcr1 = mem_value;
+        return;
     case SH7750_BCR4_A7:
+	if(!has_bcr3_and_bcr4(s))
+	    error_access("long write", addr);
+	s->bcr4 = mem_value;
+	return;
     case SH7750_WCR1_A7:
     case SH7750_WCR2_A7:
     case SH7750_WCR3_A7:
@@ -352,13 +396,22 @@ static void sh7750_mem_writel(void *opaque, target_phys_addr_t addr,
 	portb_changed(s, temp);
 	return;
     case SH7750_MMUCR_A7:
-	s->cpu->mmucr = mem_value;
-	return;
+        if (mem_value & MMUCR_TI) {
+            cpu_sh4_invalidate_tlb(s->cpu);
+        }
+        s->cpu->mmucr = mem_value & ~MMUCR_TI;
+        return;
     case SH7750_PTEH_A7:
+        /* If asid changes, clear all registered tlb entries. */
+	if ((s->cpu->pteh & 0xff) != (mem_value & 0xff))
+	    tlb_flush(s->cpu, 1);
 	s->cpu->pteh = mem_value;
 	return;
     case SH7750_PTEL_A7:
 	s->cpu->ptel = mem_value;
+	return;
+    case SH7750_PTEA_A7:
+	s->cpu->ptea = mem_value & 0x0000000f;
 	return;
     case SH7750_TTB_A7:
 	s->cpu->ttb = mem_value;
@@ -384,13 +437,13 @@ static void sh7750_mem_writel(void *opaque, target_phys_addr_t addr,
     }
 }
 
-static CPUReadMemoryFunc *sh7750_mem_read[] = {
+static CPUReadMemoryFunc * const sh7750_mem_read[] = {
     sh7750_mem_readb,
     sh7750_mem_readw,
     sh7750_mem_readl
 };
 
-static CPUWriteMemoryFunc *sh7750_mem_write[] = {
+static CPUWriteMemoryFunc * const sh7750_mem_write[] = {
     sh7750_mem_writeb,
     sh7750_mem_writew,
     sh7750_mem_writel
@@ -404,7 +457,9 @@ enum {
 	UNUSED = 0,
 
 	/* interrupt sources */
-	IRL0, IRL1, IRL2, IRL3, /* only IRLM mode supported */
+	IRL_0, IRL_1, IRL_2, IRL_3, IRL_4, IRL_5, IRL_6, IRL_7,
+	IRL_8, IRL_9, IRL_A, IRL_B, IRL_C, IRL_D, IRL_E,
+	IRL0, IRL1, IRL2, IRL3,
 	HUDI, GPIOI,
 	DMAC_DMTE0, DMAC_DMTE1, DMAC_DMTE2, DMAC_DMTE3,
 	DMAC_DMTE4, DMAC_DMTE5, DMAC_DMTE6, DMAC_DMTE7,
@@ -420,6 +475,8 @@ enum {
 
 	/* interrupt groups */
 	DMAC, PCIC1, TMU2, RTC, SCI1, SCIF, REF,
+	/* irl bundle */
+	IRL,
 
 	NR_SOURCES,
 };
@@ -521,83 +578,235 @@ static struct intc_group groups_pci[] = {
 		   PCIC1_PCIDMA0, PCIC1_PCIDMA1, PCIC1_PCIDMA2, PCIC1_PCIDMA3),
 };
 
-#define SH_CPU_SH7750  (1 << 0)
-#define SH_CPU_SH7750S (1 << 1)
-#define SH_CPU_SH7750R (1 << 2)
-#define SH_CPU_SH7751  (1 << 3)
-#define SH_CPU_SH7751R (1 << 4)
-#define SH_CPU_SH7750_ALL (SH_CPU_SH7750 | SH_CPU_SH7750S | SH_CPU_SH7750R)
-#define SH_CPU_SH7751_ALL (SH_CPU_SH7751 | SH_CPU_SH7751R)
+static struct intc_vect vectors_irl[] = {
+	INTC_VECT(IRL_0, 0x200),
+	INTC_VECT(IRL_1, 0x220),
+	INTC_VECT(IRL_2, 0x240),
+	INTC_VECT(IRL_3, 0x260),
+	INTC_VECT(IRL_4, 0x280),
+	INTC_VECT(IRL_5, 0x2a0),
+	INTC_VECT(IRL_6, 0x2c0),
+	INTC_VECT(IRL_7, 0x2e0),
+	INTC_VECT(IRL_8, 0x300),
+	INTC_VECT(IRL_9, 0x320),
+	INTC_VECT(IRL_A, 0x340),
+	INTC_VECT(IRL_B, 0x360),
+	INTC_VECT(IRL_C, 0x380),
+	INTC_VECT(IRL_D, 0x3a0),
+	INTC_VECT(IRL_E, 0x3c0),
+};
+
+static struct intc_group groups_irl[] = {
+	INTC_GROUP(IRL, IRL_0, IRL_1, IRL_2, IRL_3, IRL_4, IRL_5, IRL_6,
+		IRL_7, IRL_8, IRL_9, IRL_A, IRL_B, IRL_C, IRL_D, IRL_E),
+};
+
+/**********************************************************************
+ Memory mapped cache and TLB
+**********************************************************************/
+
+#define MM_REGION_MASK   0x07000000
+#define MM_ICACHE_ADDR   (0)
+#define MM_ICACHE_DATA   (1)
+#define MM_ITLB_ADDR     (2)
+#define MM_ITLB_DATA     (3)
+#define MM_OCACHE_ADDR   (4)
+#define MM_OCACHE_DATA   (5)
+#define MM_UTLB_ADDR     (6)
+#define MM_UTLB_DATA     (7)
+#define MM_REGION_TYPE(addr)  ((addr & MM_REGION_MASK) >> 24)
+
+static uint32_t invalid_read(void *opaque, target_phys_addr_t addr)
+{
+    assert(0);
+
+    return 0;
+}
+
+static uint32_t sh7750_mmct_readl(void *opaque, target_phys_addr_t addr)
+{
+    uint32_t ret = 0;
+
+    switch (MM_REGION_TYPE(addr)) {
+    case MM_ICACHE_ADDR:
+    case MM_ICACHE_DATA:
+        /* do nothing */
+	break;
+    case MM_ITLB_ADDR:
+    case MM_ITLB_DATA:
+        /* XXXXX */
+        assert(0);
+	break;
+    case MM_OCACHE_ADDR:
+    case MM_OCACHE_DATA:
+        /* do nothing */
+	break;
+    case MM_UTLB_ADDR:
+    case MM_UTLB_DATA:
+        /* XXXXX */
+        assert(0);
+	break;
+    default:
+        assert(0);
+    }
+
+    return ret;
+}
+
+static void invalid_write(void *opaque, target_phys_addr_t addr,
+			  uint32_t mem_value)
+{
+    assert(0);
+}
+
+static void sh7750_mmct_writel(void *opaque, target_phys_addr_t addr,
+				uint32_t mem_value)
+{
+    SH7750State *s = opaque;
+
+    switch (MM_REGION_TYPE(addr)) {
+    case MM_ICACHE_ADDR:
+    case MM_ICACHE_DATA:
+        /* do nothing */
+	break;
+    case MM_ITLB_ADDR:
+    case MM_ITLB_DATA:
+        /* XXXXX */
+        assert(0);
+	break;
+    case MM_OCACHE_ADDR:
+    case MM_OCACHE_DATA:
+        /* do nothing */
+	break;
+    case MM_UTLB_ADDR:
+        cpu_sh4_write_mmaped_utlb_addr(s->cpu, addr, mem_value);
+	break;
+    case MM_UTLB_DATA:
+        /* XXXXX */
+        assert(0);
+	break;
+    default:
+        assert(0);
+	break;
+    }
+}
+
+static CPUReadMemoryFunc * const sh7750_mmct_read[] = {
+    invalid_read,
+    invalid_read,
+    sh7750_mmct_readl
+};
+
+static CPUWriteMemoryFunc * const sh7750_mmct_write[] = {
+    invalid_write,
+    invalid_write,
+    sh7750_mmct_writel
+};
 
 SH7750State *sh7750_init(CPUSH4State * cpu)
 {
     SH7750State *s;
     int sh7750_io_memory;
-    int cpu_model = SH_CPU_SH7751R; /* for now */
+    int sh7750_mm_cache_and_tlb; /* memory mapped cache and tlb */
 
     s = qemu_mallocz(sizeof(SH7750State));
     s->cpu = cpu;
     s->periph_freq = 60000000;	/* 60MHz */
-    sh7750_io_memory = cpu_register_io_memory(0,
-					      sh7750_mem_read,
+    sh7750_io_memory = cpu_register_io_memory(sh7750_mem_read,
 					      sh7750_mem_write, s);
-    cpu_register_physical_memory(0x1c000000, 0x04000000, sh7750_io_memory);
+    cpu_register_physical_memory_offset(0x1f000000, 0x1000,
+                                        sh7750_io_memory, 0x1f000000);
+    cpu_register_physical_memory_offset(0xff000000, 0x1000,
+                                        sh7750_io_memory, 0x1f000000);
+    cpu_register_physical_memory_offset(0x1f800000, 0x1000,
+                                        sh7750_io_memory, 0x1f800000);
+    cpu_register_physical_memory_offset(0xff800000, 0x1000,
+                                        sh7750_io_memory, 0x1f800000);
+    cpu_register_physical_memory_offset(0x1fc00000, 0x1000,
+                                        sh7750_io_memory, 0x1fc00000);
+    cpu_register_physical_memory_offset(0xffc00000, 0x1000,
+                                        sh7750_io_memory, 0x1fc00000);
+
+    sh7750_mm_cache_and_tlb = cpu_register_io_memory(sh7750_mmct_read,
+						     sh7750_mmct_write, s);
+    cpu_register_physical_memory(0xf0000000, 0x08000000,
+				 sh7750_mm_cache_and_tlb);
 
     sh_intc_init(&s->intc, NR_SOURCES,
 		 _INTC_ARRAY(mask_registers),
 		 _INTC_ARRAY(prio_registers));
 
-    sh_intc_register_sources(&s->intc, 
+    sh_intc_register_sources(&s->intc,
 			     _INTC_ARRAY(vectors),
 			     _INTC_ARRAY(groups));
 
     cpu->intc_handle = &s->intc;
 
-    sh_serial_init(0x1fe00000, 0, s->periph_freq, serial_hds[0]);
+    sh_serial_init(0x1fe00000, 0, s->periph_freq, serial_hds[0],
+		   s->intc.irqs[SCI1_ERI],
+		   s->intc.irqs[SCI1_RXI],
+		   s->intc.irqs[SCI1_TXI],
+		   s->intc.irqs[SCI1_TEI],
+		   NULL);
     sh_serial_init(0x1fe80000, SH_SERIAL_FEAT_SCIF,
-		   s->periph_freq, serial_hds[1]);
+		   s->periph_freq, serial_hds[1],
+		   s->intc.irqs[SCIF_ERI],
+		   s->intc.irqs[SCIF_RXI],
+		   s->intc.irqs[SCIF_TXI],
+		   NULL,
+		   s->intc.irqs[SCIF_BRI]);
 
     tmu012_init(0x1fd80000,
 		TMU012_FEAT_TOCR | TMU012_FEAT_3CHAN | TMU012_FEAT_EXTCLK,
 		s->periph_freq,
-		sh_intc_source(&s->intc, TMU0),
-		sh_intc_source(&s->intc, TMU1),
-		sh_intc_source(&s->intc, TMU2_TUNI),
-		sh_intc_source(&s->intc, TMU2_TICPI));
+		s->intc.irqs[TMU0],
+		s->intc.irqs[TMU1],
+		s->intc.irqs[TMU2_TUNI],
+		s->intc.irqs[TMU2_TICPI]);
 
-    if (cpu_model & (SH_CPU_SH7750 | SH_CPU_SH7750S | SH_CPU_SH7751)) {
-        sh_intc_register_sources(&s->intc, 
+    if (cpu->id & (SH_CPU_SH7750 | SH_CPU_SH7750S | SH_CPU_SH7751)) {
+        sh_intc_register_sources(&s->intc,
 				 _INTC_ARRAY(vectors_dma4),
 				 _INTC_ARRAY(groups_dma4));
     }
 
-    if (cpu_model & (SH_CPU_SH7750R | SH_CPU_SH7751R)) {
-        sh_intc_register_sources(&s->intc, 
+    if (cpu->id & (SH_CPU_SH7750R | SH_CPU_SH7751R)) {
+        sh_intc_register_sources(&s->intc,
 				 _INTC_ARRAY(vectors_dma8),
 				 _INTC_ARRAY(groups_dma8));
     }
 
-    if (cpu_model & (SH_CPU_SH7750R | SH_CPU_SH7751 | SH_CPU_SH7751R)) {
-        sh_intc_register_sources(&s->intc, 
+    if (cpu->id & (SH_CPU_SH7750R | SH_CPU_SH7751 | SH_CPU_SH7751R)) {
+        sh_intc_register_sources(&s->intc,
 				 _INTC_ARRAY(vectors_tmu34),
 				 NULL, 0);
         tmu012_init(0x1e100000, 0, s->periph_freq,
-		    sh_intc_source(&s->intc, TMU3),
-		    sh_intc_source(&s->intc, TMU4),
+		    s->intc.irqs[TMU3],
+		    s->intc.irqs[TMU4],
 		    NULL, NULL);
     }
 
-    if (cpu_model & (SH_CPU_SH7751_ALL)) {
-        sh_intc_register_sources(&s->intc, 
+    if (cpu->id & (SH_CPU_SH7751_ALL)) {
+        sh_intc_register_sources(&s->intc,
 				 _INTC_ARRAY(vectors_pci),
 				 _INTC_ARRAY(groups_pci));
     }
 
-    if (cpu_model & (SH_CPU_SH7750S | SH_CPU_SH7750R | SH_CPU_SH7751_ALL)) {
-        sh_intc_register_sources(&s->intc, 
+    if (cpu->id & (SH_CPU_SH7750S | SH_CPU_SH7750R | SH_CPU_SH7751_ALL)) {
+        sh_intc_register_sources(&s->intc,
 				 _INTC_ARRAY(vectors_irlm),
 				 NULL, 0);
     }
 
+    sh_intc_register_sources(&s->intc,
+				_INTC_ARRAY(vectors_irl),
+				_INTC_ARRAY(groups_irl));
     return s;
+}
+
+qemu_irq sh7750_irl(SH7750State *s)
+{
+    sh_intc_toggle_source(sh_intc_source(&s->intc, IRL), 1, 0); /* enable */
+    return qemu_allocate_irqs(sh_intc_set_irl, sh_intc_source(&s->intc, IRL),
+                               1)[0];
 }

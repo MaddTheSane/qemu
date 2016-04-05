@@ -2,7 +2,6 @@ OUTPUT_FORMAT("elf32-littlearm", "elf32-littlearm",
 	      "elf32-littlearm")
 OUTPUT_ARCH(arm)
 ENTRY(_start)
-SEARCH_DIR(/lib); SEARCH_DIR(/usr/lib); SEARCH_DIR(/usr/local/lib); SEARCH_DIR(/usr/alpha-unknown-linux-gnu/lib);
 SECTIONS
 {
   /* Read-only sections, merged into text segment: */
@@ -63,6 +62,7 @@ SECTIONS
   . = ALIGN(0x100000) + (. & (0x100000 - 1));
   .data    :
   {
+    *(.gen_code)
     *(.data)
     *(.gnu.linkonce.d*)
     CONSTRUCTORS

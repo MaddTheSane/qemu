@@ -15,13 +15,14 @@
  * General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #ifndef CPU_M68K_H
 #define CPU_M68K_H
 
 #define TARGET_LONG_BITS 32
+
+#define CPUState struct CPUM68KState
 
 #include "cpu-defs.h"
 
@@ -103,13 +104,6 @@ typedef struct CPUM68KState {
     /* ??? remove this.  */
     uint32_t t1;
 
-    /* exception/interrupt handling */
-    jmp_buf jmp_env;
-    int exception_index;
-    int interrupt_request;
-    int user_mode_only;
-    int halted;
-
     int pending_vector;
     int pending_level;
 
@@ -120,6 +114,7 @@ typedef struct CPUM68KState {
     uint32_t features;
 } CPUM68KState;
 
+void m68k_tcg_init(void);
 CPUM68KState *cpu_m68k_init(const char *cpu_model);
 int cpu_m68k_exec(CPUM68KState *s);
 void cpu_m68k_close(CPUM68KState *s);
@@ -141,9 +136,7 @@ enum {
     CC_OP_CMPW,  /* CC_DEST = result, CC_SRC = source */
     CC_OP_ADDX,  /* CC_DEST = result, CC_SRC = source */
     CC_OP_SUBX,  /* CC_DEST = result, CC_SRC = source */
-    CC_OP_SHL,   /* CC_DEST = source, CC_SRC = shift */
-    CC_OP_SHR,   /* CC_DEST = source, CC_SRC = shift */
-    CC_OP_SAR,   /* CC_DEST = source, CC_SRC = shift */
+    CC_OP_SHIFT, /* CC_DEST = result, CC_SRC = carry */
 };
 
 #define CCF_C 0x01
@@ -205,6 +198,8 @@ static inline int m68k_feature(CPUM68KState *env, int feature)
     return (env->features & (1u << feature)) != 0;
 }
 
+void m68k_cpu_list(FILE *f, int (*cpu_fprintf)(FILE *f, const char *fmt, ...));
+
 void register_m68k_insns (CPUM68KState *env);
 
 #ifdef CONFIG_USER_ONLY
@@ -215,11 +210,11 @@ void register_m68k_insns (CPUM68KState *env);
 #define TARGET_PAGE_BITS 10
 #endif
 
-#define CPUState CPUM68KState
 #define cpu_init cpu_m68k_init
 #define cpu_exec cpu_m68k_exec
 #define cpu_gen_code cpu_m68k_gen_code
 #define cpu_signal_handler cpu_m68k_signal_handler
+#define cpu_list m68k_cpu_list
 
 /* MMU modes definitions */
 #define MMU_MODE0_SUFFIX _kernel
@@ -230,6 +225,35 @@ static inline int cpu_mmu_index (CPUState *env)
     return (env->sr & SR_S) == 0 ? 1 : 0;
 }
 
+int cpu_m68k_handle_mmu_fault(CPUState *env, target_ulong address, int rw,
+                              int mmu_idx, int is_softmmu);
+#define cpu_handle_mmu_fault cpu_m68k_handle_mmu_fault
+
+#if defined(CONFIG_USER_ONLY)
+static inline void cpu_clone_regs(CPUState *env, target_ulong newsp)
+{
+    if (newsp)
+        env->aregs[7] = newsp;
+    env->dregs[0] = 0;
+}
+#endif
+
 #include "cpu-all.h"
+#include "exec-all.h"
+
+static inline void cpu_pc_from_tb(CPUState *env, TranslationBlock *tb)
+{
+    env->pc = tb->pc;
+}
+
+static inline void cpu_get_tb_cpu_state(CPUState *env, target_ulong *pc,
+                                        target_ulong *cs_base, int *flags)
+{
+    *pc = env->pc;
+    *cs_base = 0;
+    *flags = (env->fpcr & M68K_FPCR_PREC)       /* Bit  6 */
+            | (env->sr & SR_S)                  /* Bit  13 */
+            | ((env->macsr >> 4) & 0xf);        /* Bits 0-3 */
+}
 
 #endif

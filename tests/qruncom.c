@@ -16,39 +16,6 @@
 
 //#define SIGTEST
 
-void cpu_outb(CPUState *env, int addr, int val)
-{
-    fprintf(stderr, "outb: port=0x%04x, data=%02x\n", addr, val);
-}
-
-void cpu_outw(CPUState *env, int addr, int val)
-{
-    fprintf(stderr, "outw: port=0x%04x, data=%04x\n", addr, val);
-}
-
-void cpu_outl(CPUState *env, int addr, int val)
-{
-    fprintf(stderr, "outl: port=0x%04x, data=%08x\n", addr, val);
-}
-
-int cpu_inb(CPUState *env, int addr)
-{
-    fprintf(stderr, "inb: port=0x%04x\n", addr);
-    return 0;
-}
-
-int cpu_inw(CPUState *env, int addr)
-{
-    fprintf(stderr, "inw: port=0x%04x\n", addr);
-    return 0;
-}
-
-int cpu_inl(CPUState *env, int addr)
-{
-    fprintf(stderr, "inl: port=0x%04x\n", addr);
-    return 0;
-}
-
 int cpu_get_pic_interrupt(CPUState *env)
 {
     return -1;
@@ -198,13 +165,6 @@ int main(int argc, char **argv)
     //    cpu_set_log(CPU_LOG_TB_IN_ASM | CPU_LOG_TB_OUT_ASM | CPU_LOG_EXEC);
 
     env = cpu_init("qemu32");
-
-    /* disable code copy to simplify debugging */
-    code_copy_enabled = 0;
-
-    /* set user mode state (XXX: should be done automatically by
-       cpu_init ?) */
-    env->user_mode_only = 1;
 
     cpu_x86_set_cpl(env, 3);
 

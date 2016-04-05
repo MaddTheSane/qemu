@@ -117,7 +117,7 @@ TESTCASES += check_mmap3.ctst
 TESTCASES += check_sigalrm.ctst
 TESTCASES += check_time1.ctst
 TESTCASES += check_time2.ctst
-
+TESTCASES += check_settls1.ctst
 
 TESTCASES += check_gcctorture_pr28634-1.ctst
 #TESTCASES += check_gcctorture_pr28634.ctst
@@ -140,9 +140,9 @@ build: $(CRT) $(SYS) $(TESTCASES)
 
 check: $(CRT) $(SYS) $(TESTCASES)
 	@echo -e "\nQEMU simulator."
-	@for case in $(TESTCASES); do \
+	for case in $(TESTCASES); do \
 		echo -n "$$case "; \
-		$(SIM) $$case; \
+		$(SIM) ./$$case; \
 	done
 check-g: $(CRT) $(SYS) $(TESTCASES)
 	@echo -e "\nGDB simulator."

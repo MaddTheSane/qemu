@@ -14,8 +14,7 @@
  *  GNU General Public License for more details.
  *
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -36,6 +35,7 @@
 #include <signal.h>
 
 #include "qemu.h"
+#include "qemu-common.h"
 
 #define DEBUG_SIGNAL
 
@@ -54,7 +54,7 @@ struct emulated_sigaction {
                              first signal, we put it here */
 };
 
-struct sigaltstack target_sigaltstack_used = {
+static struct sigaltstack target_sigaltstack_used = {
     0, 0, SA_DISABLE
 };
 
@@ -131,7 +131,7 @@ static inline void free_sigqueue(struct sigqueue *q)
 }
 
 /* abort execution with signal */
-void __attribute((noreturn)) force_sig(int sig)
+void QEMU_NORETURN force_sig(int sig)
 {
     int host_sig;
     host_sig = target_to_host_signal(sig);
@@ -213,7 +213,7 @@ static void host_signal_handler(int host_signum, siginfo_t *info,
 #endif
     if (queue_signal(sig, &tinfo) == 1) {
         /* interrupt the virtual CPU as soon as possible */
-        cpu_interrupt(global_env, CPU_INTERRUPT_EXIT);
+        cpu_exit(global_env);
     }
 }
 
@@ -455,5 +455,3 @@ handle_signal:
     if (q != &k->info)
         free_sigqueue(q);
 }
-
-

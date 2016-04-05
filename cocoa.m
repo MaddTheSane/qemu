@@ -115,7 +115,7 @@ BOOL savedVm_running;
 int qemu_main(int argc, char **argv); // main defined in qemu/vl.c
 NSWindow *normalWindow;
 id cocoaView;
-static void *screenBuffer;
+static DisplayChangeListener *dcl;
 
 int gArgc;
 char **gArgv;
@@ -350,9 +350,6 @@ int cocoa_keycode_to_qemu(int keycode)
 {
     Q_DEBUG("QemuCocoaView: dealloc\n");
 
-    if (screenBuffer)
-        free(screenBuffer);
-
     if (dataProviderRef)
         CGDataProviderRelease(dataProviderRef);
 
@@ -362,9 +359,6 @@ int cocoa_keycode_to_qemu(int keycode)
 - (void) drawRect:(NSRect) rect
 {
     COCOA_DEBUG("QemuCocoaView: drawRect\n");
-
-    if ((int)screenBuffer == -1)
-        return;
 
     // get CoreGraphic context
     CGContextRef viewContextRef = [[NSGraphicsContext currentContext] graphicsPort];
@@ -378,10 +372,10 @@ int cocoa_keycode_to_qemu(int keycode)
             screen.height, //height
             screen.bitsPerComponent, //bitsPerComponent
             screen.bitsPerPixel, //bitsPerPixel
-            (screen.width * 4), //bytesPerRow
+            (screen.width * (screen.bitsPerComponent/2)), //bytesPerRow
 #if __LITTLE_ENDIAN__
             CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB), //colorspace for OS X >= 10.4
-            kCGImageAlphaNoneSkipLast,
+            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
 #else
             CGColorSpaceCreateDeviceRGB(), //colorspace for OS X < 10.4 (actually ppc)
             kCGImageAlphaNoneSkipFirst, //bitmapInfo
@@ -453,22 +447,12 @@ int cocoa_keycode_to_qemu(int keycode)
     // update screenBuffer
     if (dataProviderRef)
         CGDataProviderRelease(dataProviderRef);
-    if (screenBuffer)
-        free(screenBuffer);
-    screenBuffer = malloc( w * 4 * h );
 
-    ds->data = screenBuffer;
-    ds->linesize =  (w * 4);
-    ds->depth = 32;
-    ds->width = w;
-    ds->height = h;
-#ifdef __LITTLE_ENDIAN__
-    ds->bgr = 1;
-#else
-    ds->bgr = 0;
-#endif
+    //sync host window color space with guests
+	screen.bitsPerPixel = ds_get_bits_per_pixel(ds);
+	screen.bitsPerComponent = ds_get_bytes_per_pixel(ds) * 2;
 
-    dataProviderRef = CGDataProviderCreateWithData(NULL, screenBuffer, w * 4 * h, NULL);
+    dataProviderRef = CGDataProviderCreateWithData(NULL, ds_get_data(ds), w * 4 * h, NULL);
 
     // update windows
     if (isFullscreen) {
@@ -481,6 +465,7 @@ int cocoa_keycode_to_qemu(int keycode)
     }
     screen.width = w;
     screen.height = h;
+	[normalWindow center];
     [self setContentDimensions];
     [self setFrame:NSMakeRect(cx, cy, cw, ch)];
 }
@@ -760,7 +745,7 @@ int cocoa_keycode_to_qemu(int keycode)
  ------------------------------------------------------
     QemuCocoaAppController
  ------------------------------------------------------
- */
+*/
 
 /* to be implemented by qemu */
 @protocol QDistributedObjectClientProto <NSObject>
@@ -780,34 +765,39 @@ int cocoa_keycode_to_qemu(int keycode)
 @implementation QemuCocoaAppController
 - (void)applicationDidFinishLaunching: (NSNotification *) note
 {
-	Q_DEBUG("qemu_cocoa: applicationDidFinishLaunching\n");
-	
-	
-	uniqueDocumentID = gArgv[gArgc - 1];
-	qDocument = [[NSConnection rootProxyForConnectionWithRegisteredName:[NSString stringWithCString:gArgv[gArgc - 1]] host:nil] retain];
-	if(!qDocument) {
-		NSLog(@"qemu_cocoa: applicationDidFinishLaunching: Could not connect to %s", uniqueDocumentID);
-		[NSApp terminate:self];
-	} else {
-		// register Ourselves
-		if (![qDocument qemuRegister:self]) {
-			NSLog(@"qemu_cocoa: applicationDidFinishLaunching: Could not register with %s", uniqueDocumentID);
-			[NSApp terminate:self];
-		} else {
-			// start emulation
-			gArgv[gArgc - 1] = "";
-			gArgv[gArgc - 2] = "";
-			gArgc = gArgc - 2;
-			[self startEmulationWithArgc:gArgc argv:gArgv];
-		}
-	}
+    COCOA_DEBUG("QemuCocoaAppController: init\n");
+
+    self = [super init];
+    if (self) {
+
+        // create a view and add it to the window
+        cocoaView = [[QemuCocoaView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 640.0, 480.0)];
+        if(!cocoaView) {
+            fprintf(stderr, "(cocoa) can't create a view\n");
+            exit(1);
+        }
+
+        // create a window
+        normalWindow = [[NSWindow alloc] initWithContentRect:[cocoaView frame]
+            styleMask:NSTitledWindowMask|NSMiniaturizableWindowMask|NSClosableWindowMask
+            backing:NSBackingStoreBuffered defer:NO];
+        if(!normalWindow) {
+            fprintf(stderr, "(cocoa) can't create window\n");
+            exit(1);
+        }
+        [normalWindow setAcceptsMouseMovedEvents:YES];
+        [normalWindow setTitle:[NSString stringWithFormat:@"QEMU"]];
+        [normalWindow setContentView:cocoaView];
+        [normalWindow makeKeyAndOrderFront:self];
+		[normalWindow center];
+
+    }
+    return self;
 }
-
-
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification
 {
-	Q_DEBUG("qemu_cocoa: applicationWillTerminate");
+	Q_DEBUG("qemu_cocoa: applicationWillTerminate\n");
 	
 	// unregister
 	[qDocument qemuUnRegister:self];
@@ -825,8 +815,8 @@ int cocoa_keycode_to_qemu(int keycode)
 {
 	Q_DEBUG("qemu_cocoa: startEmulationWithArgc: %D\n", argc);
 
-	int status;
-	status = qemu_main(argc, argv);
+    int status;
+    status = qemu_main(argc, argv);
     exit(status);
 }
 
@@ -1035,11 +1025,9 @@ static void cocoa_update(DisplayState *ds, int x, int y, int w, int h)
     [qDocument displayRect:NSMakeRect(x, y, w, h)];
 }
 
-
-
-static void cocoa_resize(DisplayState *ds, int w, int h)
+static void cocoa_resize(DisplayState *ds)
 {
-	Q_DEBUG("qemu_cocoa: cocoa_resize w=%d h=%d\n", w, h);
+	Q_DEBUG("qemu_cocoa: cocoa_resize\n");
 
 
     static void *screen_pixels;
@@ -1072,10 +1060,8 @@ static void cocoa_resize(DisplayState *ds, int w, int h)
     ds->bgr = 0;
 #endif
 
-    [qDocument resizeTo:NSMakeSize(w, h)];
+    [qDocument resizeTo:NSMakeSize(ds_get_width(ds), ds_get_height(ds))];
 }
-
-
 
 static void cocoa_refresh(DisplayState *ds)
 {
@@ -1182,20 +1168,21 @@ static void cocoa_refresh(DisplayState *ds)
 static void cocoa_cleanup(void)
 {
     Q_DEBUG("qemu_cocoa: cocoa_cleanup\n");
-
+	qemu_free(dcl);
 }
 
 void cocoa_display_init(DisplayState *ds, int full_screen)
 {
     Q_DEBUG("qemu_cocoa: cocoa_display_init\n");
 
-    // register vga outpu callbacks
-    ds->dpy_update = cocoa_update;
-    ds->dpy_resize = cocoa_resize;
-    ds->dpy_refresh = cocoa_refresh;
+	dcl = qemu_mallocz(sizeof(DisplayChangeListener));
+	
+    // register vga output callbacks
+    dcl->dpy_update = cocoa_update;
+    dcl->dpy_resize = cocoa_resize;
+    dcl->dpy_refresh = cocoa_refresh;
 
-    // give window a initial Size
-    cocoa_resize(ds, 640, 400);
+	register_displaychangelistener(ds, dcl);
 
     // register cleanup function
     atexit(cocoa_cleanup);

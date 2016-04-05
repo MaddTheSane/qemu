@@ -26,12 +26,24 @@
 #include "qemu-timer.h"
 #include "sysemu.h"
 #include "nvram.h"
+#include "qemu-log.h"
+#include "loader.h"
 
 //#define PPC_DEBUG_IRQ
 //#define PPC_DEBUG_TB
 
-extern FILE *logfile;
-extern int loglevel;
+#ifdef PPC_DEBUG_IRQ
+#  define LOG_IRQ(...) qemu_log_mask(CPU_LOG_INT, ## __VA_ARGS__)
+#else
+#  define LOG_IRQ(...) do { } while (0)
+#endif
+
+
+#ifdef PPC_DEBUG_TB
+#  define LOG_TB(...) qemu_log(__VA_ARGS__)
+#else
+#  define LOG_TB(...) do { } while (0)
+#endif
 
 static void cpu_ppc_tb_stop (CPUState *env);
 static void cpu_ppc_tb_start (CPUState *env);
@@ -46,13 +58,9 @@ static void ppc_set_irq (CPUState *env, int n_IRQ, int level)
         if (env->pending_interrupts == 0)
             cpu_reset_interrupt(env, CPU_INTERRUPT_HARD);
     }
-#if defined(PPC_DEBUG_IRQ)
-    if (loglevel & CPU_LOG_INT) {
-        fprintf(logfile, "%s: %p n_IRQ %d level %d => pending %08" PRIx32
+    LOG_IRQ("%s: %p n_IRQ %d level %d => pending %08" PRIx32
                 "req %08x\n", __func__, env, n_IRQ, level,
                 env->pending_interrupts, env->interrupt_request);
-    }
-#endif
 }
 
 /* PowerPC 6xx / 7xx internal IRQ controller */
@@ -61,24 +69,16 @@ static void ppc6xx_set_irq (void *opaque, int pin, int level)
     CPUState *env = opaque;
     int cur_level;
 
-#if defined(PPC_DEBUG_IRQ)
-    if (loglevel & CPU_LOG_INT) {
-        fprintf(logfile, "%s: env %p pin %d level %d\n", __func__,
+    LOG_IRQ("%s: env %p pin %d level %d\n", __func__,
                 env, pin, level);
-    }
-#endif
     cur_level = (env->irq_input_state >> pin) & 1;
     /* Don't generate spurious events */
     if ((cur_level == 1 && level == 0) || (cur_level == 0 && level != 0)) {
         switch (pin) {
         case PPC6xx_INPUT_TBEN:
             /* Level sensitive - active high */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: %s the time base\n",
+            LOG_IRQ("%s: %s the time base\n",
                         __func__, level ? "start" : "stop");
-            }
-#endif
             if (level) {
                 cpu_ppc_tb_start(env);
             } else {
@@ -86,22 +86,14 @@ static void ppc6xx_set_irq (void *opaque, int pin, int level)
             }
         case PPC6xx_INPUT_INT:
             /* Level sensitive - active high */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the external IRQ state to %d\n",
+            LOG_IRQ("%s: set the external IRQ state to %d\n",
                         __func__, level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_EXT, level);
             break;
         case PPC6xx_INPUT_SMI:
             /* Level sensitive - active high */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the SMI IRQ state to %d\n",
+            LOG_IRQ("%s: set the SMI IRQ state to %d\n",
                         __func__, level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_SMI, level);
             break;
         case PPC6xx_INPUT_MCP:
@@ -110,12 +102,8 @@ static void ppc6xx_set_irq (void *opaque, int pin, int level)
              *            603/604/740/750: check HID0[EMCP]
              */
             if (cur_level == 1 && level == 0) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: raise machine check state\n",
+                LOG_IRQ("%s: raise machine check state\n",
                             __func__);
-                }
-#endif
                 ppc_set_irq(env, PPC_INTERRUPT_MCK, 1);
             }
             break;
@@ -124,47 +112,31 @@ static void ppc6xx_set_irq (void *opaque, int pin, int level)
             /* XXX: TODO: relay the signal to CKSTP_OUT pin */
             /* XXX: Note that the only way to restart the CPU is to reset it */
             if (level) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: stop the CPU\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: stop the CPU\n", __func__);
                 env->halted = 1;
             }
             break;
         case PPC6xx_INPUT_HRESET:
             /* Level sensitive - active low */
             if (level) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: reset the CPU\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: reset the CPU\n", __func__);
                 env->interrupt_request |= CPU_INTERRUPT_EXITTB;
                 /* XXX: TOFIX */
 #if 0
-                cpu_ppc_reset(env);
+                cpu_reset(env);
 #else
                 qemu_system_reset_request();
 #endif
             }
             break;
         case PPC6xx_INPUT_SRESET:
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the RESET IRQ state to %d\n",
+            LOG_IRQ("%s: set the RESET IRQ state to %d\n",
                         __func__, level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_RESET, level);
             break;
         default:
             /* Unknown pin - do nothing */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: unknown IRQ pin %d\n", __func__, pin);
-            }
-#endif
+            LOG_IRQ("%s: unknown IRQ pin %d\n", __func__, pin);
             return;
         }
         if (level)
@@ -187,34 +159,22 @@ static void ppc970_set_irq (void *opaque, int pin, int level)
     CPUState *env = opaque;
     int cur_level;
 
-#if defined(PPC_DEBUG_IRQ)
-    if (loglevel & CPU_LOG_INT) {
-        fprintf(logfile, "%s: env %p pin %d level %d\n", __func__,
+    LOG_IRQ("%s: env %p pin %d level %d\n", __func__,
                 env, pin, level);
-    }
-#endif
     cur_level = (env->irq_input_state >> pin) & 1;
     /* Don't generate spurious events */
     if ((cur_level == 1 && level == 0) || (cur_level == 0 && level != 0)) {
         switch (pin) {
         case PPC970_INPUT_INT:
             /* Level sensitive - active high */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the external IRQ state to %d\n",
+            LOG_IRQ("%s: set the external IRQ state to %d\n",
                         __func__, level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_EXT, level);
             break;
         case PPC970_INPUT_THINT:
             /* Level sensitive - active high */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the SMI IRQ state to %d\n", __func__,
+            LOG_IRQ("%s: set the SMI IRQ state to %d\n", __func__,
                         level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_THERM, level);
             break;
         case PPC970_INPUT_MCP:
@@ -223,12 +183,8 @@ static void ppc970_set_irq (void *opaque, int pin, int level)
              *            603/604/740/750: check HID0[EMCP]
              */
             if (cur_level == 1 && level == 0) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: raise machine check state\n",
+                LOG_IRQ("%s: raise machine check state\n",
                             __func__);
-                }
-#endif
                 ppc_set_irq(env, PPC_INTERRUPT_MCK, 1);
             }
             break;
@@ -236,18 +192,10 @@ static void ppc970_set_irq (void *opaque, int pin, int level)
             /* Level sensitive - active low */
             /* XXX: TODO: relay the signal to CKSTP_OUT pin */
             if (level) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: stop the CPU\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: stop the CPU\n", __func__);
                 env->halted = 1;
             } else {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: restart the CPU\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: restart the CPU\n", __func__);
                 env->halted = 0;
             }
             break;
@@ -255,40 +203,24 @@ static void ppc970_set_irq (void *opaque, int pin, int level)
             /* Level sensitive - active low */
             if (level) {
 #if 0 // XXX: TOFIX
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: reset the CPU\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: reset the CPU\n", __func__);
                 cpu_reset(env);
 #endif
             }
             break;
         case PPC970_INPUT_SRESET:
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the RESET IRQ state to %d\n",
+            LOG_IRQ("%s: set the RESET IRQ state to %d\n",
                         __func__, level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_RESET, level);
             break;
         case PPC970_INPUT_TBEN:
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the TBEN state to %d\n", __func__,
+            LOG_IRQ("%s: set the TBEN state to %d\n", __func__,
                         level);
-            }
-#endif
             /* XXX: TODO */
             break;
         default:
             /* Unknown pin - do nothing */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: unknown IRQ pin %d\n", __func__, pin);
-            }
-#endif
+            LOG_IRQ("%s: unknown IRQ pin %d\n", __func__, pin);
             return;
         }
         if (level)
@@ -311,103 +243,63 @@ static void ppc40x_set_irq (void *opaque, int pin, int level)
     CPUState *env = opaque;
     int cur_level;
 
-#if defined(PPC_DEBUG_IRQ)
-    if (loglevel & CPU_LOG_INT) {
-        fprintf(logfile, "%s: env %p pin %d level %d\n", __func__,
+    LOG_IRQ("%s: env %p pin %d level %d\n", __func__,
                 env, pin, level);
-    }
-#endif
     cur_level = (env->irq_input_state >> pin) & 1;
     /* Don't generate spurious events */
     if ((cur_level == 1 && level == 0) || (cur_level == 0 && level != 0)) {
         switch (pin) {
         case PPC40x_INPUT_RESET_SYS:
             if (level) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: reset the PowerPC system\n",
+                LOG_IRQ("%s: reset the PowerPC system\n",
                             __func__);
-                }
-#endif
                 ppc40x_system_reset(env);
             }
             break;
         case PPC40x_INPUT_RESET_CHIP:
             if (level) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: reset the PowerPC chip\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: reset the PowerPC chip\n", __func__);
                 ppc40x_chip_reset(env);
             }
             break;
         case PPC40x_INPUT_RESET_CORE:
             /* XXX: TODO: update DBSR[MRR] */
             if (level) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: reset the PowerPC core\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: reset the PowerPC core\n", __func__);
                 ppc40x_core_reset(env);
             }
             break;
         case PPC40x_INPUT_CINT:
             /* Level sensitive - active high */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the critical IRQ state to %d\n",
+            LOG_IRQ("%s: set the critical IRQ state to %d\n",
                         __func__, level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_CEXT, level);
             break;
         case PPC40x_INPUT_INT:
             /* Level sensitive - active high */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the external IRQ state to %d\n",
+            LOG_IRQ("%s: set the external IRQ state to %d\n",
                         __func__, level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_EXT, level);
             break;
         case PPC40x_INPUT_HALT:
             /* Level sensitive - active low */
             if (level) {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: stop the CPU\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: stop the CPU\n", __func__);
                 env->halted = 1;
             } else {
-#if defined(PPC_DEBUG_IRQ)
-                if (loglevel & CPU_LOG_INT) {
-                    fprintf(logfile, "%s: restart the CPU\n", __func__);
-                }
-#endif
+                LOG_IRQ("%s: restart the CPU\n", __func__);
                 env->halted = 0;
             }
             break;
         case PPC40x_INPUT_DEBUG:
             /* Level sensitive - active high */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: set the debug pin state to %d\n",
+            LOG_IRQ("%s: set the debug pin state to %d\n",
                         __func__, level);
-            }
-#endif
             ppc_set_irq(env, PPC_INTERRUPT_DEBUG, level);
             break;
         default:
             /* Unknown pin - do nothing */
-#if defined(PPC_DEBUG_IRQ)
-            if (loglevel & CPU_LOG_INT) {
-                fprintf(logfile, "%s: unknown IRQ pin %d\n", __func__, pin);
-            }
-#endif
+            LOG_IRQ("%s: unknown IRQ pin %d\n", __func__, pin);
             return;
         }
         if (level)
@@ -423,6 +315,66 @@ void ppc40x_irq_init (CPUState *env)
                                                   env, PPC40x_INPUT_NB);
 }
 
+/* PowerPC E500 internal IRQ controller */
+static void ppce500_set_irq (void *opaque, int pin, int level)
+{
+    CPUState *env = opaque;
+    int cur_level;
+
+    LOG_IRQ("%s: env %p pin %d level %d\n", __func__,
+                env, pin, level);
+    cur_level = (env->irq_input_state >> pin) & 1;
+    /* Don't generate spurious events */
+    if ((cur_level == 1 && level == 0) || (cur_level == 0 && level != 0)) {
+        switch (pin) {
+        case PPCE500_INPUT_MCK:
+            if (level) {
+                LOG_IRQ("%s: reset the PowerPC system\n",
+                            __func__);
+                qemu_system_reset_request();
+            }
+            break;
+        case PPCE500_INPUT_RESET_CORE:
+            if (level) {
+                LOG_IRQ("%s: reset the PowerPC core\n", __func__);
+                ppc_set_irq(env, PPC_INTERRUPT_MCK, level);
+            }
+            break;
+        case PPCE500_INPUT_CINT:
+            /* Level sensitive - active high */
+            LOG_IRQ("%s: set the critical IRQ state to %d\n",
+                        __func__, level);
+            ppc_set_irq(env, PPC_INTERRUPT_CEXT, level);
+            break;
+        case PPCE500_INPUT_INT:
+            /* Level sensitive - active high */
+            LOG_IRQ("%s: set the core IRQ state to %d\n",
+                        __func__, level);
+            ppc_set_irq(env, PPC_INTERRUPT_EXT, level);
+            break;
+        case PPCE500_INPUT_DEBUG:
+            /* Level sensitive - active high */
+            LOG_IRQ("%s: set the debug pin state to %d\n",
+                        __func__, level);
+            ppc_set_irq(env, PPC_INTERRUPT_DEBUG, level);
+            break;
+        default:
+            /* Unknown pin - do nothing */
+            LOG_IRQ("%s: unknown IRQ pin %d\n", __func__, pin);
+            return;
+        }
+        if (level)
+            env->irq_input_state |= 1 << pin;
+        else
+            env->irq_input_state &= ~(1 << pin);
+    }
+}
+
+void ppce500_irq_init (CPUState *env)
+{
+    env->irq_inputs = (void **)qemu_allocate_irqs(&ppce500_set_irq,
+                                        env, PPCE500_INPUT_NB);
+}
 /*****************************************************************************/
 /* PowerPC time base and decrementer emulation */
 struct ppc_tb_t {
@@ -442,11 +394,11 @@ struct ppc_tb_t {
     void *opaque;
 };
 
-static always_inline uint64_t cpu_ppc_get_tb (ppc_tb_t *tb_env, uint64_t vmclk,
-                                              int64_t tb_offset)
+static inline uint64_t cpu_ppc_get_tb(ppc_tb_t *tb_env, uint64_t vmclk,
+                                      int64_t tb_offset)
 {
     /* TB time in tb periods */
-    return muldiv64(vmclk, tb_env->tb_freq, ticks_per_sec) + tb_offset;
+    return muldiv64(vmclk, tb_env->tb_freq, get_ticks_per_sec()) + tb_offset;
 }
 
 uint32_t cpu_ppc_load_tbl (CPUState *env)
@@ -455,26 +407,18 @@ uint32_t cpu_ppc_load_tbl (CPUState *env)
     uint64_t tb;
 
     tb = cpu_ppc_get_tb(tb_env, qemu_get_clock(vm_clock), tb_env->tb_offset);
-#if defined(PPC_DEBUG_TB)
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: tb %016" PRIx64 "\n", __func__, tb);
-    }
-#endif
+    LOG_TB("%s: tb %016" PRIx64 "\n", __func__, tb);
 
     return tb & 0xFFFFFFFF;
 }
 
-static always_inline uint32_t _cpu_ppc_load_tbu (CPUState *env)
+static inline uint32_t _cpu_ppc_load_tbu(CPUState *env)
 {
     ppc_tb_t *tb_env = env->tb_env;
     uint64_t tb;
 
     tb = cpu_ppc_get_tb(tb_env, qemu_get_clock(vm_clock), tb_env->tb_offset);
-#if defined(PPC_DEBUG_TB)
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: tb %016" PRIx64 "\n", __func__, tb);
-    }
-#endif
+    LOG_TB("%s: tb %016" PRIx64 "\n", __func__, tb);
 
     return tb >> 32;
 }
@@ -484,17 +428,12 @@ uint32_t cpu_ppc_load_tbu (CPUState *env)
     return _cpu_ppc_load_tbu(env);
 }
 
-static always_inline void cpu_ppc_store_tb (ppc_tb_t *tb_env, uint64_t vmclk,
-                                            int64_t *tb_offsetp,
-                                            uint64_t value)
+static inline void cpu_ppc_store_tb(ppc_tb_t *tb_env, uint64_t vmclk,
+                                    int64_t *tb_offsetp, uint64_t value)
 {
-    *tb_offsetp = value - muldiv64(vmclk, tb_env->tb_freq, ticks_per_sec);
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: tb %016" PRIx64 " offset %08" PRIx64 "\n",
+    *tb_offsetp = value - muldiv64(vmclk, tb_env->tb_freq, get_ticks_per_sec());
+    LOG_TB("%s: tb %016" PRIx64 " offset %08" PRIx64 "\n",
                 __func__, value, *tb_offsetp);
-    }
-#endif
 }
 
 void cpu_ppc_store_tbl (CPUState *env, uint32_t value)
@@ -508,7 +447,7 @@ void cpu_ppc_store_tbl (CPUState *env, uint32_t value)
                      &tb_env->tb_offset, tb | (uint64_t)value);
 }
 
-static always_inline void _cpu_ppc_store_tbu (CPUState *env, uint32_t value)
+static inline void _cpu_ppc_store_tbu(CPUState *env, uint32_t value)
 {
     ppc_tb_t *tb_env = env->tb_env;
     uint64_t tb;
@@ -530,11 +469,7 @@ uint32_t cpu_ppc_load_atbl (CPUState *env)
     uint64_t tb;
 
     tb = cpu_ppc_get_tb(tb_env, qemu_get_clock(vm_clock), tb_env->atb_offset);
-#if defined(PPC_DEBUG_TB)
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: tb %016" PRIx64 "\n", __func__, tb);
-    }
-#endif
+    LOG_TB("%s: tb %016" PRIx64 "\n", __func__, tb);
 
     return tb & 0xFFFFFFFF;
 }
@@ -545,11 +480,7 @@ uint32_t cpu_ppc_load_atbu (CPUState *env)
     uint64_t tb;
 
     tb = cpu_ppc_get_tb(tb_env, qemu_get_clock(vm_clock), tb_env->atb_offset);
-#if defined(PPC_DEBUG_TB)
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: tb %016" PRIx64 "\n", __func__, tb);
-    }
-#endif
+    LOG_TB("%s: tb %016" PRIx64 "\n", __func__, tb);
 
     return tb >> 32;
 }
@@ -619,23 +550,18 @@ static void cpu_ppc_tb_start (CPUState *env)
     }
 }
 
-static always_inline uint32_t _cpu_ppc_load_decr (CPUState *env,
-                                                  uint64_t *next)
+static inline uint32_t _cpu_ppc_load_decr(CPUState *env, uint64_t next)
 {
     ppc_tb_t *tb_env = env->tb_env;
     uint32_t decr;
     int64_t diff;
 
-    diff = tb_env->decr_next - qemu_get_clock(vm_clock);
+    diff = next - qemu_get_clock(vm_clock);
     if (diff >= 0)
-        decr = muldiv64(diff, tb_env->decr_freq, ticks_per_sec);
+        decr = muldiv64(diff, tb_env->decr_freq, get_ticks_per_sec());
     else
-        decr = -muldiv64(-diff, tb_env->decr_freq, ticks_per_sec);
-#if defined(PPC_DEBUG_TB)
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: %08" PRIx32 "\n", __func__, decr);
-    }
-#endif
+        decr = -muldiv64(-diff, tb_env->decr_freq, get_ticks_per_sec());
+    LOG_TB("%s: %08" PRIx32 "\n", __func__, decr);
 
     return decr;
 }
@@ -644,14 +570,14 @@ uint32_t cpu_ppc_load_decr (CPUState *env)
 {
     ppc_tb_t *tb_env = env->tb_env;
 
-    return _cpu_ppc_load_decr(env, &tb_env->decr_next);
+    return _cpu_ppc_load_decr(env, tb_env->decr_next);
 }
 
 uint32_t cpu_ppc_load_hdecr (CPUState *env)
 {
     ppc_tb_t *tb_env = env->tb_env;
 
-    return _cpu_ppc_load_decr(env, &tb_env->hdecr_next);
+    return _cpu_ppc_load_decr(env, tb_env->hdecr_next);
 }
 
 uint64_t cpu_ppc_load_purr (CPUState *env)
@@ -661,31 +587,23 @@ uint64_t cpu_ppc_load_purr (CPUState *env)
 
     diff = qemu_get_clock(vm_clock) - tb_env->purr_start;
 
-    return tb_env->purr_load + muldiv64(diff, tb_env->tb_freq, ticks_per_sec);
+    return tb_env->purr_load + muldiv64(diff, tb_env->tb_freq, get_ticks_per_sec());
 }
 
 /* When decrementer expires,
  * all we need to do is generate or queue a CPU exception
  */
-static always_inline void cpu_ppc_decr_excp (CPUState *env)
+static inline void cpu_ppc_decr_excp(CPUState *env)
 {
     /* Raise it */
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "raise decrementer exception\n");
-    }
-#endif
+    LOG_TB("raise decrementer exception\n");
     ppc_set_irq(env, PPC_INTERRUPT_DECR, 1);
 }
 
-static always_inline void cpu_ppc_hdecr_excp (CPUState *env)
+static inline void cpu_ppc_hdecr_excp(CPUState *env)
 {
     /* Raise it */
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "raise decrementer exception\n");
-    }
-#endif
+    LOG_TB("raise decrementer exception\n");
     ppc_set_irq(env, PPC_INTERRUPT_HDECR, 1);
 }
 
@@ -698,14 +616,10 @@ static void __cpu_ppc_store_decr (CPUState *env, uint64_t *nextp,
     ppc_tb_t *tb_env = env->tb_env;
     uint64_t now, next;
 
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: %08" PRIx32 " => %08" PRIx32 "\n", __func__,
+    LOG_TB("%s: %08" PRIx32 " => %08" PRIx32 "\n", __func__,
                 decr, value);
-    }
-#endif
     now = qemu_get_clock(vm_clock);
-    next = now + muldiv64(value, ticks_per_sec, tb_env->decr_freq);
+    next = now + muldiv64(value, get_ticks_per_sec(), tb_env->decr_freq);
     if (is_excp)
         next += *nextp - now;
     if (next == now)
@@ -720,8 +634,8 @@ static void __cpu_ppc_store_decr (CPUState *env, uint64_t *nextp,
         (*raise_excp)(env);
 }
 
-static always_inline void _cpu_ppc_store_decr (CPUState *env, uint32_t decr,
-                                               uint32_t value, int is_excp)
+static inline void _cpu_ppc_store_decr(CPUState *env, uint32_t decr,
+                                       uint32_t value, int is_excp)
 {
     ppc_tb_t *tb_env = env->tb_env;
 
@@ -739,8 +653,8 @@ static void cpu_ppc_decr_cb (void *opaque)
     _cpu_ppc_store_decr(opaque, 0x00000000, 0xFFFFFFFF, 1);
 }
 
-static always_inline void _cpu_ppc_store_hdecr (CPUState *env, uint32_t hdecr,
-                                                uint32_t value, int is_excp)
+static inline void _cpu_ppc_store_hdecr(CPUState *env, uint32_t hdecr,
+                                        uint32_t value, int is_excp)
 {
     ppc_tb_t *tb_env = env->tb_env;
 
@@ -790,8 +704,6 @@ clk_setup_cb cpu_ppc_tb_init (CPUState *env, uint32_t freq)
     ppc_tb_t *tb_env;
 
     tb_env = qemu_mallocz(sizeof(ppc_tb_t));
-    if (tb_env == NULL)
-        return NULL;
     env->tb_env = tb_env;
     /* Create new timer */
     tb_env->decr_timer = qemu_new_timer(vm_clock, &cpu_ppc_decr_cb, env);
@@ -808,10 +720,12 @@ clk_setup_cb cpu_ppc_tb_init (CPUState *env, uint32_t freq)
 }
 
 /* Specific helpers for POWER & PowerPC 601 RTC */
-clk_setup_cb cpu_ppc601_rtc_init (CPUState *env)
+#if 0
+static clk_setup_cb cpu_ppc601_rtc_init (CPUState *env)
 {
     return cpu_ppc_tb_init(env, 7812500);
 }
+#endif
 
 void cpu_ppc601_store_rtcu (CPUState *env, uint32_t value)
 {
@@ -875,20 +789,16 @@ static void cpu_4xx_fit_cb (void *opaque)
         /* Cannot occur, but makes gcc happy */
         return;
     }
-    next = now + muldiv64(next, ticks_per_sec, tb_env->tb_freq);
+    next = now + muldiv64(next, get_ticks_per_sec(), tb_env->tb_freq);
     if (next == now)
         next++;
     qemu_mod_timer(ppcemb_timer->fit_timer, next);
     env->spr[SPR_40x_TSR] |= 1 << 26;
     if ((env->spr[SPR_40x_TCR] >> 23) & 0x1)
         ppc_set_irq(env, PPC_INTERRUPT_FIT, 1);
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: ir %d TCR " ADDRX " TSR " ADDRX "\n", __func__,
-                (int)((env->spr[SPR_40x_TCR] >> 23) & 0x1),
-                env->spr[SPR_40x_TCR], env->spr[SPR_40x_TSR]);
-    }
-#endif
+    LOG_TB("%s: ir %d TCR " TARGET_FMT_lx " TSR " TARGET_FMT_lx "\n", __func__,
+           (int)((env->spr[SPR_40x_TCR] >> 23) & 0x1),
+           env->spr[SPR_40x_TCR], env->spr[SPR_40x_TSR]);
 }
 
 /* Programmable interval timer */
@@ -902,22 +812,14 @@ static void start_stop_pit (CPUState *env, ppc_tb_t *tb_env, int is_excp)
         !((env->spr[SPR_40x_TCR] >> 26) & 0x1) ||
         (is_excp && !((env->spr[SPR_40x_TCR] >> 22) & 0x1))) {
         /* Stop PIT */
-#ifdef PPC_DEBUG_TB
-        if (loglevel != 0) {
-            fprintf(logfile, "%s: stop PIT\n", __func__);
-        }
-#endif
+        LOG_TB("%s: stop PIT\n", __func__);
         qemu_del_timer(tb_env->decr_timer);
     } else {
-#ifdef PPC_DEBUG_TB
-        if (loglevel != 0) {
-            fprintf(logfile, "%s: start PIT %016" PRIx64 "\n",
+        LOG_TB("%s: start PIT %016" PRIx64 "\n",
                     __func__, ppcemb_timer->pit_reload);
-        }
-#endif
         now = qemu_get_clock(vm_clock);
         next = now + muldiv64(ppcemb_timer->pit_reload,
-                              ticks_per_sec, tb_env->decr_freq);
+                              get_ticks_per_sec(), tb_env->decr_freq);
         if (is_excp)
             next += tb_env->decr_next - now;
         if (next == now)
@@ -940,16 +842,12 @@ static void cpu_4xx_pit_cb (void *opaque)
     if ((env->spr[SPR_40x_TCR] >> 26) & 0x1)
         ppc_set_irq(env, PPC_INTERRUPT_PIT, 1);
     start_stop_pit(env, tb_env, 1);
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: ar %d ir %d TCR " ADDRX " TSR " ADDRX " "
-                "%016" PRIx64 "\n", __func__,
-                (int)((env->spr[SPR_40x_TCR] >> 22) & 0x1),
-                (int)((env->spr[SPR_40x_TCR] >> 26) & 0x1),
-                env->spr[SPR_40x_TCR], env->spr[SPR_40x_TSR],
-                ppcemb_timer->pit_reload);
-    }
-#endif
+    LOG_TB("%s: ar %d ir %d TCR " TARGET_FMT_lx " TSR " TARGET_FMT_lx " "
+           "%016" PRIx64 "\n", __func__,
+           (int)((env->spr[SPR_40x_TCR] >> 22) & 0x1),
+           (int)((env->spr[SPR_40x_TCR] >> 26) & 0x1),
+           env->spr[SPR_40x_TCR], env->spr[SPR_40x_TSR],
+           ppcemb_timer->pit_reload);
 }
 
 /* Watchdog timer */
@@ -981,15 +879,11 @@ static void cpu_4xx_wdt_cb (void *opaque)
         /* Cannot occur, but makes gcc happy */
         return;
     }
-    next = now + muldiv64(next, ticks_per_sec, tb_env->decr_freq);
+    next = now + muldiv64(next, get_ticks_per_sec(), tb_env->decr_freq);
     if (next == now)
         next++;
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: TCR " ADDRX " TSR " ADDRX "\n", __func__,
-                env->spr[SPR_40x_TCR], env->spr[SPR_40x_TSR]);
-    }
-#endif
+    LOG_TB("%s: TCR " TARGET_FMT_lx " TSR " TARGET_FMT_lx "\n", __func__,
+           env->spr[SPR_40x_TCR], env->spr[SPR_40x_TSR]);
     switch ((env->spr[SPR_40x_TSR] >> 30) & 0x3) {
     case 0x0:
     case 0x1:
@@ -1031,11 +925,7 @@ void store_40x_pit (CPUState *env, target_ulong val)
 
     tb_env = env->tb_env;
     ppcemb_timer = tb_env->opaque;
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s val" ADDRX "\n", __func__, val);
-    }
-#endif
+    LOG_TB("%s val" TARGET_FMT_lx "\n", __func__, val);
     ppcemb_timer->pit_reload = val;
     start_stop_pit(env, tb_env, 0);
 }
@@ -1047,11 +937,7 @@ target_ulong load_40x_pit (CPUState *env)
 
 void store_booke_tsr (CPUState *env, target_ulong val)
 {
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: val " ADDRX "\n", __func__, val);
-    }
-#endif
+    LOG_TB("%s: val " TARGET_FMT_lx "\n", __func__, val);
     env->spr[SPR_40x_TSR] &= ~(val & 0xFC000000);
     if (val & 0x80000000)
         ppc_set_irq(env, PPC_INTERRUPT_PIT, 0);
@@ -1062,11 +948,7 @@ void store_booke_tcr (CPUState *env, target_ulong val)
     ppc_tb_t *tb_env;
 
     tb_env = env->tb_env;
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s: val " ADDRX "\n", __func__, val);
-    }
-#endif
+    LOG_TB("%s: val " TARGET_FMT_lx "\n", __func__, val);
     env->spr[SPR_40x_TCR] = val & 0xFFC00000;
     start_stop_pit(env, tb_env, 1);
     cpu_4xx_wdt_cb(env);
@@ -1077,12 +959,8 @@ static void ppc_emb_set_tb_clk (void *opaque, uint32_t freq)
     CPUState *env = opaque;
     ppc_tb_t *tb_env = env->tb_env;
 
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s set new frequency to %" PRIu32 "\n", __func__,
+    LOG_TB("%s set new frequency to %" PRIu32 "\n", __func__,
                 freq);
-    }
-#endif
     tb_env->tb_freq = freq;
     tb_env->decr_freq = freq;
     /* XXX: we should also update all timers */
@@ -1094,19 +972,12 @@ clk_setup_cb ppc_emb_timers_init (CPUState *env, uint32_t freq)
     ppcemb_timer_t *ppcemb_timer;
 
     tb_env = qemu_mallocz(sizeof(ppc_tb_t));
-    if (tb_env == NULL) {
-        return NULL;
-    }
     env->tb_env = tb_env;
     ppcemb_timer = qemu_mallocz(sizeof(ppcemb_timer_t));
     tb_env->tb_freq = freq;
     tb_env->decr_freq = freq;
     tb_env->opaque = ppcemb_timer;
-#ifdef PPC_DEBUG_TB
-    if (loglevel != 0) {
-        fprintf(logfile, "%s freq %" PRIu32 "\n", __func__, freq);
-    }
-#endif
+    LOG_TB("%s freq %" PRIu32 "\n", __func__, freq);
     if (ppcemb_timer != NULL) {
         /* We use decr timer for PIT */
         tb_env->decr_timer = qemu_new_timer(vm_clock, &cpu_4xx_pit_cb, env);
@@ -1207,8 +1078,6 @@ int ppc_dcr_init (CPUState *env, int (*read_error)(int dcrn),
     ppc_dcr_t *dcr_env;
 
     dcr_env = qemu_mallocz(sizeof(ppc_dcr_t));
-    if (dcr_env == NULL)
-        return -1;
     dcr_env->read_error = read_error;
     dcr_env->write_error = write_error;
     env->dcr_env = dcr_env;
@@ -1219,7 +1088,7 @@ int ppc_dcr_init (CPUState *env, int (*read_error)(int dcrn),
 #if 0
 /*****************************************************************************/
 /* Handle system reset (for now, just stop emulation) */
-void cpu_ppc_reset (CPUState *env)
+void cpu_reset(CPUState *env)
 {
     printf("Reset asked... Stop emulation\n");
     abort();
@@ -1305,7 +1174,7 @@ uint32_t NVRAM_get_lword (nvram_t *nvram, uint32_t addr)
 }
 
 void NVRAM_set_string (nvram_t *nvram, uint32_t addr,
-                       const unsigned char *str, uint32_t max)
+                       const char *str, uint32_t max)
 {
     int i;
 
@@ -1345,7 +1214,7 @@ static uint16_t NVRAM_crc_update (uint16_t prev, uint16_t value)
     return tmp;
 }
 
-uint16_t NVRAM_compute_crc (nvram_t *nvram, uint32_t start, uint32_t count)
+static uint16_t NVRAM_compute_crc (nvram_t *nvram, uint32_t start, uint32_t count)
 {
     uint32_t i;
     uint16_t crc = 0xFFFF;
@@ -1366,7 +1235,7 @@ uint16_t NVRAM_compute_crc (nvram_t *nvram, uint32_t start, uint32_t count)
 #define CMDLINE_ADDR 0x017ff000
 
 int PPC_NVRAM_set_params (nvram_t *nvram, uint16_t NVRAM_size,
-                          const unsigned char *arch,
+                          const char *arch,
                           uint32_t RAM_size, int boot_device,
                           uint32_t kernel_image, uint32_t kernel_size,
                           const char *cmdline,
@@ -1387,7 +1256,7 @@ int PPC_NVRAM_set_params (nvram_t *nvram, uint16_t NVRAM_size,
     NVRAM_set_lword(nvram,  0x3C, kernel_size);
     if (cmdline) {
         /* XXX: put the cmdline in NVRAM too ? */
-        strcpy(phys_ram_base + CMDLINE_ADDR, cmdline);
+        pstrcpy_targphys("cmdline", CMDLINE_ADDR, RAM_size - CMDLINE_ADDR, cmdline);
         NVRAM_set_lword(nvram,  0x40, CMDLINE_ADDR);
         NVRAM_set_lword(nvram,  0x44, strlen(cmdline));
     } else {

@@ -25,6 +25,7 @@
 #include "hw.h"
 #include "ppc_mac.h"
 #include "pci.h"
+#include "escc.h"
 
 typedef struct macio_state_t macio_state_t;
 struct macio_state_t {
@@ -32,13 +33,14 @@ struct macio_state_t {
     int pic_mem_index;
     int dbdma_mem_index;
     int cuda_mem_index;
+    int escc_mem_index;
     void *nvram;
     int nb_ide;
     int ide_mem_index[4];
 };
 
 static void macio_map (PCIDevice *pci_dev, int region_num,
-                       uint32_t addr, uint32_t size, int type)
+                       pcibus_t addr, pcibus_t size, int type)
 {
     macio_state_t *macio_state;
     int i;
@@ -59,6 +61,10 @@ static void macio_map (PCIDevice *pci_dev, int region_num,
         cpu_register_physical_memory(addr + 0x08000, 0x1000,
                                      macio_state->dbdma_mem_index);
     }
+    if (macio_state->escc_mem_index >= 0) {
+        cpu_register_physical_memory(addr + 0x13000, ESCC_SIZE << 4,
+                                     macio_state->escc_mem_index);
+    }
     if (macio_state->cuda_mem_index >= 0) {
         cpu_register_physical_memory(addr + 0x16000, 0x2000,
                                      macio_state->cuda_mem_index);
@@ -75,7 +81,7 @@ static void macio_map (PCIDevice *pci_dev, int region_num,
 
 void macio_init (PCIBus *bus, int device_id, int is_oldworld, int pic_mem_index,
                  int dbdma_mem_index, int cuda_mem_index, void *nvram,
-                 int nb_ide, int *ide_mem_index)
+                 int nb_ide, int *ide_mem_index, int escc_mem_index)
 {
     PCIDevice *d;
     macio_state_t *macio_state;
@@ -89,6 +95,7 @@ void macio_init (PCIBus *bus, int device_id, int is_oldworld, int pic_mem_index,
     macio_state->pic_mem_index = pic_mem_index;
     macio_state->dbdma_mem_index = dbdma_mem_index;
     macio_state->cuda_mem_index = cuda_mem_index;
+    macio_state->escc_mem_index = escc_mem_index;
     macio_state->nvram = nvram;
     if (nb_ide > 4)
         nb_ide = 4;
@@ -99,17 +106,14 @@ void macio_init (PCIBus *bus, int device_id, int is_oldworld, int pic_mem_index,
         macio_state->ide_mem_index[i] = -1;
     /* Note: this code is strongly inspirated from the corresponding code
        in PearPC */
-    d->config[0x00] = 0x6b; // vendor_id
-    d->config[0x01] = 0x10;
-    d->config[0x02] = device_id;
-    d->config[0x03] = device_id >> 8;
 
-    d->config[0x0a] = 0x00; // class_sub = pci2pci
-    d->config[0x0b] = 0xff; // class_base = bridge
-    d->config[0x0e] = 0x00; // header_type
+    pci_config_set_vendor_id(d->config, PCI_VENDOR_ID_APPLE);
+    pci_config_set_device_id(d->config, device_id);
+    pci_config_set_class(d->config, PCI_CLASS_OTHERS << 8);
+    d->config[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL; // header_type
 
     d->config[0x3d] = 0x01; // interrupt on pin 1
 
-    pci_register_io_region(d, 0, 0x80000,
-                           PCI_ADDRESS_SPACE_MEM, macio_map);
+    pci_register_bar(d, 0, 0x80000,
+                           PCI_BASE_ADDRESS_SPACE_MEMORY, macio_map);
 }

@@ -29,15 +29,15 @@
 //#define DEBUG
 
 typedef struct SMBusEEPROMDevice {
-    SMBusDevice dev;
-    uint8_t *data;
+    SMBusDevice smbusdev;
+    void *data;
     uint8_t offset;
 } SMBusEEPROMDevice;
 
 static void eeprom_quick_cmd(SMBusDevice *dev, uint8_t read)
 {
 #ifdef DEBUG
-    printf("eeprom_quick_cmd: addr=0x%02x read=%d\n", dev->addr, read);
+    printf("eeprom_quick_cmd: addr=0x%02x read=%d\n", dev->i2c.address, read);
 #endif
 }
 
@@ -45,7 +45,8 @@ static void eeprom_send_byte(SMBusDevice *dev, uint8_t val)
 {
     SMBusEEPROMDevice *eeprom = (SMBusEEPROMDevice *) dev;
 #ifdef DEBUG
-    printf("eeprom_send_byte: addr=0x%02x val=0x%02x\n", dev->addr, val);
+    printf("eeprom_send_byte: addr=0x%02x val=0x%02x\n",
+           dev->i2c.address, val);
 #endif
     eeprom->offset = val;
 }
@@ -53,9 +54,11 @@ static void eeprom_send_byte(SMBusDevice *dev, uint8_t val)
 static uint8_t eeprom_receive_byte(SMBusDevice *dev)
 {
     SMBusEEPROMDevice *eeprom = (SMBusEEPROMDevice *) dev;
-    uint8_t val = eeprom->data[eeprom->offset++];
+    uint8_t *data = eeprom->data;
+    uint8_t val = data[eeprom->offset++];
 #ifdef DEBUG
-    printf("eeprom_receive_byte: addr=0x%02x val=0x%02x\n", dev->addr, val);
+    printf("eeprom_receive_byte: addr=0x%02x val=0x%02x\n",
+           dev->i2c.address, val);
 #endif
     return val;
 }
@@ -65,8 +68,8 @@ static void eeprom_write_data(SMBusDevice *dev, uint8_t cmd, uint8_t *buf, int l
     SMBusEEPROMDevice *eeprom = (SMBusEEPROMDevice *) dev;
     int n;
 #ifdef DEBUG
-    printf("eeprom_write_byte: addr=0x%02x cmd=0x%02x val=0x%02x\n", dev->addr,
-           cmd, buf[0]);
+    printf("eeprom_write_byte: addr=0x%02x cmd=0x%02x val=0x%02x\n",
+           dev->i2c.address, cmd, buf[0]);
 #endif
     /* An page write operation is not a valid SMBus command.
        It is a block write without a length byte.  Fortunately we
@@ -93,18 +96,32 @@ static uint8_t eeprom_read_data(SMBusDevice *dev, uint8_t cmd, int n)
     return eeprom_receive_byte(dev);
 }
 
-void smbus_eeprom_device_init(i2c_bus *bus, uint8_t addr, uint8_t *buf)
+static int smbus_eeprom_init(SMBusDevice *dev)
 {
-    SMBusEEPROMDevice *eeprom;
+    SMBusEEPROMDevice *eeprom = (SMBusEEPROMDevice *)dev;
 
-    eeprom = (SMBusEEPROMDevice *)smbus_device_init(bus, addr,
-        sizeof(SMBusEEPROMDevice));
-
-    eeprom->dev.quick_cmd = eeprom_quick_cmd;
-    eeprom->dev.send_byte = eeprom_send_byte;
-    eeprom->dev.receive_byte = eeprom_receive_byte;
-    eeprom->dev.write_data = eeprom_write_data;
-    eeprom->dev.read_data = eeprom_read_data;
-    eeprom->data = buf;
     eeprom->offset = 0;
+    return 0;
 }
+
+static SMBusDeviceInfo smbus_eeprom_info = {
+    .i2c.qdev.name = "smbus-eeprom",
+    .i2c.qdev.size = sizeof(SMBusEEPROMDevice),
+    .i2c.qdev.props = (Property[]) {
+        DEFINE_PROP_PTR("data", SMBusEEPROMDevice, data),
+        DEFINE_PROP_END_OF_LIST(),
+    },
+    .init = smbus_eeprom_init,
+    .quick_cmd = eeprom_quick_cmd,
+    .send_byte = eeprom_send_byte,
+    .receive_byte = eeprom_receive_byte,
+    .write_data = eeprom_write_data,
+    .read_data = eeprom_read_data
+};
+
+static void smbus_eeprom_register_devices(void)
+{
+    smbus_register_device(&smbus_eeprom_info);
+}
+
+device_init(smbus_eeprom_register_devices)

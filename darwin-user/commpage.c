@@ -14,8 +14,7 @@
  *  GNU General Public License for more details.
  *
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include <fcntl.h>
 #include <stdio.h>
@@ -34,9 +33,9 @@
 //#define DEBUG_COMMPAGE
 
 #ifdef DEBUG_COMMPAGE
-# define DPRINTF(...) do { if(loglevel) fprintf(logfile, __VA_ARGS__); printf(__VA_ARGS__); } while(0)
+# define DPRINTF(...) do { qemu_log(__VA_ARGS__); printf(__VA_ARGS__); } while(0)
 #else
-# define DPRINTF(...) do { if(loglevel) fprintf(logfile, __VA_ARGS__); } while(0)
+# define DPRINTF(...) do { qemu_log(__VA_ARGS__); } while(0)
 #endif
 
 /********************************************************************
@@ -180,7 +179,7 @@ static inline void install_commpage_backdoor_for_entry(struct commpage_entry ent
  */
 void commpage_init(void)
 {
-#if (defined(__i386__) ^ defined(TARGET_I386)) || (defined(__powerpc__) ^ defined(TARGET_PPC))
+#if (defined(__i386__) ^ defined(TARGET_I386)) || (defined(_ARCH_PPC) ^ defined(TARGET_PPC))
     int i;
     void * commpage = (void *)target_mmap( COMMPAGE_START, COMMPAGE_SIZE,
                            PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -191,7 +190,7 @@ void commpage_init(void)
 
     /* XXX: commpage data not handled */
 
-    for(i = 0; i < sizeof(commpage_entries)/sizeof(commpage_entries[0]); i++)
+    for(i = 0; i < ARRAY_SIZE(commpage_entries); i++)
         install_commpage_backdoor_for_entry(commpage_entries[i]);
 #else
     /* simply map our pages so they can be executed
@@ -329,7 +328,7 @@ do_commpage(void *cpu_env, int num, uint32_t arg1, uint32_t arg2, uint32_t arg3,
 
     num = num-COMMPAGE_START-2;
 
-    for(i = 0; i < sizeof(commpage_entries)/sizeof(commpage_entries[0]); i++) {
+    for(i = 0; i < ARRAY_SIZE(commpage_entries); i++) {
         if( num == commpage_code_num(&commpage_entries[i]) )
         {
             DPRINTF("commpage: %s %s\n", commpage_entries[i].name, commpage_is_indirect(&commpage_entries[i]) ? "[indirect]" : "[direct]");

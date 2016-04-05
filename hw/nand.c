@@ -45,7 +45,7 @@
 # define MAX_PAGE		0x800
 # define MAX_OOB		0x40
 
-struct nand_flash_s {
+struct NANDFlashState {
     uint8_t manf_id, chip_id;
     int size, pages;
     int page_shift, oob_shift, erase_shift, addr_shift;
@@ -64,9 +64,9 @@ struct nand_flash_s {
     int status;
     int offset;
 
-    void (*blk_write)(struct nand_flash_s *s);
-    void (*blk_erase)(struct nand_flash_s *s);
-    void (*blk_load)(struct nand_flash_s *s, uint32_t addr, int offset);
+    void (*blk_write)(NANDFlashState *s);
+    void (*blk_erase)(NANDFlashState *s);
+    void (*blk_load)(NANDFlashState *s, uint32_t addr, int offset);
 };
 
 # define NAND_NO_AUTOINCR	0x00000001
@@ -106,7 +106,7 @@ struct nand_flash_s {
 # include "nand.c"
 
 /* Information based on Linux drivers/mtd/nand/nand_ids.c */
-struct nand_info_s {
+static const struct {
     int size;
     int width;
     int page_shift;
@@ -200,7 +200,7 @@ struct nand_info_s {
     [0xc5] = { 2048,	16,	0, 0, LP_OPTIONS16 },
 };
 
-static void nand_reset(struct nand_flash_s *s)
+static void nand_reset(NANDFlashState *s)
 {
     s->cmd = NAND_CMD_READ0;
     s->addr = 0;
@@ -210,7 +210,7 @@ static void nand_reset(struct nand_flash_s *s)
     s->status &= NAND_IOSTATUS_UNPROTCT;
 }
 
-static void nand_command(struct nand_flash_s *s)
+static void nand_command(NANDFlashState *s)
 {
     switch (s->cmd) {
     case NAND_CMD_READ0:
@@ -279,7 +279,7 @@ static void nand_command(struct nand_flash_s *s)
 
 static void nand_save(QEMUFile *f, void *opaque)
 {
-    struct nand_flash_s *s = (struct nand_flash_s *) opaque;
+    NANDFlashState *s = (NANDFlashState *) opaque;
     qemu_put_byte(f, s->cle);
     qemu_put_byte(f, s->ale);
     qemu_put_byte(f, s->ce);
@@ -299,7 +299,7 @@ static void nand_save(QEMUFile *f, void *opaque)
 
 static int nand_load(QEMUFile *f, void *opaque, int version_id)
 {
-    struct nand_flash_s *s = (struct nand_flash_s *) opaque;
+    NANDFlashState *s = (NANDFlashState *) opaque;
     s->cle = qemu_get_byte(f);
     s->ale = qemu_get_byte(f);
     s->ce = qemu_get_byte(f);
@@ -319,15 +319,13 @@ static int nand_load(QEMUFile *f, void *opaque, int version_id)
     return 0;
 }
 
-static int nand_iid = 0;
-
 /*
  * Chip inputs are CLE, ALE, CE, WP, GND and eight I/O pins.  Chip
  * outputs are R/B and eight I/O pins.
  *
  * CE, WP and R/B are active low.
  */
-void nand_setpins(struct nand_flash_s *s,
+void nand_setpins(NANDFlashState *s,
                 int cle, int ale, int ce, int wp, int gnd)
 {
     s->cle = cle;
@@ -341,12 +339,12 @@ void nand_setpins(struct nand_flash_s *s,
         s->status &= ~NAND_IOSTATUS_UNPROTCT;
 }
 
-void nand_getpins(struct nand_flash_s *s, int *rb)
+void nand_getpins(NANDFlashState *s, int *rb)
 {
     *rb = 1;
 }
 
-void nand_setio(struct nand_flash_s *s, uint8_t value)
+void nand_setio(NANDFlashState *s, uint8_t value)
 {
     if (!s->ce && s->cle) {
         if (nand_flash_ids[s->chip_id].options & NAND_SAMSUNG_LP) {
@@ -417,7 +415,7 @@ void nand_setio(struct nand_flash_s *s, uint8_t value)
     }
 }
 
-uint8_t nand_getio(struct nand_flash_s *s)
+uint8_t nand_getio(NANDFlashState *s)
 {
     int offset;
 
@@ -440,24 +438,20 @@ uint8_t nand_getio(struct nand_flash_s *s)
     return *(s->ioaddr ++);
 }
 
-struct nand_flash_s *nand_init(int manf_id, int chip_id)
+NANDFlashState *nand_init(int manf_id, int chip_id)
 {
     int pagesize;
-    struct nand_flash_s *s;
-    int index;
+    NANDFlashState *s;
+    DriveInfo *dinfo;
 
     if (nand_flash_ids[chip_id].size == 0) {
-        cpu_abort(cpu_single_env, "%s: Unsupported NAND chip ID.\n",
-                        __FUNCTION__);
-    }
-    index = drive_get_index(IF_MTD, 0, 0);
-    if (index == -1) {
-        cpu_abort(cpu_single_env, "%s: missing MTD device\n",
-                        __FUNCTION__);
+        hw_error("%s: Unsupported NAND chip ID.\n", __FUNCTION__);
     }
 
-    s = (struct nand_flash_s *) qemu_mallocz(sizeof(struct nand_flash_s));
-    s->bdrv = drives_table[index].bdrv;
+    s = (NANDFlashState *) qemu_mallocz(sizeof(NANDFlashState));
+    dinfo = drive_get(IF_MTD, 0, 0);
+    if (dinfo)
+        s->bdrv = dinfo->bdrv;
     s->manf_id = manf_id;
     s->chip_id = chip_id;
     s->size = nand_flash_ids[s->chip_id].size << 20;
@@ -480,8 +474,7 @@ struct nand_flash_s *nand_init(int manf_id, int chip_id)
         nand_init_2048(s);
         break;
     default:
-        cpu_abort(cpu_single_env, "%s: Unsupported NAND block size.\n",
-                        __FUNCTION__);
+        hw_error("%s: Unsupported NAND block size.\n", __FUNCTION__);
     }
 
     pagesize = 1 << s->oob_shift;
@@ -497,13 +490,16 @@ struct nand_flash_s *nand_init(int manf_id, int chip_id)
     if (pagesize)
         s->storage = (uint8_t *) memset(qemu_malloc(s->pages * pagesize),
                         0xff, s->pages * pagesize);
+    /* Give s->ioaddr a sane value in case we save state before it
+       is used.  */
+    s->ioaddr = s->io;
 
-    register_savevm("nand", nand_iid ++, 0, nand_save, nand_load, s);
+    register_savevm("nand", -1, 0, nand_save, nand_load, s);
 
     return s;
 }
 
-void nand_done(struct nand_flash_s *s)
+void nand_done(NANDFlashState *s)
 {
     if (s->bdrv) {
         bdrv_close(s->bdrv);
@@ -511,15 +507,15 @@ void nand_done(struct nand_flash_s *s)
     }
 
     if (!s->bdrv || s->mem_oob)
-        free(s->storage);
+        qemu_free(s->storage);
 
-    free(s);
+    qemu_free(s);
 }
 
 #else
 
 /* Program a single page */
-static void glue(nand_blk_write_, PAGE_SIZE)(struct nand_flash_s *s)
+static void glue(nand_blk_write_, PAGE_SIZE)(NANDFlashState *s)
 {
     uint32_t off, page, sector, soff;
     uint8_t iobuf[(PAGE_SECTORS + 2) * 0x200];
@@ -565,7 +561,7 @@ static void glue(nand_blk_write_, PAGE_SIZE)(struct nand_flash_s *s)
 }
 
 /* Erase a single block */
-static void glue(nand_blk_erase_, PAGE_SIZE)(struct nand_flash_s *s)
+static void glue(nand_blk_erase_, PAGE_SIZE)(NANDFlashState *s)
 {
     uint32_t i, page, addr;
     uint8_t iobuf[0x200] = { [0 ... 0x1ff] = 0xff, };
@@ -610,7 +606,7 @@ static void glue(nand_blk_erase_, PAGE_SIZE)(struct nand_flash_s *s)
     }
 }
 
-static void glue(nand_blk_load_, PAGE_SIZE)(struct nand_flash_s *s,
+static void glue(nand_blk_load_, PAGE_SIZE)(NANDFlashState *s,
                 uint32_t addr, int offset)
 {
     if (PAGE(addr) >= s->pages)
@@ -642,7 +638,7 @@ static void glue(nand_blk_load_, PAGE_SIZE)(struct nand_flash_s *s,
     s->addr += PAGE_SIZE;
 }
 
-static void glue(nand_init_, PAGE_SIZE)(struct nand_flash_s *s)
+static void glue(nand_init_, PAGE_SIZE)(NANDFlashState *s)
 {
     s->oob_shift = PAGE_SHIFT - 5;
     s->pages = s->size >> PAGE_SHIFT;

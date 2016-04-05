@@ -14,8 +14,7 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include <stdarg.h>
 #include <stdlib.h>
@@ -23,35 +22,21 @@
 #include <string.h>
 #include <inttypes.h>
 #include <signal.h>
-#include <assert.h>
 
 #include "cpu.h"
 #include "exec-all.h"
 #include "qemu-common.h"
 
 //#define DEBUG_MMU
+//#define DEBUG_FEATURES
 
-typedef struct sparc_def_t sparc_def_t;
-
-struct sparc_def_t {
-    const unsigned char *name;
-    target_ulong iu_version;
-    uint32_t fpu_version;
-    uint32_t mmu_version;
-    uint32_t mmu_bm;
-    uint32_t mmu_ctpr_mask;
-    uint32_t mmu_cxr_mask;
-    uint32_t mmu_sfsr_mask;
-    uint32_t mmu_trcr_mask;
-};
-
-static const sparc_def_t *cpu_sparc_find_by_name(const unsigned char *name);
+static int cpu_sparc_find_by_name(sparc_def_t *cpu_def, const char *cpu_model);
 
 /* Sparc MMU emulation */
 
 /* thread support */
 
-spinlock_t global_cpu_lock = SPIN_LOCK_UNLOCKED;
+static spinlock_t global_cpu_lock = SPIN_LOCK_UNLOCKED;
 
 void cpu_lock(void)
 {
@@ -65,13 +50,13 @@ void cpu_unlock(void)
 
 #if defined(CONFIG_USER_ONLY)
 
-int cpu_sparc_handle_mmu_fault(CPUState *env, target_ulong address, int rw,
+int cpu_sparc_handle_mmu_fault(CPUState *env1, target_ulong address, int rw,
                                int mmu_idx, int is_softmmu)
 {
     if (rw & 2)
-        env->exception_index = TT_TFAULT;
+        env1->exception_index = TT_TFAULT;
     else
-        env->exception_index = TT_DFAULT;
+        env1->exception_index = TT_DFAULT;
     return 1;
 }
 
@@ -82,14 +67,14 @@ int cpu_sparc_handle_mmu_fault(CPUState *env, target_ulong address, int rw,
  * Sparc V8 Reference MMU (SRMMU)
  */
 static const int access_table[8][8] = {
-    { 0, 0, 0, 0, 2, 0, 3, 3 },
-    { 0, 0, 0, 0, 2, 0, 0, 0 },
-    { 2, 2, 0, 0, 0, 2, 3, 3 },
-    { 2, 2, 0, 0, 0, 2, 0, 0 },
-    { 2, 0, 2, 0, 2, 2, 3, 3 },
-    { 2, 0, 2, 0, 2, 0, 2, 0 },
-    { 2, 2, 2, 0, 2, 2, 3, 3 },
-    { 2, 2, 2, 0, 2, 2, 2, 0 }
+    { 0, 0, 0, 0, 8, 0, 12, 12 },
+    { 0, 0, 0, 0, 8, 0, 0, 0 },
+    { 8, 8, 0, 0, 0, 8, 12, 12 },
+    { 8, 8, 0, 0, 0, 8, 0, 0 },
+    { 8, 0, 8, 0, 8, 8, 12, 12 },
+    { 8, 0, 8, 0, 8, 0, 8, 0 },
+    { 8, 8, 8, 0, 8, 8, 12, 12 },
+    { 8, 8, 8, 0, 8, 8, 8, 0 }
 };
 
 static const int perm_table[2][8] = {
@@ -131,7 +116,7 @@ static int get_physical_address(CPUState *env, target_phys_addr_t *physical,
 
     if ((env->mmuregs[0] & MMU_E) == 0) { /* MMU disabled */
         // Boot mode: instruction fetches are taken from PROM
-        if (rw == 2 && (env->mmuregs[0] & env->mmu_bm)) {
+        if (rw == 2 && (env->mmuregs[0] & env->def->mmu_bm)) {
             *physical = env->prom_addr | (address & 0x7ffffULL);
             *prot = PAGE_READ | PAGE_EXEC;
             return 0;
@@ -190,7 +175,8 @@ static int get_physical_address(CPUState *env, target_phys_addr_t *physical,
                     return (3 << 8) | (4 << 2);
                 case 2: /* L3 PTE */
                     virt_addr = address & TARGET_PAGE_MASK;
-                    page_offset = (address & TARGET_PAGE_MASK) & (TARGET_PAGE_SIZE - 1);
+                    page_offset = (address & TARGET_PAGE_MASK) &
+                        (TARGET_PAGE_SIZE - 1);
                 }
                 break;
             case 2: /* L2 PTE */
@@ -240,7 +226,8 @@ int cpu_sparc_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
     target_ulong vaddr;
     int error_code = 0, prot, ret = 0, access_index;
 
-    error_code = get_physical_address(env, &paddr, &prot, &access_index, address, rw, mmu_idx);
+    error_code = get_physical_address(env, &paddr, &prot, &access_index,
+                                      address, rw, mmu_idx);
     if (error_code == 0) {
         vaddr = address & TARGET_PAGE_MASK;
         paddr &= TARGET_PAGE_MASK;
@@ -381,121 +368,167 @@ void dump_mmu(CPUState *env)
 #endif /* DEBUG_MMU */
 
 #else /* !TARGET_SPARC64 */
+
+// 41 bit physical address space
+static inline target_phys_addr_t ultrasparc_truncate_physical(uint64_t x)
+{
+    return x & 0x1ffffffffffULL;
+}
+
 /*
  * UltraSparc IIi I/DMMUs
  */
-static int get_physical_address_data(CPUState *env, target_phys_addr_t *physical, int *prot,
-                          int *access_index, target_ulong address, int rw,
-                          int is_user)
+
+static inline int compare_masked(uint64_t x, uint64_t y, uint64_t mask)
 {
-    target_ulong mask;
+    return (x & mask) == (y & mask);
+}
+
+// Returns true if TTE tag is valid and matches virtual address value in context
+// requires virtual address mask value calculated from TTE entry size
+static inline int ultrasparc_tag_match(SparcTLBEntry *tlb,
+                                       uint64_t address, uint64_t context,
+                                       target_phys_addr_t *physical,
+                                       int is_nucleus)
+{
+    uint64_t mask;
+
+    switch ((tlb->tte >> 61) & 3) {
+    default:
+    case 0x0: // 8k
+        mask = 0xffffffffffffe000ULL;
+        break;
+    case 0x1: // 64k
+        mask = 0xffffffffffff0000ULL;
+        break;
+    case 0x2: // 512k
+        mask = 0xfffffffffff80000ULL;
+        break;
+    case 0x3: // 4M
+        mask = 0xffffffffffc00000ULL;
+        break;
+    }
+
+    // valid, context match, virtual address match?
+    if (TTE_IS_VALID(tlb->tte) &&
+        ((is_nucleus && compare_masked(0, tlb->tag, 0x1fff))
+         || TTE_IS_GLOBAL(tlb->tte) || compare_masked(context, tlb->tag, 0x1fff))
+        && compare_masked(address, tlb->tag, mask))
+    {
+        // decode physical address
+        *physical = ((tlb->tte & mask) | (address & ~mask)) & 0x1ffffffe000ULL;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int get_physical_address_data(CPUState *env,
+                                     target_phys_addr_t *physical, int *prot,
+                                     target_ulong address, int rw, int is_user)
+{
     unsigned int i;
+    uint64_t context;
+    int is_nucleus;
 
     if ((env->lsu & DMMU_E) == 0) { /* DMMU disabled */
-        *physical = address;
+        *physical = ultrasparc_truncate_physical(address);
         *prot = PAGE_READ | PAGE_WRITE;
         return 0;
     }
 
+    context = env->dmmu.mmu_primary_context & 0x1fff;
+    is_nucleus = env->tl > 0;
+
     for (i = 0; i < 64; i++) {
-        switch ((env->dtlb_tte[i] >> 61) & 3) {
-        default:
-        case 0x0: // 8k
-            mask = 0xffffffffffffe000ULL;
-            break;
-        case 0x1: // 64k
-            mask = 0xffffffffffff0000ULL;
-            break;
-        case 0x2: // 512k
-            mask = 0xfffffffffff80000ULL;
-            break;
-        case 0x3: // 4M
-            mask = 0xffffffffffc00000ULL;
-            break;
-        }
-        // ctx match, vaddr match?
-        if (env->dmmuregs[1] == (env->dtlb_tag[i] & 0x1fff) &&
-            (address & mask) == (env->dtlb_tag[i] & ~0x1fffULL)) {
-            // valid, access ok?
-            if ((env->dtlb_tte[i] & 0x8000000000000000ULL) == 0 ||
-                ((env->dtlb_tte[i] & 0x4) && is_user) ||
-                (!(env->dtlb_tte[i] & 0x2) && (rw == 1))) {
-                if (env->dmmuregs[3]) /* Fault status register */
-                    env->dmmuregs[3] = 2; /* overflow (not read before another fault) */
-                env->dmmuregs[3] |= (is_user << 3) | ((rw == 1) << 2) | 1;
-                env->dmmuregs[4] = address; /* Fault address register */
+        // ctx match, vaddr match, valid?
+        if (ultrasparc_tag_match(&env->dtlb[i],
+                                 address, context, physical,
+                                 is_nucleus)) {
+            // access ok?
+            if (((env->dtlb[i].tte & 0x4) && is_user) ||
+                (!(env->dtlb[i].tte & 0x2) && (rw == 1))) {
+                uint8_t fault_type = 0;
+
+                if ((env->dtlb[i].tte & 0x4) && is_user) {
+                    fault_type |= 1; /* privilege violation */
+                }
+
+                if (env->dmmu.sfsr & 1) /* Fault status register */
+                    env->dmmu.sfsr = 2; /* overflow (not read before
+                                             another fault) */
+
+                env->dmmu.sfsr |= (is_user << 3) | ((rw == 1) << 2) | 1;
+
+                env->dmmu.sfsr |= (fault_type << 7);
+
+                env->dmmu.sfar = address; /* Fault address register */
                 env->exception_index = TT_DFAULT;
 #ifdef DEBUG_MMU
                 printf("DFAULT at 0x%" PRIx64 "\n", address);
 #endif
                 return 1;
             }
-            *physical = (env->dtlb_tte[i] & mask & 0x1fffffff000ULL) + (address & ~mask & 0x1fffffff000ULL);
             *prot = PAGE_READ;
-            if (env->dtlb_tte[i] & 0x2)
+            if (env->dtlb[i].tte & 0x2)
                 *prot |= PAGE_WRITE;
+            TTE_SET_USED(env->dtlb[i].tte);
             return 0;
         }
     }
 #ifdef DEBUG_MMU
     printf("DMISS at 0x%" PRIx64 "\n", address);
 #endif
+    env->dmmu.tag_access = (address & ~0x1fffULL) | context;
     env->exception_index = TT_DMISS;
     return 1;
 }
 
-static int get_physical_address_code(CPUState *env, target_phys_addr_t *physical, int *prot,
-                          int *access_index, target_ulong address, int rw,
-                          int is_user)
+static int get_physical_address_code(CPUState *env,
+                                     target_phys_addr_t *physical, int *prot,
+                                     target_ulong address, int is_user)
 {
-    target_ulong mask;
     unsigned int i;
+    uint64_t context;
+    int is_nucleus;
 
-    if ((env->lsu & IMMU_E) == 0) { /* IMMU disabled */
-        *physical = address;
+    if ((env->lsu & IMMU_E) == 0 || (env->pstate & PS_RED) != 0) {
+        /* IMMU disabled */
+        *physical = ultrasparc_truncate_physical(address);
         *prot = PAGE_EXEC;
         return 0;
     }
 
+    context = env->dmmu.mmu_primary_context & 0x1fff;
+    is_nucleus = env->tl > 0;
+
     for (i = 0; i < 64; i++) {
-        switch ((env->itlb_tte[i] >> 61) & 3) {
-        default:
-        case 0x0: // 8k
-            mask = 0xffffffffffffe000ULL;
-            break;
-        case 0x1: // 64k
-            mask = 0xffffffffffff0000ULL;
-            break;
-        case 0x2: // 512k
-            mask = 0xfffffffffff80000ULL;
-            break;
-        case 0x3: // 4M
-            mask = 0xffffffffffc00000ULL;
-                break;
-        }
-        // ctx match, vaddr match?
-        if (env->dmmuregs[1] == (env->itlb_tag[i] & 0x1fff) &&
-            (address & mask) == (env->itlb_tag[i] & ~0x1fffULL)) {
-            // valid, access ok?
-            if ((env->itlb_tte[i] & 0x8000000000000000ULL) == 0 ||
-                ((env->itlb_tte[i] & 0x4) && is_user)) {
-                if (env->immuregs[3]) /* Fault status register */
-                    env->immuregs[3] = 2; /* overflow (not read before another fault) */
-                env->immuregs[3] |= (is_user << 3) | 1;
+        // ctx match, vaddr match, valid?
+        if (ultrasparc_tag_match(&env->itlb[i],
+                                 address, context, physical,
+                                 is_nucleus)) {
+            // access ok?
+            if ((env->itlb[i].tte & 0x4) && is_user) {
+                if (env->immu.sfsr) /* Fault status register */
+                    env->immu.sfsr = 2; /* overflow (not read before
+                                             another fault) */
+                env->immu.sfsr |= (is_user << 3) | 1;
                 env->exception_index = TT_TFAULT;
 #ifdef DEBUG_MMU
                 printf("TFAULT at 0x%" PRIx64 "\n", address);
 #endif
                 return 1;
             }
-            *physical = (env->itlb_tte[i] & mask & 0x1fffffff000ULL) + (address & ~mask & 0x1fffffff000ULL);
             *prot = PAGE_EXEC;
+            TTE_SET_USED(env->itlb[i].tte);
             return 0;
         }
     }
 #ifdef DEBUG_MMU
     printf("TMISS at 0x%" PRIx64 "\n", address);
 #endif
+    /* Context is stored in DMMU (dmmuregs[1]) also for IMMU */
+    env->immu.tag_access = (address & ~0x1fffULL) | context;
     env->exception_index = TT_TMISS;
     return 1;
 }
@@ -507,9 +540,11 @@ static int get_physical_address(CPUState *env, target_phys_addr_t *physical,
     int is_user = mmu_idx == MMU_USER_IDX;
 
     if (rw == 2)
-        return get_physical_address_code(env, physical, prot, access_index, address, rw, is_user);
+        return get_physical_address_code(env, physical, prot, address,
+                                         is_user);
     else
-        return get_physical_address_data(env, physical, prot, access_index, address, rw, is_user);
+        return get_physical_address_data(env, physical, prot, address, rw,
+                                         is_user);
 }
 
 /* Perform address translation */
@@ -520,12 +555,15 @@ int cpu_sparc_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
     target_phys_addr_t paddr;
     int error_code = 0, prot, ret = 0, access_index;
 
-    error_code = get_physical_address(env, &paddr, &prot, &access_index, address, rw, mmu_idx);
+    error_code = get_physical_address(env, &paddr, &prot, &access_index,
+                                      address, rw, mmu_idx);
     if (error_code == 0) {
         virt_addr = address & TARGET_PAGE_MASK;
-        vaddr = virt_addr + ((address & TARGET_PAGE_MASK) & (TARGET_PAGE_SIZE - 1));
+        vaddr = virt_addr + ((address & TARGET_PAGE_MASK) &
+                             (TARGET_PAGE_SIZE - 1));
 #ifdef DEBUG_MMU
-        printf("Translate at 0x%" PRIx64 " -> 0x%" PRIx64 ", vaddr 0x%" PRIx64 "\n", address, paddr, vaddr);
+        printf("Translate at 0x%" PRIx64 " -> 0x%" PRIx64 ", vaddr 0x%" PRIx64
+               "\n", address, paddr, vaddr);
 #endif
         ret = tlb_set_page_exec(env, vaddr, paddr, prot, mmu_idx, is_softmmu);
         return ret;
@@ -540,13 +578,14 @@ void dump_mmu(CPUState *env)
     unsigned int i;
     const char *mask;
 
-    printf("MMU contexts: Primary: %" PRId64 ", Secondary: %" PRId64 "\n", env->dmmuregs[1], env->dmmuregs[2]);
+    printf("MMU contexts: Primary: %" PRId64 ", Secondary: %" PRId64 "\n",
+           env->dmmu.mmu_primary_context, env->dmmu.mmu_secondary_context);
     if ((env->lsu & DMMU_E) == 0) {
         printf("DMMU disabled\n");
     } else {
         printf("DMMU dump:\n");
         for (i = 0; i < 64; i++) {
-            switch ((env->dtlb_tte[i] >> 61) & 3) {
+            switch ((env->dtlb[i].tte >> 61) & 3) {
             default:
             case 0x0:
                 mask = "  8k";
@@ -561,15 +600,18 @@ void dump_mmu(CPUState *env)
                 mask = "  4M";
                 break;
             }
-            if ((env->dtlb_tte[i] & 0x8000000000000000ULL) != 0) {
-                printf("VA: " TARGET_FMT_lx ", PA: " TARGET_FMT_lx ", %s, %s, %s, %s, ctx %" PRId64 "\n",
-                       env->dtlb_tag[i] & ~0x1fffULL,
-                       env->dtlb_tte[i] & 0x1ffffffe000ULL,
+            if ((env->dtlb[i].tte & 0x8000000000000000ULL) != 0) {
+                printf("[%02u] VA: %" PRIx64 ", PA: %" PRIx64
+                       ", %s, %s, %s, %s, ctx %" PRId64 " %s\n",
+                       i,
+                       env->dtlb[i].tag & (uint64_t)~0x1fffULL,
+                       env->dtlb[i].tte & (uint64_t)0x1ffffffe000ULL,
                        mask,
-                       env->dtlb_tte[i] & 0x4? "priv": "user",
-                       env->dtlb_tte[i] & 0x2? "RW": "RO",
-                       env->dtlb_tte[i] & 0x40? "locked": "unlocked",
-                       env->dtlb_tag[i] & 0x1fffULL);
+                       env->dtlb[i].tte & 0x4? "priv": "user",
+                       env->dtlb[i].tte & 0x2? "RW": "RO",
+                       env->dtlb[i].tte & 0x40? "locked": "unlocked",
+                       env->dtlb[i].tag & (uint64_t)0x1fffULL,
+                       TTE_IS_GLOBAL(env->dtlb[i].tag)? "global" : "local");
             }
         }
     }
@@ -578,7 +620,7 @@ void dump_mmu(CPUState *env)
     } else {
         printf("IMMU dump:\n");
         for (i = 0; i < 64; i++) {
-            switch ((env->itlb_tte[i] >> 61) & 3) {
+            switch ((env->itlb[i].tte >> 61) & 3) {
             default:
             case 0x0:
                 mask = "  8k";
@@ -593,14 +635,17 @@ void dump_mmu(CPUState *env)
                 mask = "  4M";
                 break;
             }
-            if ((env->itlb_tte[i] & 0x8000000000000000ULL) != 0) {
-                printf("VA: " TARGET_FMT_lx ", PA: " TARGET_FMT_lx ", %s, %s, %s, ctx %" PRId64 "\n",
-                       env->itlb_tag[i] & ~0x1fffULL,
-                       env->itlb_tte[i] & 0x1ffffffe000ULL,
+            if ((env->itlb[i].tte & 0x8000000000000000ULL) != 0) {
+                printf("[%02u] VA: %" PRIx64 ", PA: %" PRIx64
+                       ", %s, %s, %s, ctx %" PRId64 " %s\n",
+                       i,
+                       env->itlb[i].tag & (uint64_t)~0x1fffULL,
+                       env->itlb[i].tte & (uint64_t)0x1ffffffe000ULL,
                        mask,
-                       env->itlb_tte[i] & 0x4? "priv": "user",
-                       env->itlb_tte[i] & 0x40? "locked": "unlocked",
-                       env->itlb_tag[i] & 0x1fffULL);
+                       env->itlb[i].tte & 0x4? "priv": "user",
+                       env->itlb[i].tte & 0x40? "locked": "unlocked",
+                       env->itlb[i].tag & (uint64_t)0x1fffULL,
+                       TTE_IS_GLOBAL(env->itlb[i].tag)? "global" : "local");
             }
         }
     }
@@ -634,85 +679,98 @@ target_phys_addr_t cpu_get_phys_page_debug(CPUState *env, target_ulong addr)
 }
 #endif
 
-void memcpy32(target_ulong *dst, const target_ulong *src)
-{
-    dst[0] = src[0];
-    dst[1] = src[1];
-    dst[2] = src[2];
-    dst[3] = src[3];
-    dst[4] = src[4];
-    dst[5] = src[5];
-    dst[6] = src[6];
-    dst[7] = src[7];
-}
-
-void helper_flush(target_ulong addr)
-{
-    addr &= ~7;
-    tb_invalidate_page_range(addr, addr + 8);
-}
-
 void cpu_reset(CPUSPARCState *env)
 {
+    if (qemu_loglevel_mask(CPU_LOG_RESET)) {
+        qemu_log("CPU Reset (CPU %d)\n", env->cpu_index);
+        log_cpu_state(env, 0);
+    }
+
     tlb_flush(env, 1);
     env->cwp = 0;
+#ifndef TARGET_SPARC64
     env->wim = 1;
+#endif
     env->regwptr = env->regbase + (env->cwp * 16);
+    CC_OP = CC_OP_FLAGS;
 #if defined(CONFIG_USER_ONLY)
-    env->user_mode_only = 1;
 #ifdef TARGET_SPARC64
-    env->cleanwin = NWINDOWS - 2;
-    env->cansave = NWINDOWS - 2;
+    env->cleanwin = env->nwindows - 2;
+    env->cansave = env->nwindows - 2;
     env->pstate = PS_RMO | PS_PEF | PS_IE;
     env->asi = 0x82; // Primary no-fault
 #endif
 #else
+#if !defined(TARGET_SPARC64)
     env->psret = 0;
+#endif
     env->psrs = 1;
     env->psrps = 1;
 #ifdef TARGET_SPARC64
-    env->pstate = PS_PRIV;
+    env->pstate = PS_PRIV|PS_RED|PS_PEF|PS_AG;
     env->hpstate = HS_PRIV;
-    env->pc = 0x1fff0000000ULL;
-    env->tsptr = &env->ts[env->tl];
+    env->tl = env->maxtl;
+    cpu_tsptr(env)->tt = TT_POWER_ON_RESET;
+    env->lsu = 0;
 #else
-    env->pc = 0;
     env->mmuregs[0] &= ~(MMU_E | MMU_NF);
-    env->mmuregs[0] |= env->mmu_bm;
+    env->mmuregs[0] |= env->def->mmu_bm;
 #endif
+    env->pc = 0;
     env->npc = env->pc + 4;
 #endif
+}
+
+static int cpu_sparc_register(CPUSPARCState *env, const char *cpu_model)
+{
+    sparc_def_t def1, *def = &def1;
+
+    if (cpu_sparc_find_by_name(def, cpu_model) < 0)
+        return -1;
+
+    env->def = qemu_mallocz(sizeof(*def));
+    memcpy(env->def, def, sizeof(*def));
+#if defined(CONFIG_USER_ONLY)
+    if ((env->def->features & CPU_FEATURE_FLOAT))
+        env->def->features |= CPU_FEATURE_FLOAT128;
+#endif
+    env->cpu_model_str = cpu_model;
+    env->version = def->iu_version;
+    env->fsr = def->fpu_version;
+    env->nwindows = def->nwindows;
+#if !defined(TARGET_SPARC64)
+    env->mmuregs[0] |= def->mmu_version;
+    cpu_sparc_set_id(env, 0);
+    env->mxccregs[7] |= def->mxcc_version;
+#else
+    env->mmu_version = def->mmu_version;
+    env->maxtl = def->maxtl;
+    env->version |= def->maxtl << 8;
+    env->version |= def->nwindows - 1;
+#endif
+    return 0;
+}
+
+static void cpu_sparc_close(CPUSPARCState *env)
+{
+    free(env->def);
+    free(env);
 }
 
 CPUSPARCState *cpu_sparc_init(const char *cpu_model)
 {
     CPUSPARCState *env;
-    const sparc_def_t *def;
-
-    def = cpu_sparc_find_by_name(cpu_model);
-    if (!def)
-        return NULL;
 
     env = qemu_mallocz(sizeof(CPUSPARCState));
-    if (!env)
-        return NULL;
     cpu_exec_init(env);
-    env->cpu_model_str = cpu_model;
-    env->version = def->iu_version;
-    env->fsr = def->fpu_version;
-#if !defined(TARGET_SPARC64)
-    env->mmu_bm = def->mmu_bm;
-    env->mmu_ctpr_mask = def->mmu_ctpr_mask;
-    env->mmu_cxr_mask = def->mmu_cxr_mask;
-    env->mmu_sfsr_mask = def->mmu_sfsr_mask;
-    env->mmu_trcr_mask = def->mmu_trcr_mask;
-    env->mmuregs[0] |= def->mmu_version;
-    cpu_sparc_set_id(env, 0);
-#endif
 
     gen_intermediate_code_init(env);
 
-    cpu_reset(env);
+    if (cpu_sparc_register(env, cpu_model) < 0) {
+        cpu_sparc_close(env);
+        return NULL;
+    }
+    qemu_init_vcpu(env);
 
     return env;
 }
@@ -728,108 +786,160 @@ static const sparc_def_t sparc_defs[] = {
 #ifdef TARGET_SPARC64
     {
         .name = "Fujitsu Sparc64",
-        .iu_version = ((0x04ULL << 48) | (0x02ULL << 32) | (0ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x04ULL << 48) | (0x02ULL << 32) | (0ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 4,
+        .maxtl = 4,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Fujitsu Sparc64 III",
-        .iu_version = ((0x04ULL << 48) | (0x03ULL << 32) | (0ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x04ULL << 48) | (0x03ULL << 32) | (0ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 5,
+        .maxtl = 4,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Fujitsu Sparc64 IV",
-        .iu_version = ((0x04ULL << 48) | (0x04ULL << 32) | (0ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x04ULL << 48) | (0x04ULL << 32) | (0ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Fujitsu Sparc64 V",
-        .iu_version = ((0x04ULL << 48) | (0x05ULL << 32) | (0x51ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x04ULL << 48) | (0x05ULL << 32) | (0x51ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "TI UltraSparc I",
-        .iu_version = ((0x17ULL << 48) | (0x10ULL << 32) | (0x40ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x17ULL << 48) | (0x10ULL << 32) | (0x40ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "TI UltraSparc II",
-        .iu_version = ((0x17ULL << 48) | (0x11ULL << 32) | (0x20ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x17ULL << 48) | (0x11ULL << 32) | (0x20ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "TI UltraSparc IIi",
-        .iu_version = ((0x17ULL << 48) | (0x12ULL << 32) | (0x91ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x17ULL << 48) | (0x12ULL << 32) | (0x91ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "TI UltraSparc IIe",
-        .iu_version = ((0x17ULL << 48) | (0x13ULL << 32) | (0x14ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x17ULL << 48) | (0x13ULL << 32) | (0x14ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Sun UltraSparc III",
-        .iu_version = ((0x3eULL << 48) | (0x14ULL << 32) | (0x34ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x3eULL << 48) | (0x14ULL << 32) | (0x34ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Sun UltraSparc III Cu",
-        .iu_version = ((0x3eULL << 48) | (0x15ULL << 32) | (0x41ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x3eULL << 48) | (0x15ULL << 32) | (0x41ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_3,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Sun UltraSparc IIIi",
-        .iu_version = ((0x3eULL << 48) | (0x16ULL << 32) | (0x34ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x3eULL << 48) | (0x16ULL << 32) | (0x34ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Sun UltraSparc IV",
-        .iu_version = ((0x3eULL << 48) | (0x18ULL << 32) | (0x31ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x3eULL << 48) | (0x18ULL << 32) | (0x31ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_4,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Sun UltraSparc IV+",
-        .iu_version = ((0x3eULL << 48) | (0x19ULL << 32) | (0x22ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x3eULL << 48) | (0x19ULL << 32) | (0x22ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES | CPU_FEATURE_CMT,
     },
     {
         .name = "Sun UltraSparc IIIi+",
-        .iu_version = ((0x3eULL << 48) | (0x22ULL << 32) | (0ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x3eULL << 48) | (0x22ULL << 32) | (0ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_3,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
+    },
+    {
+        .name = "Sun UltraSparc T1",
+        // defined in sparc_ifu_fdp.v and ctu.h
+        .iu_version = ((0x3eULL << 48) | (0x23ULL << 32) | (0x02ULL << 24)),
+        .fpu_version = 0x00000000,
+        .mmu_version = mmu_sun4v,
+        .nwindows = 8,
+        .maxtl = 6,
+        .features = CPU_DEFAULT_FEATURES | CPU_FEATURE_HYPV | CPU_FEATURE_CMT
+        | CPU_FEATURE_GL,
+    },
+    {
+        .name = "Sun UltraSparc T2",
+        // defined in tlu_asi_ctl.v and n2_revid_cust.v
+        .iu_version = ((0x3eULL << 48) | (0x24ULL << 32) | (0x02ULL << 24)),
+        .fpu_version = 0x00000000,
+        .mmu_version = mmu_sun4v,
+        .nwindows = 8,
+        .maxtl = 6,
+        .features = CPU_DEFAULT_FEATURES | CPU_FEATURE_HYPV | CPU_FEATURE_CMT
+        | CPU_FEATURE_GL,
     },
     {
         .name = "NEC UltraSparc I",
-        .iu_version = ((0x22ULL << 48) | (0x10ULL << 32) | (0x40ULL << 24)
-                       | (MAXTL << 8) | (NWINDOWS - 1)),
+        .iu_version = ((0x22ULL << 48) | (0x10ULL << 32) | (0x40ULL << 24)),
         .fpu_version = 0x00000000,
-        .mmu_version = 0,
+        .mmu_version = mmu_us_12,
+        .nwindows = 8,
+        .maxtl = 5,
+        .features = CPU_DEFAULT_FEATURES,
     },
 #else
     {
@@ -842,6 +952,8 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 7,
+        .features = CPU_FEATURE_FLOAT | CPU_FEATURE_FSMULD,
     },
     {
         .name = "Fujitsu MB86904",
@@ -853,6 +965,8 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x000000ff,
         .mmu_sfsr_mask = 0x00016fff,
         .mmu_trcr_mask = 0x00ffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Fujitsu MB86907",
@@ -864,6 +978,8 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x000000ff,
         .mmu_sfsr_mask = 0x00016fff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "LSI L64811",
@@ -875,6 +991,9 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_FEATURE_FLOAT | CPU_FEATURE_SWAP | CPU_FEATURE_FSQRT |
+        CPU_FEATURE_FSMULD,
     },
     {
         .name = "Cypress CY7C601",
@@ -886,6 +1005,9 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_FEATURE_FLOAT | CPU_FEATURE_SWAP | CPU_FEATURE_FSQRT |
+        CPU_FEATURE_FSMULD,
     },
     {
         .name = "Cypress CY7C611",
@@ -897,17 +1019,9 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
-    },
-    {
-        .name = "TI SuperSparc II",
-        .iu_version = 0x40000000,
-        .fpu_version = 0 << 17,
-        .mmu_version = 0x04000000,
-        .mmu_bm = 0x00002000,
-        .mmu_ctpr_mask = 0xffffffc0,
-        .mmu_cxr_mask = 0x0000ffff,
-        .mmu_sfsr_mask = 0xffffffff,
-        .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_FEATURE_FLOAT | CPU_FEATURE_SWAP | CPU_FEATURE_FSQRT |
+        CPU_FEATURE_FSMULD,
     },
     {
         .name = "TI MicroSparc I",
@@ -919,6 +1033,10 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0x00016fff,
         .mmu_trcr_mask = 0x0000003f,
+        .nwindows = 7,
+        .features = CPU_FEATURE_FLOAT | CPU_FEATURE_SWAP | CPU_FEATURE_MUL |
+        CPU_FEATURE_DIV | CPU_FEATURE_FLUSH | CPU_FEATURE_FSQRT |
+        CPU_FEATURE_FMUL,
     },
     {
         .name = "TI MicroSparc II",
@@ -930,6 +1048,8 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x000000ff,
         .mmu_sfsr_mask = 0x00016fff,
         .mmu_trcr_mask = 0x00ffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "TI MicroSparc IIep",
@@ -941,28 +1061,89 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x000000ff,
         .mmu_sfsr_mask = 0x00016bff,
         .mmu_trcr_mask = 0x00ffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
+    },
+    {
+        .name = "TI SuperSparc 40", // STP1020NPGA
+        .iu_version = 0x41000000, // SuperSPARC 2.x
+        .fpu_version = 0 << 17,
+        .mmu_version = 0x00000800, // SuperSPARC 2.x, no MXCC
+        .mmu_bm = 0x00002000,
+        .mmu_ctpr_mask = 0xffffffc0,
+        .mmu_cxr_mask = 0x0000ffff,
+        .mmu_sfsr_mask = 0xffffffff,
+        .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
+    },
+    {
+        .name = "TI SuperSparc 50", // STP1020PGA
+        .iu_version = 0x40000000, // SuperSPARC 3.x
+        .fpu_version = 0 << 17,
+        .mmu_version = 0x01000800, // SuperSPARC 3.x, no MXCC
+        .mmu_bm = 0x00002000,
+        .mmu_ctpr_mask = 0xffffffc0,
+        .mmu_cxr_mask = 0x0000ffff,
+        .mmu_sfsr_mask = 0xffffffff,
+        .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "TI SuperSparc 51",
-        .iu_version = 0x43000000,
+        .iu_version = 0x40000000, // SuperSPARC 3.x
         .fpu_version = 0 << 17,
-        .mmu_version = 0x04000000,
+        .mmu_version = 0x01000000, // SuperSPARC 3.x, MXCC
         .mmu_bm = 0x00002000,
         .mmu_ctpr_mask = 0xffffffc0,
         .mmu_cxr_mask = 0x0000ffff,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .mxcc_version = 0x00000104,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
+    },
+    {
+        .name = "TI SuperSparc 60", // STP1020APGA
+        .iu_version = 0x40000000, // SuperSPARC 3.x
+        .fpu_version = 0 << 17,
+        .mmu_version = 0x01000800, // SuperSPARC 3.x, no MXCC
+        .mmu_bm = 0x00002000,
+        .mmu_ctpr_mask = 0xffffffc0,
+        .mmu_cxr_mask = 0x0000ffff,
+        .mmu_sfsr_mask = 0xffffffff,
+        .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "TI SuperSparc 61",
-        .iu_version = 0x44000000,
+        .iu_version = 0x44000000, // SuperSPARC 3.x
         .fpu_version = 0 << 17,
-        .mmu_version = 0x04000000,
+        .mmu_version = 0x01000000, // SuperSPARC 3.x, MXCC
         .mmu_bm = 0x00002000,
         .mmu_ctpr_mask = 0xffffffc0,
         .mmu_cxr_mask = 0x0000ffff,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .mxcc_version = 0x00000104,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
+    },
+    {
+        .name = "TI SuperSparc II",
+        .iu_version = 0x40000000, // SuperSPARC II 1.x
+        .fpu_version = 0 << 17,
+        .mmu_version = 0x08000000, // SuperSPARC II 1.x, MXCC
+        .mmu_bm = 0x00002000,
+        .mmu_ctpr_mask = 0xffffffc0,
+        .mmu_cxr_mask = 0x0000ffff,
+        .mmu_sfsr_mask = 0xffffffff,
+        .mmu_trcr_mask = 0xffffffff,
+        .mxcc_version = 0x00000104,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Ross RT625",
@@ -974,6 +1155,8 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "Ross RT620",
@@ -985,6 +1168,8 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "BIT B5010",
@@ -996,6 +1181,9 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_FEATURE_FLOAT | CPU_FEATURE_SWAP | CPU_FEATURE_FSQRT |
+        CPU_FEATURE_FSMULD,
     },
     {
         .name = "Matsushita MN10501",
@@ -1007,6 +1195,9 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_FEATURE_FLOAT | CPU_FEATURE_MUL | CPU_FEATURE_FSQRT |
+        CPU_FEATURE_FSMULD,
     },
     {
         .name = "Weitek W8601",
@@ -1018,6 +1209,8 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "LEON2",
@@ -1029,6 +1222,8 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
     {
         .name = "LEON3",
@@ -1040,36 +1235,184 @@ static const sparc_def_t sparc_defs[] = {
         .mmu_cxr_mask = 0x0000003f,
         .mmu_sfsr_mask = 0xffffffff,
         .mmu_trcr_mask = 0xffffffff,
+        .nwindows = 8,
+        .features = CPU_DEFAULT_FEATURES,
     },
 #endif
 };
 
-static const sparc_def_t *cpu_sparc_find_by_name(const unsigned char *name)
+static const char * const feature_name[] = {
+    "float",
+    "float128",
+    "swap",
+    "mul",
+    "div",
+    "flush",
+    "fsqrt",
+    "fmul",
+    "vis1",
+    "vis2",
+    "fsmuld",
+    "hypv",
+    "cmt",
+    "gl",
+};
+
+static void print_features(FILE *f,
+                           int (*cpu_fprintf)(FILE *f, const char *fmt, ...),
+                           uint32_t features, const char *prefix)
 {
     unsigned int i;
 
-    for (i = 0; i < sizeof(sparc_defs) / sizeof(sparc_def_t); i++) {
-        if (strcasecmp(name, sparc_defs[i].name) == 0) {
-            return &sparc_defs[i];
+    for (i = 0; i < ARRAY_SIZE(feature_name); i++)
+        if (feature_name[i] && (features & (1 << i))) {
+            if (prefix)
+                (*cpu_fprintf)(f, "%s", prefix);
+            (*cpu_fprintf)(f, "%s ", feature_name[i]);
         }
-    }
-    return NULL;
 }
 
-void sparc_cpu_list (FILE *f, int (*cpu_fprintf)(FILE *f, const char *fmt, ...))
+static void add_flagname_to_bitmaps(const char *flagname, uint32_t *features)
 {
     unsigned int i;
 
-    for (i = 0; i < sizeof(sparc_defs) / sizeof(sparc_def_t); i++) {
-        (*cpu_fprintf)(f, "Sparc %16s IU " TARGET_FMT_lx " FPU %08x MMU %08x\n",
+    for (i = 0; i < ARRAY_SIZE(feature_name); i++)
+        if (feature_name[i] && !strcmp(flagname, feature_name[i])) {
+            *features |= 1 << i;
+            return;
+        }
+    fprintf(stderr, "CPU feature %s not found\n", flagname);
+}
+
+static int cpu_sparc_find_by_name(sparc_def_t *cpu_def, const char *cpu_model)
+{
+    unsigned int i;
+    const sparc_def_t *def = NULL;
+    char *s = strdup(cpu_model);
+    char *featurestr, *name = strtok(s, ",");
+    uint32_t plus_features = 0;
+    uint32_t minus_features = 0;
+    long long iu_version;
+    uint32_t fpu_version, mmu_version, nwindows;
+
+    for (i = 0; i < ARRAY_SIZE(sparc_defs); i++) {
+        if (strcasecmp(name, sparc_defs[i].name) == 0) {
+            def = &sparc_defs[i];
+        }
+    }
+    if (!def)
+        goto error;
+    memcpy(cpu_def, def, sizeof(*def));
+
+    featurestr = strtok(NULL, ",");
+    while (featurestr) {
+        char *val;
+
+        if (featurestr[0] == '+') {
+            add_flagname_to_bitmaps(featurestr + 1, &plus_features);
+        } else if (featurestr[0] == '-') {
+            add_flagname_to_bitmaps(featurestr + 1, &minus_features);
+        } else if ((val = strchr(featurestr, '='))) {
+            *val = 0; val++;
+            if (!strcmp(featurestr, "iu_version")) {
+                char *err;
+
+                iu_version = strtoll(val, &err, 0);
+                if (!*val || *err) {
+                    fprintf(stderr, "bad numerical value %s\n", val);
+                    goto error;
+                }
+                cpu_def->iu_version = iu_version;
+#ifdef DEBUG_FEATURES
+                fprintf(stderr, "iu_version %llx\n", iu_version);
+#endif
+            } else if (!strcmp(featurestr, "fpu_version")) {
+                char *err;
+
+                fpu_version = strtol(val, &err, 0);
+                if (!*val || *err) {
+                    fprintf(stderr, "bad numerical value %s\n", val);
+                    goto error;
+                }
+                cpu_def->fpu_version = fpu_version;
+#ifdef DEBUG_FEATURES
+                fprintf(stderr, "fpu_version %x\n", fpu_version);
+#endif
+            } else if (!strcmp(featurestr, "mmu_version")) {
+                char *err;
+
+                mmu_version = strtol(val, &err, 0);
+                if (!*val || *err) {
+                    fprintf(stderr, "bad numerical value %s\n", val);
+                    goto error;
+                }
+                cpu_def->mmu_version = mmu_version;
+#ifdef DEBUG_FEATURES
+                fprintf(stderr, "mmu_version %x\n", mmu_version);
+#endif
+            } else if (!strcmp(featurestr, "nwindows")) {
+                char *err;
+
+                nwindows = strtol(val, &err, 0);
+                if (!*val || *err || nwindows > MAX_NWINDOWS ||
+                    nwindows < MIN_NWINDOWS) {
+                    fprintf(stderr, "bad numerical value %s\n", val);
+                    goto error;
+                }
+                cpu_def->nwindows = nwindows;
+#ifdef DEBUG_FEATURES
+                fprintf(stderr, "nwindows %d\n", nwindows);
+#endif
+            } else {
+                fprintf(stderr, "unrecognized feature %s\n", featurestr);
+                goto error;
+            }
+        } else {
+            fprintf(stderr, "feature string `%s' not in format "
+                    "(+feature|-feature|feature=xyz)\n", featurestr);
+            goto error;
+        }
+        featurestr = strtok(NULL, ",");
+    }
+    cpu_def->features |= plus_features;
+    cpu_def->features &= ~minus_features;
+#ifdef DEBUG_FEATURES
+    print_features(stderr, fprintf, cpu_def->features, NULL);
+#endif
+    free(s);
+    return 0;
+
+ error:
+    free(s);
+    return -1;
+}
+
+void sparc_cpu_list(FILE *f, int (*cpu_fprintf)(FILE *f, const char *fmt, ...))
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(sparc_defs); i++) {
+        (*cpu_fprintf)(f, "Sparc %16s IU " TARGET_FMT_lx " FPU %08x MMU %08x NWINS %d ",
                        sparc_defs[i].name,
                        sparc_defs[i].iu_version,
                        sparc_defs[i].fpu_version,
-                       sparc_defs[i].mmu_version);
+                       sparc_defs[i].mmu_version,
+                       sparc_defs[i].nwindows);
+        print_features(f, cpu_fprintf, CPU_DEFAULT_FEATURES &
+                       ~sparc_defs[i].features, "-");
+        print_features(f, cpu_fprintf, ~CPU_DEFAULT_FEATURES &
+                       sparc_defs[i].features, "+");
+        (*cpu_fprintf)(f, "\n");
     }
+    (*cpu_fprintf)(f, "Default CPU feature flags (use '-' to remove): ");
+    print_features(f, cpu_fprintf, CPU_DEFAULT_FEATURES, NULL);
+    (*cpu_fprintf)(f, "\n");
+    (*cpu_fprintf)(f, "Available CPU feature flags (use '+' to add): ");
+    print_features(f, cpu_fprintf, ~CPU_DEFAULT_FEATURES, NULL);
+    (*cpu_fprintf)(f, "\n");
+    (*cpu_fprintf)(f, "Numerical features (use '=' to set): iu_version "
+                   "fpu_version mmu_version nwindows\n");
 }
-
-#define GET_FLAG(a,b) ((env->psr & a)?b:'-')
 
 void cpu_dump_state(CPUState *env, FILE *f,
                     int (*cpu_fprintf)(FILE *f, const char *fmt, ...),
@@ -1077,7 +1420,8 @@ void cpu_dump_state(CPUState *env, FILE *f,
 {
     int i, x;
 
-    cpu_fprintf(f, "pc: " TARGET_FMT_lx "  npc: " TARGET_FMT_lx "\n", env->pc, env->npc);
+    cpu_fprintf(f, "pc: " TARGET_FMT_lx "  npc: " TARGET_FMT_lx "\n", env->pc,
+                env->npc);
     cpu_fprintf(f, "General Registers:\n");
     for (i = 0; i < 4; i++)
         cpu_fprintf(f, "%%g%c: " TARGET_FMT_lx "\t", i + '0', env->gregs[i]);
@@ -1101,53 +1445,26 @@ void cpu_dump_state(CPUState *env, FILE *f,
     for (i = 0; i < 32; i++) {
         if ((i & 3) == 0)
             cpu_fprintf(f, "%%f%02d:", i);
-        cpu_fprintf(f, " %016lf", env->fpr[i]);
+        cpu_fprintf(f, " %016f", *(float *)&env->fpr[i]);
         if ((i & 3) == 3)
             cpu_fprintf(f, "\n");
     }
 #ifdef TARGET_SPARC64
     cpu_fprintf(f, "pstate: 0x%08x ccr: 0x%02x asi: 0x%02x tl: %d fprs: %d\n",
                 env->pstate, GET_CCR(env), env->asi, env->tl, env->fprs);
-    cpu_fprintf(f, "cansave: %d canrestore: %d otherwin: %d wstate %d cleanwin %d cwp %d\n",
+    cpu_fprintf(f, "cansave: %d canrestore: %d otherwin: %d wstate %d "
+                "cleanwin %d cwp %d\n",
                 env->cansave, env->canrestore, env->otherwin, env->wstate,
-                env->cleanwin, NWINDOWS - 1 - env->cwp);
+                env->cleanwin, env->nwindows - 1 - env->cwp);
 #else
-    cpu_fprintf(f, "psr: 0x%08x -> %c%c%c%c %c%c%c wim: 0x%08x\n", GET_PSR(env),
-            GET_FLAG(PSR_ZERO, 'Z'), GET_FLAG(PSR_OVF, 'V'),
-            GET_FLAG(PSR_NEG, 'N'), GET_FLAG(PSR_CARRY, 'C'),
-            env->psrs?'S':'-', env->psrps?'P':'-',
-            env->psret?'E':'-', env->wim);
-#endif
-    cpu_fprintf(f, "fsr: 0x%08x\n", GET_FSR32(env));
-}
 
-#ifdef TARGET_SPARC64
-#if !defined(CONFIG_USER_ONLY)
-#include "qemu-common.h"
-#include "hw/irq.h"
-#include "qemu-timer.h"
-#endif
+#define GET_FLAG(a,b) ((env->psr & a)?b:'-')
 
-void helper_tick_set_count(void *opaque, uint64_t count)
-{
-#if !defined(CONFIG_USER_ONLY)
-    ptimer_set_count(opaque, -count);
+    cpu_fprintf(f, "psr: 0x%08x -> %c%c%c%c %c%c%c wim: 0x%08x\n",
+                GET_PSR(env), GET_FLAG(PSR_ZERO, 'Z'), GET_FLAG(PSR_OVF, 'V'),
+                GET_FLAG(PSR_NEG, 'N'), GET_FLAG(PSR_CARRY, 'C'),
+                env->psrs?'S':'-', env->psrps?'P':'-',
+                env->psret?'E':'-', env->wim);
 #endif
+    cpu_fprintf(f, "fsr: 0x%08x\n", env->fsr);
 }
-
-uint64_t helper_tick_get_count(void *opaque)
-{
-#if !defined(CONFIG_USER_ONLY)
-    return -ptimer_get_count(opaque);
-#else
-    return 0;
-#endif
-}
-
-void helper_tick_set_limit(void *opaque, uint64_t limit)
-{
-#if !defined(CONFIG_USER_ONLY)
-    ptimer_set_limit(opaque, -limit, 0);
-#endif
-}
-#endif

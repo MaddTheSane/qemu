@@ -8,7 +8,6 @@
  * This code is licenced under the GPL.
  */
 
-#include <assert.h>
 #include "sh_intc.h"
 #include "hw.h"
 #include "sh.h"
@@ -17,7 +16,6 @@
 //#define DEBUG_INTC_SOURCES
 
 #define INTC_A7(x) ((x) & 0x1fffffff)
-#define INTC_ARRAY(x) (sizeof(x) / sizeof(x[0]))
 
 void sh_intc_toggle_source(struct intc_source *source,
 			   int enable_adj, int assert_adj)
@@ -71,6 +69,17 @@ void sh_intc_toggle_source(struct intc_source *source,
 		   source->pending ? "pending" : "");
 #endif
   }
+}
+
+static void sh_intc_set_irq (void *opaque, int n, int level)
+{
+  struct intc_desc *desc = opaque;
+  struct intc_source *source = &(desc->sources[n]);
+
+  if (level && !source->asserted)
+    sh_intc_toggle_source(source, 0, 1);
+  else if (!level && source->asserted)
+    sh_intc_toggle_source(source, 0, -1);
 }
 
 int sh_intc_get_pending_vector(struct intc_desc *desc, int imask)
@@ -273,13 +282,13 @@ static void sh_intc_write(void *opaque, target_phys_addr_t offset,
 #endif
 }
 
-static CPUReadMemoryFunc *sh_intc_readfn[] = {
+static CPUReadMemoryFunc * const sh_intc_readfn[] = {
     sh_intc_read,
     sh_intc_read,
     sh_intc_read
 };
 
-static CPUWriteMemoryFunc *sh_intc_writefn[] = {
+static CPUWriteMemoryFunc * const sh_intc_writefn[] = {
     sh_intc_write,
     sh_intc_write,
     sh_intc_write
@@ -296,8 +305,12 @@ struct intc_source *sh_intc_source(struct intc_desc *desc, intc_enum id)
 static void sh_intc_register(struct intc_desc *desc, 
 			     unsigned long address)
 {
-    if (address)
-        cpu_register_physical_memory(INTC_A7(address), 4, desc->iomemtype);
+    if (address) {
+        cpu_register_physical_memory_offset(P4ADDR(address), 4,
+                                            desc->iomemtype, INTC_A7(address));
+        cpu_register_physical_memory_offset(A7ADDR(address), 4,
+                                            desc->iomemtype, INTC_A7(address));
+    }
 }
 
 static void sh_intc_register_source(struct intc_desc *desc,
@@ -312,7 +325,7 @@ static void sh_intc_register_source(struct intc_desc *desc,
         for (i = 0; i < desc->nr_mask_regs; i++) {
 	    struct intc_mask_reg *mr = desc->mask_regs + i;
 
-	    for (k = 0; k < INTC_ARRAY(mr->enum_ids); k++) {
+	    for (k = 0; k < ARRAY_SIZE(mr->enum_ids); k++) {
                 if (mr->enum_ids[k] != source)
                     continue;
 
@@ -327,7 +340,7 @@ static void sh_intc_register_source(struct intc_desc *desc,
         for (i = 0; i < desc->nr_prio_regs; i++) {
 	    struct intc_prio_reg *pr = desc->prio_regs + i;
 
-	    for (k = 0; k < INTC_ARRAY(pr->enum_ids); k++) {
+	    for (k = 0; k < ARRAY_SIZE(pr->enum_ids); k++) {
                 if (pr->enum_ids[k] != source)
                     continue;
 
@@ -342,7 +355,7 @@ static void sh_intc_register_source(struct intc_desc *desc,
         for (i = 0; i < nr_groups; i++) {
 	    struct intc_group *gr = groups + i;
 
-	    for (k = 0; k < INTC_ARRAY(gr->enum_ids); k++) {
+	    for (k = 0; k < ARRAY_SIZE(gr->enum_ids); k++) {
                 if (gr->enum_ids[k] != source)
                     continue;
 
@@ -385,7 +398,7 @@ void sh_intc_register_sources(struct intc_desc *desc,
 	    s = sh_intc_source(desc, gr->enum_id);
 	    s->next_enum_id = gr->enum_ids[0];
 
-	    for (k = 1; k < INTC_ARRAY(gr->enum_ids); k++) {
+	    for (k = 1; k < ARRAY_SIZE(gr->enum_ids); k++) {
                 if (!gr->enum_ids[k])
                     continue;
 
@@ -418,9 +431,7 @@ int sh_intc_init(struct intc_desc *desc,
     desc->nr_prio_regs = nr_prio_regs;
 
     i = sizeof(struct intc_source) * nr_sources;
-    desc->sources = malloc(i);
-    if (!desc->sources)
-        return -1;
+    desc->sources = qemu_malloc(i);
 
     memset(desc->sources, 0, i);
     for (i = 0; i < desc->nr_sources; i++) {
@@ -428,8 +439,10 @@ int sh_intc_init(struct intc_desc *desc,
 
         source->parent = desc;
     }
+
+    desc->irqs = qemu_allocate_irqs(sh_intc_set_irq, desc, nr_sources);
  
-    desc->iomemtype = cpu_register_io_memory(0, sh_intc_readfn,
+    desc->iomemtype = cpu_register_io_memory(sh_intc_readfn,
 					     sh_intc_writefn, desc);
     if (desc->mask_regs) {
         for (i = 0; i < desc->nr_mask_regs; i++) {
@@ -450,4 +463,19 @@ int sh_intc_init(struct intc_desc *desc,
     }
 
     return 0;
+}
+
+/* Assert level <n> IRL interrupt. 
+   0:deassert. 1:lowest priority,... 15:highest priority. */
+void sh_intc_set_irl(void *opaque, int n, int level)
+{
+    struct intc_source *s = opaque;
+    int i, irl = level ^ 15;
+    for (i = 0; (s = sh_intc_source(s->parent, s->next_enum_id)); i++) {
+	if (i == irl)
+	    sh_intc_toggle_source(s, s->enable_count?0:1, s->asserted?0:1);
+	else
+	    if (s->asserted)
+	        sh_intc_toggle_source(s, 0, -1);
+    }
 }

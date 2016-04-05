@@ -8,13 +8,15 @@
  */
 
 #include "hw.h"
+#include "qemu-timer.h"
+#include "sysbus.h"
 #include "primecell.h"
 #include "sysemu.h"
 
 #define LOCK_VALUE 0xa05f
 
 typedef struct {
-    uint32_t base;
+    SysBusDevice busdev;
     uint32_t sys_id;
     uint32_t leds;
     uint16_t lockval;
@@ -23,13 +25,25 @@ typedef struct {
     uint32_t flags;
     uint32_t nvflags;
     uint32_t resetlevel;
+    uint32_t proc_id;
 } arm_sysctl_state;
+
+static void arm_sysctl_reset(DeviceState *d)
+{
+    arm_sysctl_state *s = FROM_SYSBUS(arm_sysctl_state, sysbus_from_qdev(d));
+
+    s->leds = 0;
+    s->lockval = 0;
+    s->cfgdata1 = 0;
+    s->cfgdata2 = 0;
+    s->flags = 0;
+    s->resetlevel = 0;
+}
 
 static uint32_t arm_sysctl_read(void *opaque, target_phys_addr_t offset)
 {
     arm_sysctl_state *s = (arm_sysctl_state *)opaque;
 
-    offset -= s->base;
     switch (offset) {
     case 0x00: /* ID */
         return s->sys_id;
@@ -72,13 +86,11 @@ static uint32_t arm_sysctl_read(void *opaque, target_phys_addr_t offset)
     case 0x58: /* BOOTCS */
         return 0;
     case 0x5c: /* 24MHz */
-        /* ??? not implemented.  */
-        return 0;
+        return muldiv64(qemu_get_clock(vm_clock), 24000000, get_ticks_per_sec());
     case 0x60: /* MISC */
         return 0;
     case 0x84: /* PROCID0 */
-        /* ??? Don't know what the proper value for the core tile ID is.  */
-        return 0x02000000;
+        return s->proc_id;
     case 0x88: /* PROCID1 */
         return 0xff000000;
     case 0x64: /* DMAPSR0 */
@@ -108,7 +120,6 @@ static void arm_sysctl_write(void *opaque, target_phys_addr_t offset,
                           uint32_t val)
 {
     arm_sysctl_state *s = (arm_sysctl_state *)opaque;
-    offset -= s->base;
 
     switch (offset) {
     case 0x08: /* LED */
@@ -179,34 +190,57 @@ static void arm_sysctl_write(void *opaque, target_phys_addr_t offset,
     }
 }
 
-static CPUReadMemoryFunc *arm_sysctl_readfn[] = {
+static CPUReadMemoryFunc * const arm_sysctl_readfn[] = {
    arm_sysctl_read,
    arm_sysctl_read,
    arm_sysctl_read
 };
 
-static CPUWriteMemoryFunc *arm_sysctl_writefn[] = {
+static CPUWriteMemoryFunc * const arm_sysctl_writefn[] = {
    arm_sysctl_write,
    arm_sysctl_write,
    arm_sysctl_write
 };
 
-void arm_sysctl_init(uint32_t base, uint32_t sys_id)
+static int arm_sysctl_init1(SysBusDevice *dev)
 {
-    arm_sysctl_state *s;
+    arm_sysctl_state *s = FROM_SYSBUS(arm_sysctl_state, dev);
     int iomemtype;
 
-    s = (arm_sysctl_state *)qemu_mallocz(sizeof(arm_sysctl_state));
-    if (!s)
-        return;
-    s->base = base;
-    s->sys_id = sys_id;
-    /* The MPcore bootloader uses these flags to start secondary CPUs.
-       We don't use a bootloader, so do this here.  */
-    s->flags = 3;
-    iomemtype = cpu_register_io_memory(0, arm_sysctl_readfn,
+    iomemtype = cpu_register_io_memory(arm_sysctl_readfn,
                                        arm_sysctl_writefn, s);
-    cpu_register_physical_memory(base, 0x00001000, iomemtype);
+    sysbus_init_mmio(dev, 0x1000, iomemtype);
     /* ??? Save/restore.  */
+    return 0;
 }
 
+/* Legacy helper function.  */
+void arm_sysctl_init(uint32_t base, uint32_t sys_id, uint32_t proc_id)
+{
+    DeviceState *dev;
+
+    dev = qdev_create(NULL, "realview_sysctl");
+    qdev_prop_set_uint32(dev, "sys_id", sys_id);
+    qdev_init_nofail(dev);
+    qdev_prop_set_uint32(dev, "proc_id", proc_id);
+    sysbus_mmio_map(sysbus_from_qdev(dev), 0, base);
+}
+
+static SysBusDeviceInfo arm_sysctl_info = {
+    .init = arm_sysctl_init1,
+    .qdev.name  = "realview_sysctl",
+    .qdev.size  = sizeof(arm_sysctl_state),
+    .qdev.reset = arm_sysctl_reset,
+    .qdev.props = (Property[]) {
+        DEFINE_PROP_UINT32("sys_id", arm_sysctl_state, sys_id, 0),
+        DEFINE_PROP_UINT32("proc_id", arm_sysctl_state, proc_id, 0),
+        DEFINE_PROP_END_OF_LIST(),
+    }
+};
+
+static void arm_sysctl_register_devices(void)
+{
+    sysbus_register_withprop(&arm_sysctl_info);
+}
+
+device_init(arm_sysctl_register_devices)

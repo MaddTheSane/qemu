@@ -14,8 +14,7 @@
  *  GNU General Public License for more details.
  *
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -408,4 +407,3 @@ int target_msync(unsigned long start, unsigned long len, int flags)
     start &= qemu_host_page_mask;
     return msync((void *)start, end - start, flags);
 }
-

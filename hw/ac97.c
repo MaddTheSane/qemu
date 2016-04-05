@@ -147,7 +147,7 @@ typedef struct AC97BusMasterRegs {
 } AC97BusMasterRegs;
 
 typedef struct AC97LinkState {
-    PCIDevice *pci_dev;
+    PCIDevice dev;
     QEMUSoundCard card;
     uint32_t glob_cnt;
     uint32_t glob_sta;
@@ -158,6 +158,7 @@ typedef struct AC97LinkState {
     SWVoiceIn *voice_pi;
     SWVoiceOut *voice_po;
     SWVoiceIn *voice_mc;
+    int invalid_freq[3];
     uint8_t silence[128];
     uint32_t base[2];
     int bup_flag;
@@ -173,11 +174,6 @@ enum {
 #else
 #define dolog(...)
 #endif
-
-typedef struct PCIAC97LinkState {
-    PCIDevice dev;
-    AC97LinkState ac97;
-} PCIAC97LinkState;
 
 #define MKREGS(prefix, start)                   \
 enum {                                          \
@@ -277,12 +273,12 @@ static void update_sr (AC97LinkState *s, AC97BusMasterRegs *r, uint32_t new_sr)
     if (level) {
         s->glob_sta |= masks[r - s->bm_regs];
         dolog ("set irq level=1\n");
-        qemu_set_irq(s->pci_dev->irq[0], 1);
+        qemu_set_irq (s->dev.irq[0], 1);
     }
     else {
         s->glob_sta &= ~masks[r - s->bm_regs];
         dolog ("set irq level=0\n");
-        qemu_set_irq(s->pci_dev->irq[0], 0);
+        qemu_set_irq (s->dev.irq[0], 0);
     }
 }
 
@@ -327,7 +323,7 @@ static void reset_bm_regs (AC97LinkState *s, AC97BusMasterRegs *r)
 static void mixer_store (AC97LinkState *s, uint32_t i, uint16_t v)
 {
     if (i + 2 > sizeof (s->mixer_data)) {
-        dolog ("mixer_store: index %d out of bounds %d\n",
+        dolog ("mixer_store: index %d out of bounds %zd\n",
                i, sizeof (s->mixer_data));
         return;
     }
@@ -341,7 +337,7 @@ static uint16_t mixer_load (AC97LinkState *s, uint32_t i)
     uint16_t val = 0xffff;
 
     if (i + 2 > sizeof (s->mixer_data)) {
-        dolog ("mixer_store: index %d out of bounds %d\n",
+        dolog ("mixer_store: index %d out of bounds %zd\n",
                i, sizeof (s->mixer_data));
     }
     else {
@@ -353,46 +349,68 @@ static uint16_t mixer_load (AC97LinkState *s, uint32_t i)
 
 static void open_voice (AC97LinkState *s, int index, int freq)
 {
-    audsettings_t as;
+    struct audsettings as;
 
     as.freq = freq;
     as.nchannels = 2;
     as.fmt = AUD_FMT_S16;
     as.endianness = 0;
 
-    switch (index) {
-    case PI_INDEX:
-        s->voice_pi = AUD_open_in (
-            &s->card,
-            s->voice_pi,
-            "ac97.pi",
-            s,
-            pi_callback,
-            &as
-            );
-        break;
+    if (freq > 0) {
+        s->invalid_freq[index] = 0;
+        switch (index) {
+        case PI_INDEX:
+            s->voice_pi = AUD_open_in (
+                &s->card,
+                s->voice_pi,
+                "ac97.pi",
+                s,
+                pi_callback,
+                &as
+                );
+            break;
 
-    case PO_INDEX:
-        s->voice_po = AUD_open_out (
-            &s->card,
-            s->voice_po,
-            "ac97.po",
-            s,
-            po_callback,
-            &as
-            );
-        break;
+        case PO_INDEX:
+            s->voice_po = AUD_open_out (
+                &s->card,
+                s->voice_po,
+                "ac97.po",
+                s,
+                po_callback,
+                &as
+                );
+            break;
 
-    case MC_INDEX:
-        s->voice_mc = AUD_open_in (
-            &s->card,
-            s->voice_mc,
-            "ac97.mc",
-            s,
-            mc_callback,
-            &as
-            );
-        break;
+        case MC_INDEX:
+            s->voice_mc = AUD_open_in (
+                &s->card,
+                s->voice_mc,
+                "ac97.mc",
+                s,
+                mc_callback,
+                &as
+                );
+            break;
+        }
+    }
+    else {
+        s->invalid_freq[index] = freq;
+        switch (index) {
+        case PI_INDEX:
+            AUD_close_in (&s->card, s->voice_pi);
+            s->voice_pi = NULL;
+            break;
+
+        case PO_INDEX:
+            AUD_close_out (&s->card, s->voice_po);
+            s->voice_po = NULL;
+            break;
+
+        case MC_INDEX:
+            AUD_close_in (&s->card, s->voice_mc);
+            s->voice_mc = NULL;
+            break;
+        }
     }
 }
 
@@ -555,8 +573,7 @@ static void mixer_reset (AC97LinkState *s)
  */
 static uint32_t nam_readb (void *opaque, uint32_t addr)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     dolog ("U nam readb %#x\n", addr);
     s->cas = 0;
     return ~0U;
@@ -564,8 +581,7 @@ static uint32_t nam_readb (void *opaque, uint32_t addr)
 
 static uint32_t nam_readw (void *opaque, uint32_t addr)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     uint32_t val = ~0U;
     uint32_t index = addr - s->base[0];
     s->cas = 0;
@@ -575,8 +591,7 @@ static uint32_t nam_readw (void *opaque, uint32_t addr)
 
 static uint32_t nam_readl (void *opaque, uint32_t addr)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     dolog ("U nam readl %#x\n", addr);
     s->cas = 0;
     return ~0U;
@@ -588,16 +603,14 @@ static uint32_t nam_readl (void *opaque, uint32_t addr)
  */
 static void nam_writeb (void *opaque, uint32_t addr, uint32_t val)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     dolog ("U nam writeb %#x <- %#x\n", addr, val);
     s->cas = 0;
 }
 
 static void nam_writew (void *opaque, uint32_t addr, uint32_t val)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     uint32_t index = addr - s->base[0];
     s->cas = 0;
     switch (index) {
@@ -688,8 +701,7 @@ static void nam_writew (void *opaque, uint32_t addr, uint32_t val)
 
 static void nam_writel (void *opaque, uint32_t addr, uint32_t val)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     dolog ("U nam writel %#x <- %#x\n", addr, val);
     s->cas = 0;
 }
@@ -700,8 +712,7 @@ static void nam_writel (void *opaque, uint32_t addr, uint32_t val)
  */
 static uint32_t nabm_readb (void *opaque, uint32_t addr)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     AC97BusMasterRegs *r = NULL;
     uint32_t index = addr - s->base[1];
     uint32_t val = ~0U;
@@ -756,8 +767,7 @@ static uint32_t nabm_readb (void *opaque, uint32_t addr)
 
 static uint32_t nabm_readw (void *opaque, uint32_t addr)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     AC97BusMasterRegs *r = NULL;
     uint32_t index = addr - s->base[1];
     uint32_t val = ~0U;
@@ -786,8 +796,7 @@ static uint32_t nabm_readw (void *opaque, uint32_t addr)
 
 static uint32_t nabm_readl (void *opaque, uint32_t addr)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     AC97BusMasterRegs *r = NULL;
     uint32_t index = addr - s->base[1];
     uint32_t val = ~0U;
@@ -837,8 +846,7 @@ static uint32_t nabm_readl (void *opaque, uint32_t addr)
  */
 static void nabm_writeb (void *opaque, uint32_t addr, uint32_t val)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     AC97BusMasterRegs *r = NULL;
     uint32_t index = addr - s->base[1];
     switch (index) {
@@ -894,8 +902,7 @@ static void nabm_writeb (void *opaque, uint32_t addr, uint32_t val)
 
 static void nabm_writew (void *opaque, uint32_t addr, uint32_t val)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     AC97BusMasterRegs *r = NULL;
     uint32_t index = addr - s->base[1];
     switch (index) {
@@ -915,8 +922,7 @@ static void nabm_writew (void *opaque, uint32_t addr, uint32_t val)
 
 static void nabm_writel (void *opaque, uint32_t addr, uint32_t val)
 {
-    PCIAC97LinkState *d = opaque;
-    AC97LinkState *s = &d->ac97;
+    AC97LinkState *s = opaque;
     AC97BusMasterRegs *r = NULL;
     uint32_t index = addr - s->base[1];
     switch (index) {
@@ -1065,6 +1071,12 @@ static void transfer_audio (AC97LinkState *s, int index, int elapsed)
     AC97BusMasterRegs *r = &s->bm_regs[index];
     int written = 0, stop = 0;
 
+    if (s->invalid_freq[index]) {
+        AUD_log ("ac97", "attempt to use voice %d with invalid frequency %d\n",
+                 index, s->invalid_freq[index]);
+        return;
+    }
+
     if (r->sr & SR_DCH) {
         if (r->cr & CR_RPBM) {
             switch (index) {
@@ -1155,65 +1167,30 @@ static void po_callback (void *opaque, int free)
     transfer_audio (opaque, PO_INDEX, free);
 }
 
-static void ac97_save (QEMUFile *f, void *opaque)
+static const VMStateDescription vmstate_ac97_bm_regs = {
+    .name = "ac97_bm_regs",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .minimum_version_id_old = 1,
+    .fields      = (VMStateField []) {
+        VMSTATE_UINT32(bdbar, AC97BusMasterRegs),
+        VMSTATE_UINT8(civ, AC97BusMasterRegs),
+        VMSTATE_UINT8(lvi, AC97BusMasterRegs),
+        VMSTATE_UINT16(sr, AC97BusMasterRegs),
+        VMSTATE_UINT16(picb, AC97BusMasterRegs),
+        VMSTATE_UINT8(piv, AC97BusMasterRegs),
+        VMSTATE_UINT8(cr, AC97BusMasterRegs),
+        VMSTATE_UINT32(bd_valid, AC97BusMasterRegs),
+        VMSTATE_UINT32(bd.addr, AC97BusMasterRegs),
+        VMSTATE_UINT32(bd.ctl_len, AC97BusMasterRegs),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int ac97_post_load (void *opaque, int version_id)
 {
-    size_t i;
     uint8_t active[LAST_INDEX];
     AC97LinkState *s = opaque;
-
-    qemu_put_be32s (f, &s->glob_cnt);
-    qemu_put_be32s (f, &s->glob_sta);
-    qemu_put_be32s (f, &s->cas);
-
-    for (i = 0; i < sizeof (s->bm_regs) / sizeof (s->bm_regs[0]); ++i) {
-        AC97BusMasterRegs *r = &s->bm_regs[i];
-        qemu_put_be32s (f, &r->bdbar);
-        qemu_put_8s (f, &r->civ);
-        qemu_put_8s (f, &r->lvi);
-        qemu_put_be16s (f, &r->sr);
-        qemu_put_be16s (f, &r->picb);
-        qemu_put_8s (f, &r->piv);
-        qemu_put_8s (f, &r->cr);
-        qemu_put_be32s (f, &r->bd_valid);
-        qemu_put_be32s (f, &r->bd.addr);
-        qemu_put_be32s (f, &r->bd.ctl_len);
-    }
-    qemu_put_buffer (f, s->mixer_data, sizeof (s->mixer_data));
-
-    active[PI_INDEX] = AUD_is_active_in (s->voice_pi) ? 1 : 0;
-    active[PO_INDEX] = AUD_is_active_out (s->voice_po) ? 1 : 0;
-    active[MC_INDEX] = AUD_is_active_in (s->voice_mc) ? 1 : 0;
-    qemu_put_buffer (f, active, sizeof (active));
-}
-
-static int ac97_load (QEMUFile *f, void *opaque, int version_id)
-{
-    size_t i;
-    uint8_t active[LAST_INDEX];
-    AC97LinkState *s = opaque;
-
-    if (version_id != 1)
-        return -EINVAL;
-
-    qemu_get_be32s (f, &s->glob_cnt);
-    qemu_get_be32s (f, &s->glob_sta);
-    qemu_get_be32s (f, &s->cas);
-
-    for (i = 0; i < sizeof (s->bm_regs) / sizeof (s->bm_regs[0]); ++i) {
-        AC97BusMasterRegs *r = &s->bm_regs[i];
-        qemu_get_be32s (f, &r->bdbar);
-        qemu_get_8s (f, &r->civ);
-        qemu_get_8s (f, &r->lvi);
-        qemu_get_be16s (f, &r->sr);
-        qemu_get_be16s (f, &r->picb);
-        qemu_get_8s (f, &r->piv);
-        qemu_get_8s (f, &r->cr);
-        qemu_get_be32s (f, &r->bd_valid);
-        qemu_get_be32s (f, &r->bd.addr);
-        qemu_get_be32s (f, &r->bd.ctl_len);
-    }
-    qemu_get_buffer (f, s->mixer_data, sizeof (s->mixer_data));
-    qemu_get_buffer (f, active, sizeof (active));
 
 #ifdef USE_MIXER
     record_select (s, mixer_load (s, AC97_Record_Select));
@@ -1223,6 +1200,9 @@ static int ac97_load (QEMUFile *f, void *opaque, int version_id)
     V_ (AC97_Line_In_Volume_Mute, AUD_MIXER_LINE_IN);
 #undef V_
 #endif
+    active[PI_INDEX] = !!(s->bm_regs[PI_INDEX].cr & CR_RPBM);
+    active[PO_INDEX] = !!(s->bm_regs[PO_INDEX].cr & CR_RPBM);
+    active[MC_INDEX] = !!(s->bm_regs[MC_INDEX].cr & CR_RPBM);
     reset_voices (s, active);
 
     s->bup_flag = 0;
@@ -1230,11 +1210,35 @@ static int ac97_load (QEMUFile *f, void *opaque, int version_id)
     return 0;
 }
 
-static void ac97_map (PCIDevice *pci_dev, int region_num,
-                      uint32_t addr, uint32_t size, int type)
+static bool is_version_2 (void *opaque, int version_id)
 {
-    PCIAC97LinkState *d = (PCIAC97LinkState *) pci_dev;
-    AC97LinkState *s = &d->ac97;
+    return version_id == 2;
+}
+
+static const VMStateDescription vmstate_ac97 = {
+    .name = "ac97",
+    .version_id = 3,
+    .minimum_version_id = 2,
+    .minimum_version_id_old = 2,
+    .post_load = ac97_post_load,
+    .fields      = (VMStateField []) {
+        VMSTATE_PCI_DEVICE(dev, AC97LinkState),
+        VMSTATE_UINT32(glob_cnt, AC97LinkState),
+        VMSTATE_UINT32(glob_sta, AC97LinkState),
+        VMSTATE_UINT32(cas, AC97LinkState),
+        VMSTATE_STRUCT_ARRAY(bm_regs, AC97LinkState, 3, 1,
+                             vmstate_ac97_bm_regs, AC97BusMasterRegs),
+        VMSTATE_BUFFER(mixer_data, AC97LinkState),
+        VMSTATE_UNUSED_TEST(is_version_2, 3),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void ac97_map (PCIDevice *pci_dev, int region_num,
+                      pcibus_t addr, pcibus_t size, int type)
+{
+    AC97LinkState *s = DO_UPCAST (AC97LinkState, dev, pci_dev);
+    PCIDevice *d = &s->dev;
 
     if (!region_num) {
         s->base[0] = addr;
@@ -1272,39 +1276,13 @@ static void ac97_on_reset (void *opaque)
     mixer_reset (s);
 }
 
-int ac97_init (PCIBus *bus, AudioState *audio)
+static int ac97_initfn (PCIDevice *dev)
 {
-    PCIAC97LinkState *d;
-    AC97LinkState *s;
-    uint8_t *c;
+    AC97LinkState *s = DO_UPCAST (AC97LinkState, dev, dev);
+    uint8_t *c = s->dev.config;
 
-    if (!bus) {
-        AUD_log ("ac97", "No PCI bus\n");
-        return -1;
-    }
-
-    if (!audio) {
-        AUD_log ("ac97", "No audio state\n");
-        return -1;
-    }
-
-    d = (PCIAC97LinkState *) pci_register_device (bus, "AC97",
-                                                  sizeof (PCIAC97LinkState),
-                                                  -1, NULL, NULL);
-
-    if (!d) {
-        AUD_log ("ac97", "Failed to register PCI device\n");
-        return -1;
-    }
-
-    s = &d->ac97;
-    s->pci_dev = &d->dev;
-    c = d->dev.config;
-    c[0x00] = 0x86;      /* vid vendor id intel ro */
-    c[0x01] = 0x80;      /* intel */
-
-    c[0x02] = 0x15;      /* did device id 82801 ro */
-    c[0x03] = 0x24;      /* 82801aa */
+    pci_config_set_vendor_id (c, PCI_VENDOR_ID_INTEL); /* ro */
+    pci_config_set_device_id (c, PCI_DEVICE_ID_INTEL_82801AA_5); /* ro */
 
     c[0x04] = 0x00;      /* pcicmd pci command rw, ro */
     c[0x05] = 0x00;
@@ -1314,9 +1292,8 @@ int ac97_init (PCIBus *bus, AudioState *audio)
 
     c[0x08] = 0x01;      /* rid revision ro */
     c[0x09] = 0x00;      /* pi programming interface ro */
-    c[0x0a] = 0x01;      /* scc sub class code ro */
-    c[0x0b] = 0x04;      /* bcc base class code ro */
-    c[0x0e] = 0x00;      /* headtyp header type ro */
+    pci_config_set_class (c, PCI_CLASS_MULTIMEDIA_AUDIO); /* ro */
+    c[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL; /* headtyp header type ro */
 
     c[0x10] = 0x01;      /* nabmar native audio mixer base
                             address rw */
@@ -1339,11 +1316,32 @@ int ac97_init (PCIBus *bus, AudioState *audio)
     c[0x3c] = 0x00;      /* intr_ln interrupt line rw */
     c[0x3d] = 0x01;      /* intr_pn interrupt pin ro */
 
-    pci_register_io_region (&d->dev, 0, 256 * 4, PCI_ADDRESS_SPACE_IO, ac97_map);
-    pci_register_io_region (&d->dev, 1, 64 * 4, PCI_ADDRESS_SPACE_IO, ac97_map);
-    register_savevm ("ac97", 0, 1, ac97_save, ac97_load, s);
+    pci_register_bar (&s->dev, 0, 256 * 4, PCI_BASE_ADDRESS_SPACE_IO,
+                      ac97_map);
+    pci_register_bar (&s->dev, 1, 64 * 4, PCI_BASE_ADDRESS_SPACE_IO, ac97_map);
     qemu_register_reset (ac97_on_reset, s);
-    AUD_register_card (audio, "ac97", &s->card);
+    AUD_register_card ("ac97", &s->card);
     ac97_on_reset (s);
     return 0;
 }
+
+int ac97_init (PCIBus *bus)
+{
+    pci_create_simple (bus, -1, "AC97");
+    return 0;
+}
+
+static PCIDeviceInfo ac97_info = {
+    .qdev.name    = "AC97",
+    .qdev.desc    = "Intel 82801AA AC97 Audio",
+    .qdev.size    = sizeof (AC97LinkState),
+    .qdev.vmsd    = &vmstate_ac97,
+    .init         = ac97_initfn,
+};
+
+static void ac97_register (void)
+{
+    pci_qdev_register (&ac97_info);
+}
+device_init (ac97_register);
+

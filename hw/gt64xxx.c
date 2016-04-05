@@ -25,10 +25,8 @@
 #include "hw.h"
 #include "mips.h"
 #include "pci.h"
-#include "pc.h"
-
-typedef target_phys_addr_t pci_addr_t;
 #include "pci_host.h"
+#include "pc.h"
 
 //#define DEBUG
 
@@ -854,13 +852,13 @@ static uint32_t gt64120_readl (void *opaque,
     return val;
 }
 
-static CPUWriteMemoryFunc *gt64120_write[] = {
+static CPUWriteMemoryFunc * const gt64120_write[] = {
     &gt64120_writel,
     &gt64120_writel,
     &gt64120_writel,
 };
 
-static CPUReadMemoryFunc *gt64120_read[] = {
+static CPUReadMemoryFunc * const gt64120_read[] = {
     &gt64120_readl,
     &gt64120_readl,
     &gt64120_readl,
@@ -891,12 +889,12 @@ static int pci_gt64120_map_irq(PCIDevice *pci_dev, int irq_num)
     }
 }
 
-extern PCIDevice *piix4_dev;
 static int pci_irq_levels[4];
 
-static void pci_gt64120_set_irq(qemu_irq *pic, int irq_num, int level)
+static void pci_gt64120_set_irq(void *opaque, int irq_num, int level)
 {
     int i, pic_irq, pic_level;
+    qemu_irq *pic = opaque;
 
     pci_irq_levels[irq_num] = level;
 
@@ -1119,28 +1117,20 @@ PCIBus *pci_gt64120_init(qemu_irq *pic)
     GT64120State *s;
     PCIDevice *d;
 
-    (void)&pci_host_data_writeb; /* avoid warning */
-    (void)&pci_host_data_writew; /* avoid warning */
-    (void)&pci_host_data_writel; /* avoid warning */
-    (void)&pci_host_data_readb; /* avoid warning */
-    (void)&pci_host_data_readw; /* avoid warning */
-    (void)&pci_host_data_readl; /* avoid warning */
-
     s = qemu_mallocz(sizeof(GT64120State));
     s->pci = qemu_mallocz(sizeof(GT64120PCIState));
 
-    s->pci->bus = pci_register_bus(pci_gt64120_set_irq, pci_gt64120_map_irq,
+    s->pci->bus = pci_register_bus(NULL, "pci",
+                                   pci_gt64120_set_irq, pci_gt64120_map_irq,
                                    pic, 144, 4);
-    s->ISD_handle = cpu_register_io_memory(0, gt64120_read, gt64120_write, s);
+    s->ISD_handle = cpu_register_io_memory(gt64120_read, gt64120_write, s);
     d = pci_register_device(s->pci->bus, "GT64120 PCI Bus", sizeof(PCIDevice),
                             0, gt64120_read_config, gt64120_write_config);
 
     /* FIXME: Malta specific hw assumptions ahead */
 
-    d->config[0x00] = 0xab; /* vendor_id */
-    d->config[0x01] = 0x11;
-    d->config[0x02] = 0x20; /* device_id */
-    d->config[0x03] = 0x46;
+    pci_config_set_vendor_id(d->config, PCI_VENDOR_ID_MARVELL);
+    pci_config_set_device_id(d->config, PCI_DEVICE_ID_MARVELL_GT6412X);
 
     d->config[0x04] = 0x00;
     d->config[0x05] = 0x00;
@@ -1149,8 +1139,7 @@ PCIBus *pci_gt64120_init(qemu_irq *pic)
 
     d->config[0x08] = 0x10;
     d->config[0x09] = 0x00;
-    d->config[0x0A] = 0x00;
-    d->config[0x0B] = 0x06;
+    pci_config_set_class(d->config, PCI_CLASS_BRIDGE_HOST);
 
     d->config[0x10] = 0x08;
     d->config[0x14] = 0x08;

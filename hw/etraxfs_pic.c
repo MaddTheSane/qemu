@@ -22,186 +22,147 @@
  * THE SOFTWARE.
  */
 
-#include <stdio.h>
+#include "sysbus.h"
 #include "hw.h"
+//#include "pc.h"
+//#include "etraxfs.h"
 
 #define D(x)
 
-struct fs_pic_state_t
-{
-	CPUState *env;
-	target_phys_addr_t base;
+#define R_RW_MASK   0
+#define R_R_VECT    1
+#define R_R_MASKED_VECT 2
+#define R_R_NMI     3
+#define R_R_GURU    4
+#define R_MAX       5
 
-	uint32_t rw_mask;
-	/* Active interrupt lines.  */
-	uint32_t r_vect;
-	/* Active lines, gated through the mask.  */
-	uint32_t r_masked_vect;
-	uint32_t r_nmi;
-	uint32_t r_guru;
+struct etrax_pic
+{
+    SysBusDevice busdev;
+    void *interrupt_vector;
+    qemu_irq parent_irq;
+    qemu_irq parent_nmi;
+    uint32_t regs[R_MAX];
 };
 
-static uint32_t pic_readb (void *opaque, target_phys_addr_t addr)
-{
-	return 0;
-}
-static uint32_t pic_readw (void *opaque, target_phys_addr_t addr)
-{
-	return 0;
+static void pic_update(struct etrax_pic *fs)
+{   
+    uint32_t vector = 0;
+    int i;
+
+    fs->regs[R_R_MASKED_VECT] = fs->regs[R_R_VECT] & fs->regs[R_RW_MASK];
+
+    /* The ETRAX interrupt controller signals interrupts to teh core
+       through an interrupt request wire and an irq vector bus. If 
+       multiple interrupts are simultaneously active it chooses vector 
+       0x30 and lets the sw choose the priorities.  */
+    if (fs->regs[R_R_MASKED_VECT]) {
+        uint32_t mv = fs->regs[R_R_MASKED_VECT];
+        for (i = 0; i < 31; i++) {
+            if (mv & 1) {
+                vector = 0x31 + i;
+                /* Check for multiple interrupts.  */
+                if (mv > 1)
+                    vector = 0x30;
+                break;
+            }
+            mv >>= 1;
+        }
+    }
+
+    if (fs->interrupt_vector) {
+        /* hack alert: ptr property */
+        *(uint32_t*)(fs->interrupt_vector) = vector;
+    }
+    qemu_set_irq(fs->parent_irq, !!vector);
 }
 
 static uint32_t pic_readl (void *opaque, target_phys_addr_t addr)
 {
-	struct fs_pic_state_t *fs = opaque;
-	uint32_t rval;
+    struct etrax_pic *fs = opaque;
+    uint32_t rval;
 
-	/* Transform this to a relative addr.  */
-	addr -= fs->base;
-	switch (addr)
-	{
-		case 0x0: 
-			rval = fs->rw_mask;
-			break;
-		case 0x4: 
-			rval = fs->r_vect;
-			break;
-		case 0x8: 
-			rval = fs->r_masked_vect;
-			break;
-		case 0xc: 
-			rval = fs->r_nmi;
-			break;
-		case 0x10: 
-			rval = fs->r_guru;
-			break;
-		default:
-			cpu_abort(fs->env, "invalid PIC register.\n");
-			break;
-
-	}
-	D(printf("%s %x=%x\n", __func__, addr, rval));
-	return rval;
-}
-
-static void
-pic_writeb (void *opaque, target_phys_addr_t addr, uint32_t value)
-{
-}
-
-static void
-pic_writew (void *opaque, target_phys_addr_t addr, uint32_t value)
-{
+    rval = fs->regs[addr >> 2];
+    D(printf("%s %x=%x\n", __func__, addr, rval));
+    return rval;
 }
 
 static void
 pic_writel (void *opaque, target_phys_addr_t addr, uint32_t value)
 {
-	struct fs_pic_state_t *fs = opaque;
-	D(printf("%s addr=%x val=%x\n", __func__, addr, value));
-	/* Transform this to a relative addr.  */
-	addr -= fs->base;
-	switch (addr) 
-	{
-		case 0x0: 
-			fs->rw_mask = value;
-			break;
-		case 0x4: 
-			fs->r_vect = value;
-			break;
-		case 0x8: 
-			fs->r_masked_vect = value;
-			break;
-		case 0xc: 
-			fs->r_nmi = value;
-			break;
-		case 0x10: 
-			fs->r_guru = value;
-			break;
-		default:
-			cpu_abort(fs->env, "invalid PIC register.\n");
-			break;
-	}
+    struct etrax_pic *fs = opaque;
+    D(printf("%s addr=%x val=%x\n", __func__, addr, value));
+
+    if (addr == R_RW_MASK) {
+        fs->regs[R_RW_MASK] = value;
+        pic_update(fs);
+    }
 }
 
-static CPUReadMemoryFunc *pic_read[] = {
-	&pic_readb,
-	&pic_readw,
-	&pic_readl,
+static CPUReadMemoryFunc * const pic_read[] = {
+    NULL, NULL,
+    &pic_readl,
 };
 
-static CPUWriteMemoryFunc *pic_write[] = {
-	&pic_writeb,
-	&pic_writew,
-	&pic_writel,
+static CPUWriteMemoryFunc * const pic_write[] = {
+    NULL, NULL,
+    &pic_writel,
 };
 
-void pic_info(void)
+static void nmi_handler(void *opaque, int irq, int level)
+{   
+    struct etrax_pic *fs = (void *)opaque;
+    uint32_t mask;
+
+    mask = 1 << irq;
+    if (level)
+        fs->regs[R_R_NMI] |= mask;
+    else
+        fs->regs[R_R_NMI] &= ~mask;
+
+    qemu_set_irq(fs->parent_nmi, !!fs->regs[R_R_NMI]);
+}
+
+static void irq_handler(void *opaque, int irq, int level)
+{   
+    struct etrax_pic *fs = (void *)opaque;
+
+    if (irq >= 30)
+        return nmi_handler(opaque, irq, level);
+
+    irq -= 1;
+    fs->regs[R_R_VECT] &= ~(1 << irq);
+    fs->regs[R_R_VECT] |= (!!level << irq);
+    pic_update(fs);
+}
+
+static int etraxfs_pic_init(SysBusDevice *dev)
 {
+    struct etrax_pic *s = FROM_SYSBUS(typeof (*s), dev);
+    int intr_vect_regs;
+
+    qdev_init_gpio_in(&dev->qdev, irq_handler, 32);
+    sysbus_init_irq(dev, &s->parent_irq);
+    sysbus_init_irq(dev, &s->parent_nmi);
+
+    intr_vect_regs = cpu_register_io_memory(pic_read, pic_write, s);
+    sysbus_init_mmio(dev, R_MAX * 4, intr_vect_regs);
+    return 0;
 }
 
-void irq_info(void)
+static SysBusDeviceInfo etraxfs_pic_info = {
+    .init = etraxfs_pic_init,
+    .qdev.name  = "etraxfs,pic",
+    .qdev.size  = sizeof(struct etrax_pic),
+    .qdev.props = (Property[]) {
+        DEFINE_PROP_PTR("interrupt_vector", struct etrax_pic, interrupt_vector),
+        DEFINE_PROP_END_OF_LIST(),
+    }
+};
+
+static void etraxfs_pic_register(void)
 {
+    sysbus_register_withprop(&etraxfs_pic_info);
 }
 
-static void etraxfs_pic_handler(void *opaque, int irq, int level)
-{	
-	struct fs_pic_state_t *fs = (void *)opaque;
-	CPUState *env = fs->env;
-	int i;
-	uint32_t vector = 0;
-
-	D(printf("%s irq=%d level=%d mask=%x v=%x mv=%x\n", 
-		 __func__, irq, level,
-		 fs->rw_mask, fs->r_vect, fs->r_masked_vect));
-
-	fs->r_vect &= ~(1 << irq);
-	fs->r_vect |= (!!level << irq);
-	fs->r_masked_vect = fs->r_vect & fs->rw_mask;
-
-	/* The ETRAX interrupt controller signals interrupts to teh core
-	   through an interrupt request wire and an irq vector bus. If 
-	   multiple interrupts are simultaneously active it chooses vector 
-	   0x30 and lets the sw choose the priorities.  */
-	if (fs->r_masked_vect) {
-		uint32_t mv = fs->r_masked_vect;
-		for (i = 0; i < 31; i++) {
-			if (mv & 1) {
-				vector = 0x31 + i;
-				/* Check for multiple interrupts.  */
-				if (mv > 1)
-					vector = 0x30;
-				break;
-			}
-			mv >>= 1;
-		}
-		if (vector) {
-			env->interrupt_vector = vector;
-			D(printf("%s vector=%x\n", __func__, vector));
-			cpu_interrupt(env, CPU_INTERRUPT_HARD);
-		}
-	} else {
-		env->interrupt_vector = 0;
-		cpu_reset_interrupt(env, CPU_INTERRUPT_HARD);
-		D(printf("%s reset irqs\n", __func__));
-	}
-}
-
-qemu_irq *etraxfs_pic_init(CPUState *env, target_phys_addr_t base)
-{
-	struct fs_pic_state_t *fs;
-	qemu_irq *pic;
-	int intr_vect_regs;
-
-	fs = qemu_mallocz(sizeof *fs);
-	if (!fs)
-		return NULL;
-	fs->env = env;
-
-	pic = qemu_allocate_irqs(etraxfs_pic_handler, fs, 30);
-
-	intr_vect_regs = cpu_register_io_memory(0, pic_read, pic_write, fs);
-	cpu_register_physical_memory(base, 0x14, intr_vect_regs);
-	fs->base = base;
-
-	return pic;
-}
+device_init(etraxfs_pic_register)

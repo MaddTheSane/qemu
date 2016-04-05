@@ -9,25 +9,14 @@
 
 static void sbappendsb(struct sbuf *sb, struct mbuf *m);
 
-/* Done as a macro in socket.h */
-/* int
- * sbspace(struct sockbuff *sb)
- * {
- *	return SB_DATALEN - sb->sb_cc;
- * }
- */
-
 void
-sbfree(sb)
-	struct sbuf *sb;
+sbfree(struct sbuf *sb)
 {
 	free(sb->sb_data);
 }
 
 void
-sbdrop(sb, num)
-	struct sbuf *sb;
-	int num;
+sbdrop(struct sbuf *sb, int num)
 {
 	/*
 	 * We can only drop how much we have
@@ -43,9 +32,7 @@ sbdrop(sb, num)
 }
 
 void
-sbreserve(sb, size)
-	struct sbuf *sb;
-	int size;
+sbreserve(struct sbuf *sb, int size)
 {
 	if (sb->sb_data) {
 		/* Already alloced, realloc if necessary */
@@ -74,9 +61,7 @@ sbreserve(sb, size)
  * (the socket is non-blocking, so we won't hang)
  */
 void
-sbappend(so, m)
-	struct socket *so;
-	struct mbuf *m;
+sbappend(struct socket *so, struct mbuf *m)
 {
 	int ret = 0;
 
@@ -108,7 +93,7 @@ sbappend(so, m)
 	 * ottherwise it'll arrive out of order, and hence corrupt
 	 */
 	if (!so->so_rcv.sb_cc)
-	   ret = send(so->s, m->m_data, m->m_len, 0);
+	   ret = slirp_send(so, m->m_data, m->m_len, 0);
 
 	if (ret <= 0) {
 		/*
@@ -173,11 +158,7 @@ sbappendsb(struct sbuf *sb, struct mbuf *m)
  * done in sbdrop when the data is acked
  */
 void
-sbcopy(sb, off, len, to)
-	struct sbuf *sb;
-	int off;
-	int len;
-	char *to;
+sbcopy(struct sbuf *sb, int off, int len, char *to)
 {
 	char *from;
 
@@ -198,4 +179,3 @@ sbcopy(sb, off, len, to)
 		   memcpy(to+off,sb->sb_data,len);
 	}
 }
-

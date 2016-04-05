@@ -25,12 +25,12 @@
 #include "qemu-char.h"
 #include "qemu-timer.h"
 #include "usb.h"
-#include <assert.h>
+#include "baum.h"
 #include <brlapi.h>
 #include <brlapi_constants.h>
 #include <brlapi_keycodes.h>
 #ifdef CONFIG_SDL
-#include <SDL/SDL_syswm.h>
+#include <SDL_syswm.h>
 #endif
 
 #if 0
@@ -90,7 +90,7 @@ typedef struct {
 
     brlapi_handle_t *brlapi;
     int brlapi_fd;
-    int x, y;
+    unsigned int x, y;
 
     uint8_t in_buf[BUF_SIZE];
     uint8_t in_buf_used;
@@ -335,7 +335,8 @@ static int baum_eat_packet(BaumDriverState *baum, const uint8_t *buf, int len)
         int i;
 
         /* Allow 100ms to complete the DisplayData packet */
-        qemu_mod_timer(baum->cellCount_timer, qemu_get_clock(vm_clock) + ticks_per_sec / 10);
+        qemu_mod_timer(baum->cellCount_timer, qemu_get_clock(vm_clock) +
+                       get_ticks_per_sec() / 10);
         for (i = 0; i < baum->x * baum->y ; i++) {
             EAT(c);
             cells[i] = c;
@@ -356,12 +357,12 @@ static int baum_eat_packet(BaumDriverState *baum, const uint8_t *buf, int len)
             .displayNumber = BRLAPI_DISPLAY_DEFAULT,
             .regionBegin = 1,
             .regionSize = baum->x * baum->y,
-            .text = text,
+            .text = (char *)text,
             .textSize = baum->x * baum->y,
             .andMask = zero,
             .orMask = cells,
             .cursor = cursor,
-            .charset = "ISO-8859-1",
+            .charset = (char *)"ISO-8859-1",
         };
 
         if (brlapi__write(baum->brlapi, &wa) == -1)
@@ -474,7 +475,7 @@ static void baum_send_event(CharDriverState *chr, int event)
     switch (event) {
     case CHR_EVENT_BREAK:
         break;
-    case CHR_EVENT_RESET:
+    case CHR_EVENT_OPENED:
         /* Reset state */
         baum->in_buf_used = 0;
         break;
@@ -558,12 +559,12 @@ static void baum_chr_read(void *opaque)
     if (ret == -1 && (brlapi_errno != BRLAPI_ERROR_LIBCERR || errno != EINTR)) {
         brlapi_perror("baum: brlapi_readKey");
         brlapi__closeConnection(baum->brlapi);
-        free(baum->brlapi);
+        qemu_free(baum->brlapi);
         baum->brlapi = NULL;
     }
 }
 
-CharDriverState *chr_baum_init(void)
+CharDriverState *chr_baum_init(QemuOpts *opts)
 {
     BaumDriverState *baum;
     CharDriverState *chr;
@@ -574,12 +575,7 @@ CharDriverState *chr_baum_init(void)
     int tty;
 
     baum = qemu_mallocz(sizeof(BaumDriverState));
-    if (!baum)
-        return NULL;
-
     baum->chr = chr = qemu_mallocz(sizeof(CharDriverState));
-    if (!chr)
-        goto fail_baum;
 
     chr->opaque = baum;
     chr->chr_write = baum_write;
@@ -587,8 +583,6 @@ CharDriverState *chr_baum_init(void)
     chr->chr_accept_input = baum_accept_input;
 
     handle = qemu_mallocz(brlapi_getHandleSize());
-    if (!handle)
-        goto fail_chr;
     baum->brlapi = handle;
 
     baum->brlapi_fd = brlapi__openConnection(handle, NULL, NULL);
@@ -620,7 +614,7 @@ CharDriverState *chr_baum_init(void)
 
     qemu_set_fd_handler(baum->brlapi_fd, baum_chr_read, NULL, baum);
 
-    qemu_chr_reset(chr);
+    qemu_chr_generic_open(chr);
 
     return chr;
 
@@ -628,16 +622,8 @@ fail:
     qemu_free_timer(baum->cellCount_timer);
     brlapi__closeConnection(handle);
 fail_handle:
-    free(handle);
-fail_chr:
-    free(chr);
-fail_baum:
-    free(baum);
+    qemu_free(handle);
+    qemu_free(chr);
+    qemu_free(baum);
     return NULL;
-}
-
-USBDevice *usb_baum_init(void)
-{
-    /* USB Product ID of Super Vario 40 */
-    return usb_serial_init("productid=FE72:braille");
 }

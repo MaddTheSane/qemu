@@ -47,16 +47,11 @@ static struct {
     int freq;
     int nb_channels;
     int bufsize;
-    int threshold;
     int broken_adc;
 } conf = {
-    NULL,
-    2048 * 2,
-    44100,
-    2,
-    0,
-    0,
-    0
+    .nb_samples  = 2048 * 2,
+    .freq        = 44100,
+    .nb_channels = 2,
 };
 
 static void GCC_FMT_ATTR (1, 2) fmod_logerr (const char *fmt, ...)
@@ -142,8 +137,8 @@ static void fmod_write_sample (HWVoiceOut *hw, uint8_t *dst, int dst_len)
     int src_len1 = dst_len;
     int src_len2 = 0;
     int pos = hw->rpos + dst_len;
-    st_sample_t *src1 = hw->mix_buf + hw->rpos;
-    st_sample_t *src2 = NULL;
+    struct st_sample *src1 = hw->mix_buf + hw->rpos;
+    struct st_sample *src2 = NULL;
 
     if (pos > hw->samples) {
         src_len1 = hw->samples - hw->rpos;
@@ -229,24 +224,15 @@ static int fmod_lock_sample (
     return 0;
 }
 
-static int fmod_run_out (HWVoiceOut *hw)
+static int fmod_run_out (HWVoiceOut *hw, int live)
 {
     FMODVoiceOut *fmd = (FMODVoiceOut *) hw;
-    int live, decr;
+    int decr;
     void *p1 = 0, *p2 = 0;
     unsigned int blen1 = 0, blen2 = 0;
     unsigned int len1 = 0, len2 = 0;
-    int nb_live;
 
-    live = audio_pcm_hw_get_live_out2 (hw, &nb_live);
-    if (!live) {
-        return 0;
-    }
-
-    if (!hw->pending_disable
-        && nb_live
-        && (conf.threshold && live <= conf.threshold)) {
-        ldebug ("live=%d nb_live=%d\n", live, nb_live);
+    if (!hw->pending_disable) {
         return 0;
     }
 
@@ -355,11 +341,11 @@ static void fmod_fini_out (HWVoiceOut *hw)
     }
 }
 
-static int fmod_init_out (HWVoiceOut *hw, audsettings_t *as)
+static int fmod_init_out (HWVoiceOut *hw, struct audsettings *as)
 {
     int bits16, mode, channel;
     FMODVoiceOut *fmd = (FMODVoiceOut *) hw;
-    audsettings_t obt_as = *as;
+    struct audsettings obt_as = *as;
 
     mode = aud_to_fmodfmt (as->fmt, as->nchannels == 2 ? 1 : 0);
     fmd->fmod_sample = FSOUND_Sample_Alloc (
@@ -417,11 +403,11 @@ static int fmod_ctl_out (HWVoiceOut *hw, int cmd, ...)
     return 0;
 }
 
-static int fmod_init_in (HWVoiceIn *hw, audsettings_t *as)
+static int fmod_init_in (HWVoiceIn *hw, struct audsettings *as)
 {
     int bits16, mode;
     FMODVoiceIn *fmd = (FMODVoiceIn *) hw;
-    audsettings_t obt_as = *as;
+    struct audsettings obt_as = *as;
 
     if (conf.broken_adc) {
         return -1;
@@ -517,27 +503,27 @@ static struct {
     const char *name;
     int type;
 } drvtab[] = {
-    {"none", FSOUND_OUTPUT_NOSOUND},
+    { .name = "none",   .type = FSOUND_OUTPUT_NOSOUND },
 #ifdef _WIN32
-    {"winmm", FSOUND_OUTPUT_WINMM},
-    {"dsound", FSOUND_OUTPUT_DSOUND},
-    {"a3d", FSOUND_OUTPUT_A3D},
-    {"asio", FSOUND_OUTPUT_ASIO},
+    { .name = "winmm",  .type = FSOUND_OUTPUT_WINMM   },
+    { .name = "dsound", .type = FSOUND_OUTPUT_DSOUND  },
+    { .name = "a3d",    .type = FSOUND_OUTPUT_A3D     },
+    { .name = "asio",   .type = FSOUND_OUTPUT_ASIO    },
 #endif
 #ifdef __linux__
-    {"oss", FSOUND_OUTPUT_OSS},
-    {"alsa", FSOUND_OUTPUT_ALSA},
-    {"esd", FSOUND_OUTPUT_ESD},
+    { .name = "oss",    .type = FSOUND_OUTPUT_OSS     },
+    { .name = "alsa",   .type = FSOUND_OUTPUT_ALSA    },
+    { .name = "esd",    .type = FSOUND_OUTPUT_ESD     },
 #endif
 #ifdef __APPLE__
-    {"mac", FSOUND_OUTPUT_MAC},
+    { .name = "mac",    .type = FSOUND_OUTPUT_MAC     },
 #endif
 #if 0
-    {"xbox", FSOUND_OUTPUT_XBOX},
-    {"ps2", FSOUND_OUTPUT_PS2},
-    {"gcube", FSOUND_OUTPUT_GC},
+    { .name = "xbox",   .type = FSOUND_OUTPUT_XBOX    },
+    { .name = "ps2",    .type = FSOUND_OUTPUT_PS2     },
+    { .name = "gcube",  .type = FSOUND_OUTPUT_GC      },
 #endif
-    {"none-realtime", FSOUND_OUTPUT_NOSOUND_NONREALTIME}
+    { .name = "none-realtime", .type = FSOUND_OUTPUT_NOSOUND_NONREALTIME }
 };
 
 static void *fmod_audio_init (void)
@@ -564,7 +550,7 @@ static void *fmod_audio_init (void)
 
     if (drv) {
         int found = 0;
-        for (i = 0; i < sizeof (drvtab) / sizeof (drvtab[0]); i++) {
+        for (i = 0; i < ARRAY_SIZE (drvtab); i++) {
             if (!strcmp (drv, drvtab[i].name)) {
                 output_type = drvtab[i].type;
                 found = 1;
@@ -574,7 +560,7 @@ static void *fmod_audio_init (void)
         if (!found) {
             dolog ("Unknown FMOD driver `%s'\n", drv);
             dolog ("Valid drivers:\n");
-            for (i = 0; i < sizeof (drvtab) / sizeof (drvtab[0]); i++) {
+            for (i = 0; i < ARRAY_SIZE (drvtab); i++) {
                 dolog ("  %s\n", drvtab[i].name);
             }
         }
@@ -639,48 +625,63 @@ static void fmod_audio_fini (void *opaque)
 }
 
 static struct audio_option fmod_options[] = {
-    {"DRV", AUD_OPT_STR, &conf.drvname,
-     "FMOD driver", NULL, 0},
-    {"FREQ", AUD_OPT_INT, &conf.freq,
-     "Default frequency", NULL, 0},
-    {"SAMPLES", AUD_OPT_INT, &conf.nb_samples,
-     "Buffer size in samples", NULL, 0},
-    {"CHANNELS", AUD_OPT_INT, &conf.nb_channels,
-     "Number of default channels (1 - mono, 2 - stereo)", NULL, 0},
-    {"BUFSIZE", AUD_OPT_INT, &conf.bufsize,
-     "(undocumented)", NULL, 0},
-#if 0
-    {"THRESHOLD", AUD_OPT_INT, &conf.threshold,
-     "(undocumented)"},
-#endif
-
-    {NULL, 0, NULL, NULL, NULL, 0}
+    {
+        .name  = "DRV",
+        .tag   = AUD_OPT_STR,
+        .valp  = &conf.drvname,
+        .descr = "FMOD driver"
+    },
+    {
+        .name  = "FREQ",
+        .tag   = AUD_OPT_INT,
+        .valp  = &conf.freq,
+        .descr = "Default frequency"
+    },
+    {
+        .name  = "SAMPLES",
+        .tag   = AUD_OPT_INT,
+        .valp  = &conf.nb_samples,
+        .descr = "Buffer size in samples"
+    },
+    {
+        .name  = "CHANNELS",
+        .tag   = AUD_OPT_INT,
+        .valp  = &conf.nb_channels,
+        .descr = "Number of default channels (1 - mono, 2 - stereo)"
+    },
+    {
+        .name  = "BUFSIZE",
+        .tag   = AUD_OPT_INT,
+        .valp  = &conf.bufsize,
+        .descr = "(undocumented)"
+    },
+    { /* End of list */ }
 };
 
 static struct audio_pcm_ops fmod_pcm_ops = {
-    fmod_init_out,
-    fmod_fini_out,
-    fmod_run_out,
-    fmod_write,
-    fmod_ctl_out,
+    .init_out = fmod_init_out,
+    .fini_out = fmod_fini_out,
+    .run_out  = fmod_run_out,
+    .write    = fmod_write,
+    .ctl_out  = fmod_ctl_out,
 
-    fmod_init_in,
-    fmod_fini_in,
-    fmod_run_in,
-    fmod_read,
-    fmod_ctl_in
+    .init_in  = fmod_init_in,
+    .fini_in  = fmod_fini_in,
+    .run_in   = fmod_run_in,
+    .read     = fmod_read,
+    .ctl_in   = fmod_ctl_in
 };
 
 struct audio_driver fmod_audio_driver = {
-    INIT_FIELD (name           = ) "fmod",
-    INIT_FIELD (descr          = ) "FMOD 3.xx http://www.fmod.org",
-    INIT_FIELD (options        = ) fmod_options,
-    INIT_FIELD (init           = ) fmod_audio_init,
-    INIT_FIELD (fini           = ) fmod_audio_fini,
-    INIT_FIELD (pcm_ops        = ) &fmod_pcm_ops,
-    INIT_FIELD (can_be_default = ) 1,
-    INIT_FIELD (max_voices_out = ) INT_MAX,
-    INIT_FIELD (max_voices_in  = ) INT_MAX,
-    INIT_FIELD (voice_size_out = ) sizeof (FMODVoiceOut),
-    INIT_FIELD (voice_size_in  = ) sizeof (FMODVoiceIn)
+    .name           = "fmod",
+    .descr          = "FMOD 3.xx http://www.fmod.org",
+    .options        = fmod_options,
+    .init           = fmod_audio_init,
+    .fini           = fmod_audio_fini,
+    .pcm_ops        = &fmod_pcm_ops,
+    .can_be_default = 1,
+    .max_voices_out = INT_MAX,
+    .max_voices_in  = INT_MAX,
+    .voice_size_out = sizeof (FMODVoiceOut),
+    .voice_size_in  = sizeof (FMODVoiceIn)
 };

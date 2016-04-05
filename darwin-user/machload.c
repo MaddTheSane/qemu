@@ -14,8 +14,7 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include <stdio.h>
 #include <sys/types.h>
@@ -39,9 +38,9 @@
 //#define DEBUG_MACHLOAD
 
 #ifdef DEBUG_MACHLOAD
-# define DPRINTF(...) do { if(loglevel) fprintf(logfile, __VA_ARGS__); printf(__VA_ARGS__); } while(0)
+# define DPRINTF(...) do { qemu_log(__VA_ARGS__); printf(__VA_ARGS__); } while(0)
 #else
-# define DPRINTF(...) do { if(loglevel) fprintf(logfile, __VA_ARGS__); } while(0)
+# define DPRINTF(...) do { qemu_log(__VA_ARGS__); } while(0)
 #endif
 
 # define check_mach_header(x) (x.magic == MH_CIGAM)

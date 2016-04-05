@@ -25,17 +25,12 @@
 #if !defined(PPC_4XX_H)
 #define PPC_4XX_H
 
+#include "pci.h"
+
 /* PowerPC 4xx core initialization */
-CPUState *ppc4xx_init (const unsigned char *cpu_model,
+CPUState *ppc4xx_init (const char *cpu_model,
                        clk_setup_t *cpu_clk, clk_setup_t *tb_clk,
                        uint32_t sysclk);
-
-typedef struct ppc4xx_mmio_t ppc4xx_mmio_t;
-int ppc4xx_mmio_register (CPUState *env, ppc4xx_mmio_t *mmio,
-                          target_phys_addr_t offset, uint32_t len,
-                          CPUReadMemoryFunc **mem_read,
-                          CPUWriteMemoryFunc **mem_write, void *opaque);
-ppc4xx_mmio_t *ppc4xx_mmio_init (CPUState *env, target_phys_addr_t base);
 
 /* PowerPC 4xx universal interrupt controller */
 enum {
@@ -45,5 +40,21 @@ enum {
 };
 qemu_irq *ppcuic_init (CPUState *env, qemu_irq *irqs,
                        uint32_t dcr_base, int has_ssr, int has_vr);
+
+ram_addr_t ppc4xx_sdram_adjust(ram_addr_t ram_size, int nr_banks,
+                               target_phys_addr_t ram_bases[],
+                               target_phys_addr_t ram_sizes[],
+                               const unsigned int sdram_bank_sizes[]);
+
+void ppc4xx_sdram_init (CPUState *env, qemu_irq irq, int nbanks,
+                        target_phys_addr_t *ram_bases,
+                        target_phys_addr_t *ram_sizes,
+                        int do_init);
+
+PCIBus *ppc4xx_pci_init(CPUState *env, qemu_irq pci_irqs[4],
+                        target_phys_addr_t config_space,
+                        target_phys_addr_t int_ack,
+                        target_phys_addr_t special_cycle,
+                        target_phys_addr_t registers);
 
 #endif /* !defined(PPC_4XX_H) */

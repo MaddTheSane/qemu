@@ -35,35 +35,30 @@
 #define ldebug(...)
 #endif
 
-#ifdef WORDS_BIGENDIAN
+#ifdef HOST_WORDS_BIGENDIAN
 #define GUS_ENDIANNESS 1
 #else
 #define GUS_ENDIANNESS 0
 #endif
 
 #define IO_READ_PROTO(name) \
-    uint32_t name (void *opaque, uint32_t nport)
+    static uint32_t name (void *opaque, uint32_t nport)
 #define IO_WRITE_PROTO(name) \
-    void name (void *opaque, uint32_t nport, uint32_t val)
-
-static struct {
-    int port;
-    int irq;
-    int dma;
-    int freq;
-} conf = {0x240, 7, 3, 44100};
+    static void name (void *opaque, uint32_t nport, uint32_t val)
 
 typedef struct GUSState {
+    ISADevice dev;
     GUSEmuState emu;
     QEMUSoundCard card;
-    int freq;
+    uint32_t freq;
+    uint32_t port;
     int pos, left, shift, irqs;
-    uint16_t *mixbuf;
+    GUSsample *mixbuf;
     uint8_t himem[1024 * 1024 + 32 + 4096];
     int samples;
     SWVoiceOut *voice;
     int64_t last_ticks;
-    qemu_irq *pic;
+    qemu_irq pic;
 } GUSState;
 
 IO_READ_PROTO (gus_readb)
@@ -161,15 +156,15 @@ static void GUS_callback (void *opaque, int free)
     }
     s->left = samples;
 
-reset:
-    gus_irqgen (&s->emu, (double) (net * 1000000) / s->freq);
+ reset:
+    gus_irqgen (&s->emu, muldiv64 (net, 1000000, s->freq));
 }
 
 int GUS_irqrequest (GUSEmuState *emu, int hwirq, int n)
 {
     GUSState *s = emu->opaque;
-    /* qemu_irq_lower (s->pic[hwirq]); */
-    qemu_irq_raise (s->pic[hwirq]);
+    /* qemu_irq_lower (s->pic); */
+    qemu_irq_raise (s->pic);
     s->irqs += n;
     ldebug ("irqrequest %d %d %d\n", hwirq, n, s->irqs);
     return n;
@@ -179,7 +174,7 @@ void GUS_irqclear (GUSEmuState *emu, int hwirq)
 {
     GUSState *s = emu->opaque;
     ldebug ("irqclear %d %d\n", hwirq, s->irqs);
-    qemu_irq_lower (s->pic[hwirq]);
+    qemu_irq_lower (s->pic);
     s->irqs -= 1;
 #ifdef IRQ_STORM
     if (s->irqs > 0) {
@@ -195,10 +190,10 @@ void GUS_dmarequest (GUSEmuState *der)
     DMA_hold_DREQ (der->gusdma);
 }
 
-int GUS_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
+static int GUS_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
 {
     GUSState *s = opaque;
-    int8_t tmpbuf[4096];
+    char tmpbuf[4096];
     int pos = dma_pos, mode, left = dma_len - dma_pos;
 
     ldebug ("read DMA %#x %d\n", dma_pos, dma_len);
@@ -220,26 +215,31 @@ int GUS_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
     return dma_len;
 }
 
-int GUS_init (AudioState *audio, qemu_irq *pic)
+static const VMStateDescription vmstate_gus = {
+    .name = "gus",
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .minimum_version_id_old = 2,
+    .fields      = (VMStateField []) {
+        VMSTATE_INT32(pos, GUSState),
+        VMSTATE_INT32(left, GUSState),
+        VMSTATE_INT32(shift, GUSState),
+        VMSTATE_INT32(irqs, GUSState),
+        VMSTATE_INT32(samples, GUSState),
+        VMSTATE_INT64(last_ticks, GUSState),
+        VMSTATE_BUFFER(himem, GUSState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int gus_initfn (ISADevice *dev)
 {
-    GUSState *s;
-    audsettings_t as;
+    GUSState *s = DO_UPCAST(GUSState, dev, dev);
+    struct audsettings as;
 
-    if (!audio) {
-        dolog ("No audio state\n");
-        return -1;
-    }
+    AUD_register_card ("gus", &s->card);
 
-    s = qemu_mallocz (sizeof (*s));
-    if (!s) {
-        dolog ("Could not allocate memory for GUS (%zu bytes)\n",
-               sizeof (*s));
-        return -1;
-    }
-
-    AUD_register_card (audio, "gus", &s->card);
-
-    as.freq = conf.freq;
+    as.freq = s->freq;
     as.nchannels = 2;
     as.fmt = AUD_FMT_S16;
     as.endianness = GUS_ENDIANNESS;
@@ -255,46 +255,64 @@ int GUS_init (AudioState *audio, qemu_irq *pic)
 
     if (!s->voice) {
         AUD_remove_card (&s->card);
-        qemu_free (s);
         return -1;
     }
 
     s->shift = 2;
     s->samples = AUD_get_buffer_size_out (s->voice) >> s->shift;
     s->mixbuf = qemu_mallocz (s->samples << s->shift);
-    if (!s->mixbuf) {
-        AUD_close_out (&s->card, s->voice);
-        AUD_remove_card (&s->card);
-        qemu_free (s);
-        return -1;
-    }
 
-    register_ioport_write (conf.port, 1, 1, gus_writeb, s);
-    register_ioport_write (conf.port, 1, 2, gus_writew, s);
+    register_ioport_write (s->port, 1, 1, gus_writeb, s);
+    register_ioport_write (s->port, 1, 2, gus_writew, s);
 
-    register_ioport_read ((conf.port + 0x100) & 0xf00, 1, 1, gus_readb, s);
-    register_ioport_read ((conf.port + 0x100) & 0xf00, 1, 2, gus_readw, s);
+    register_ioport_read ((s->port + 0x100) & 0xf00, 1, 1, gus_readb, s);
+    register_ioport_read ((s->port + 0x100) & 0xf00, 1, 2, gus_readw, s);
 
-    register_ioport_write (conf.port + 6, 10, 1, gus_writeb, s);
-    register_ioport_write (conf.port + 6, 10, 2, gus_writew, s);
-    register_ioport_read (conf.port + 6, 10, 1, gus_readb, s);
-    register_ioport_read (conf.port + 6, 10, 2, gus_readw, s);
+    register_ioport_write (s->port + 6, 10, 1, gus_writeb, s);
+    register_ioport_write (s->port + 6, 10, 2, gus_writew, s);
+    register_ioport_read (s->port + 6, 10, 1, gus_readb, s);
+    register_ioport_read (s->port + 6, 10, 2, gus_readw, s);
 
 
-    register_ioport_write (conf.port + 0x100, 8, 1, gus_writeb, s);
-    register_ioport_write (conf.port + 0x100, 8, 2, gus_writew, s);
-    register_ioport_read (conf.port + 0x100, 8, 1, gus_readb, s);
-    register_ioport_read (conf.port + 0x100, 8, 2, gus_readw, s);
+    register_ioport_write (s->port + 0x100, 8, 1, gus_writeb, s);
+    register_ioport_write (s->port + 0x100, 8, 2, gus_writew, s);
+    register_ioport_read (s->port + 0x100, 8, 1, gus_readb, s);
+    register_ioport_read (s->port + 0x100, 8, 2, gus_readw, s);
 
-    DMA_register_channel (conf.dma, GUS_read_DMA, s);
-    s->emu.gusirq = conf.irq;
-    s->emu.gusdma = conf.dma;
+    DMA_register_channel (s->emu.gusdma, GUS_read_DMA, s);
     s->emu.himemaddr = s->himem;
     s->emu.gusdatapos = s->emu.himemaddr + 1024 * 1024 + 32;
     s->emu.opaque = s;
-    s->freq = conf.freq;
-    s->pic = pic;
+    isa_init_irq (dev, &s->pic, s->emu.gusirq);
 
     AUD_set_active_out (s->voice, 1);
+
     return 0;
 }
+
+int GUS_init (qemu_irq *pic)
+{
+    isa_create_simple ("gus");
+    return 0;
+}
+
+static ISADeviceInfo gus_info = {
+    .qdev.name     = "gus",
+    .qdev.desc     = "Gravis Ultrasound GF1",
+    .qdev.size     = sizeof (GUSState),
+    .qdev.vmsd     = &vmstate_gus,
+    .init          = gus_initfn,
+    .qdev.props    = (Property[]) {
+        DEFINE_PROP_UINT32 ("freq",    GUSState, freq,        44100),
+        DEFINE_PROP_HEX32  ("iobase",  GUSState, port,        0x240),
+        DEFINE_PROP_UINT32 ("irq",     GUSState, emu.gusirq,  7),
+        DEFINE_PROP_UINT32 ("dma",     GUSState, emu.gusdma,  3),
+        DEFINE_PROP_END_OF_LIST (),
+    },
+};
+
+static void gus_register (void)
+{
+    isa_qdev_register (&gus_info);
+}
+device_init (gus_register)

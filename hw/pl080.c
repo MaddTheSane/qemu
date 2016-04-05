@@ -7,8 +7,7 @@
  * This code is licenced under the GPL.
  */
 
-#include "hw.h"
-#include "primecell.h"
+#include "sysbus.h"
 
 #define PL080_MAX_CHANNELS 8
 #define PL080_CONF_E    0x1
@@ -37,7 +36,7 @@ typedef struct {
 } pl080_channel;
 
 typedef struct {
-    uint32_t base;
+    SysBusDevice busdev;
     uint8_t tc_int;
     uint8_t tc_mask;
     uint8_t err_int;
@@ -80,7 +79,7 @@ static void pl080_run(pl080_state *s)
     int src_id;
     int dest_id;
     int size;
-    char buff[4];
+    uint8_t buff[4];
     uint32_t req;
 
     s->tc_mask = 0;
@@ -94,7 +93,7 @@ static void pl080_run(pl080_state *s)
     if ((s->conf & PL080_CONF_E) == 0)
         return;
 
-cpu_abort(cpu_single_env, "DMA active\n");
+hw_error("DMA active\n");
     /* If we are already in the middle of a DMA operation then indicate that
        there may be new DMA requests and return immediately.  */
     if (s->running) {
@@ -112,7 +111,7 @@ again:
                 continue;
             flow = (ch->conf >> 11) & 7;
             if (flow >= 4) {
-                cpu_abort(cpu_single_env,
+                hw_error(
                     "pl080_run: Peripheral flow control not implemented\n");
             }
             src_id = (ch->conf >> 1) & 0x1f;
@@ -187,7 +186,6 @@ static uint32_t pl080_read(void *opaque, target_phys_addr_t offset)
     uint32_t i;
     uint32_t mask;
 
-    offset -= s->base;
     if (offset >= 0xfe0 && offset < 0x1000) {
         if (s->nchannels == 8) {
             return pl080_id[(offset - 0xfe0) >> 2];
@@ -244,7 +242,7 @@ static uint32_t pl080_read(void *opaque, target_phys_addr_t offset)
         return s->sync;
     default:
     bad_offset:
-        cpu_abort(cpu_single_env, "pl080_read: Bad offset %x\n", (int)offset);
+        hw_error("pl080_read: Bad offset %x\n", (int)offset);
         return 0;
     }
 }
@@ -255,7 +253,6 @@ static void pl080_write(void *opaque, target_phys_addr_t offset,
     pl080_state *s = (pl080_state *)opaque;
     int i;
 
-    offset -= s->base;
     if (offset >= 0x100 && offset < 0x200) {
         i = (offset & 0xe0) >> 5;
         if (i >= s->nchannels)
@@ -291,13 +288,12 @@ static void pl080_write(void *opaque, target_phys_addr_t offset,
     case 10: /* SoftLBReq */
     case 11: /* SoftLSReq */
         /* ??? Implement these.  */
-        cpu_abort(cpu_single_env, "pl080_write: Soft DMA not implemented\n");
+        hw_error("pl080_write: Soft DMA not implemented\n");
         break;
     case 12: /* Configuration */
         s->conf = value;
         if (s->conf & (PL080_CONF_M1 | PL080_CONF_M1)) {
-            cpu_abort(cpu_single_env,
-                      "pl080_write: Big-endian DMA not implemented\n");
+            hw_error("pl080_write: Big-endian DMA not implemented\n");
         }
         pl080_run(s);
         break;
@@ -306,38 +302,53 @@ static void pl080_write(void *opaque, target_phys_addr_t offset,
         break;
     default:
     bad_offset:
-        cpu_abort(cpu_single_env, "pl080_write: Bad offset %x\n", (int)offset);
+        hw_error("pl080_write: Bad offset %x\n", (int)offset);
     }
     pl080_update(s);
 }
 
-static CPUReadMemoryFunc *pl080_readfn[] = {
+static CPUReadMemoryFunc * const pl080_readfn[] = {
    pl080_read,
    pl080_read,
    pl080_read
 };
 
-static CPUWriteMemoryFunc *pl080_writefn[] = {
+static CPUWriteMemoryFunc * const pl080_writefn[] = {
    pl080_write,
    pl080_write,
    pl080_write
 };
 
-/* The PL080 and PL081 are the same except for the number of channels
-   they implement (8 and 2 respectively).  */
-void *pl080_init(uint32_t base, qemu_irq irq, int nchannels)
+static int pl08x_init(SysBusDevice *dev, int nchannels)
 {
     int iomemtype;
-    pl080_state *s;
+    pl080_state *s = FROM_SYSBUS(pl080_state, dev);
 
-    s = (pl080_state *)qemu_mallocz(sizeof(pl080_state));
-    iomemtype = cpu_register_io_memory(0, pl080_readfn,
+    iomemtype = cpu_register_io_memory(pl080_readfn,
                                        pl080_writefn, s);
-    cpu_register_physical_memory(base, 0x00001000, iomemtype);
-    s->base = base;
-    s->irq = irq;
+    sysbus_init_mmio(dev, 0x1000, iomemtype);
+    sysbus_init_irq(dev, &s->irq);
     s->nchannels = nchannels;
     /* ??? Save/restore.  */
-    return s;
+    return 0;
 }
 
+static int pl080_init(SysBusDevice *dev)
+{
+    return pl08x_init(dev, 8);
+}
+
+static int pl081_init(SysBusDevice *dev)
+{
+    return pl08x_init(dev, 2);
+}
+
+/* The PL080 and PL081 are the same except for the number of channels
+   they implement (8 and 2 respectively).  */
+static void pl080_register_devices(void)
+{
+    sysbus_register_dev("pl080", sizeof(pl080_state), pl080_init);
+    sysbus_register_dev("pl081", sizeof(pl080_state), pl081_init);
+}
+
+device_init(pl080_register_devices)

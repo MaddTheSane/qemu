@@ -13,17 +13,14 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
- * MA 02111-1307 USA
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "hw.h"
 #include "omap.h"
 #include "sd.h"
 
 struct omap_mmc_s {
-    target_phys_addr_t base;
     qemu_irq irq;
     qemu_irq *dma;
     qemu_irq coverswitch;
@@ -114,7 +111,7 @@ static void omap_mmc_command(struct omap_mmc_s *host, int cmd, int dir,
 {
     uint32_t rspstatus, mask;
     int rsplen, timeout;
-    struct sd_request_s request;
+    SDRequest request;
     uint8_t response[16];
 
     if (init && cmd == 0) {
@@ -543,13 +540,13 @@ static void omap_mmc_write(void *opaque, target_phys_addr_t offset,
     }
 }
 
-static CPUReadMemoryFunc *omap_mmc_readfn[] = {
+static CPUReadMemoryFunc * const omap_mmc_readfn[] = {
     omap_badwidth_read16,
     omap_mmc_read,
     omap_badwidth_read16,
 };
 
-static CPUWriteMemoryFunc *omap_mmc_writefn[] = {
+static CPUWriteMemoryFunc * const omap_mmc_writefn[] = {
     omap_badwidth_write16,
     omap_mmc_write,
     omap_badwidth_write16,
@@ -581,7 +578,6 @@ struct omap_mmc_s *omap_mmc_init(target_phys_addr_t base,
             qemu_mallocz(sizeof(struct omap_mmc_s));
 
     s->irq = irq;
-    s->base = base;
     s->dma = dma;
     s->clk = clk;
     s->lines = 1;	/* TODO: needs to be settable per-board */
@@ -589,9 +585,9 @@ struct omap_mmc_s *omap_mmc_init(target_phys_addr_t base,
 
     omap_mmc_reset(s);
 
-    iomemtype = cpu_register_io_memory(0, omap_mmc_readfn,
+    iomemtype = cpu_register_io_memory(omap_mmc_readfn,
                     omap_mmc_writefn, s);
-    cpu_register_physical_memory(s->base, 0x800, iomemtype);
+    cpu_register_physical_memory(base, 0x800, iomemtype);
 
     /* Instantiate the storage */
     s->card = sd_init(bd, 0);
@@ -615,15 +611,15 @@ struct omap_mmc_s *omap2_mmc_init(struct omap_target_agent_s *ta,
 
     omap_mmc_reset(s);
 
-    iomemtype = cpu_register_io_memory(0, omap_mmc_readfn,
+    iomemtype = l4_register_io_memory(omap_mmc_readfn,
                     omap_mmc_writefn, s);
-    s->base = omap_l4_attach(ta, 0, iomemtype);
+    omap_l4_attach(ta, 0, iomemtype);
 
     /* Instantiate the storage */
     s->card = sd_init(bd, 0);
 
     s->cdet = qemu_allocate_irqs(omap_mmc_cover_cb, s, 1)[0];
-    sd_set_cb(s->card, 0, s->cdet);
+    sd_set_cb(s->card, NULL, s->cdet);
 
     return s;
 }

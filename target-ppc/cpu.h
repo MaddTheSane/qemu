@@ -14,8 +14,7 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #if !defined (__CPU_PPC_H__)
 #define __CPU_PPC_H__
@@ -27,29 +26,16 @@
 
 #if defined (TARGET_PPC64)
 /* PowerPC 64 definitions */
-typedef uint64_t ppc_gpr_t;
 #define TARGET_LONG_BITS 64
 #define TARGET_PAGE_BITS 12
 
 #else /* defined (TARGET_PPC64) */
 /* PowerPC 32 definitions */
-#if (HOST_LONG_BITS >= 64)
-/* When using 64 bits temporary registers,
- * we can use 64 bits GPR with no extra cost
- * It's even an optimization as this will prevent
- * the compiler to do unuseful masking in the micro-ops.
- */
-typedef uint64_t ppc_gpr_t;
-#else /* (HOST_LONG_BITS >= 64) */
-typedef uint32_t ppc_gpr_t;
-#endif /* (HOST_LONG_BITS >= 64) */
-
 #define TARGET_LONG_BITS 32
 
 #if defined(TARGET_PPCEMB)
 /* Specific definitions for PowerPC embedded */
 /* BookE have 36 bits physical address space */
-#define TARGET_PHYS_ADDR_BITS 64
 #if defined(CONFIG_USER_ONLY)
 /* It looks like a lot of Linux programs assume page size
  * is 4kB long. This is evil, but we have to deal with it...
@@ -66,11 +52,9 @@ typedef uint32_t ppc_gpr_t;
 
 #endif /* defined (TARGET_PPC64) */
 
-#include "cpu-defs.h"
+#define CPUState struct CPUPPCState
 
-#define REGX "%016" PRIx64
-#define ADDRX TARGET_FMT_lx
-#define PADDRX TARGET_FMT_plx
+#include "cpu-defs.h"
 
 #include <setjmp.h>
 
@@ -230,6 +214,7 @@ enum {
     /* Qemu exceptions: special cases we want to stop translation            */
     POWERPC_EXCP_SYNC         = 0x202, /* context synchronizing instruction  */
     POWERPC_EXCP_SYSCALL_USER = 0x203, /* System call in user mode only      */
+    POWERPC_EXCP_STCX         = 0x204 /* Conditional stores in user mode     */
 };
 
 /* Exceptions error codes                                                    */
@@ -307,22 +292,26 @@ typedef union ppc_tlb_t ppc_tlb_t;
 
 /* SPR access micro-ops generations callbacks */
 struct ppc_spr_t {
-    void (*uea_read)(void *opaque, int spr_num);
-    void (*uea_write)(void *opaque, int spr_num);
+    void (*uea_read)(void *opaque, int gpr_num, int spr_num);
+    void (*uea_write)(void *opaque, int spr_num, int gpr_num);
 #if !defined(CONFIG_USER_ONLY)
-    void (*oea_read)(void *opaque, int spr_num);
-    void (*oea_write)(void *opaque, int spr_num);
-    void (*hea_read)(void *opaque, int spr_num);
-    void (*hea_write)(void *opaque, int spr_num);
+    void (*oea_read)(void *opaque, int gpr_num, int spr_num);
+    void (*oea_write)(void *opaque, int spr_num, int gpr_num);
+    void (*hea_read)(void *opaque, int gpr_num, int spr_num);
+    void (*hea_write)(void *opaque, int spr_num, int gpr_num);
 #endif
-    const unsigned char *name;
+    const char *name;
 };
 
 /* Altivec registers (128 bits) */
 union ppc_avr_t {
+    float32 f[4];
     uint8_t u8[16];
     uint16_t u16[8];
     uint32_t u32[4];
+    int8_t s8[16];
+    int16_t s16[8];
+    int32_t s32[4];
     uint64_t u64[2];
 };
 
@@ -347,6 +336,12 @@ struct ppcemb_tlb_t {
 union ppc_tlb_t {
     ppc6xx_tlb_t tlb6;
     ppcemb_tlb_t tlbe;
+};
+
+typedef struct ppc_slb_t ppc_slb_t;
+struct ppc_slb_t {
+    uint64_t tmp64;
+    uint32_t tmp;
 };
 
 /*****************************************************************************/
@@ -534,6 +529,13 @@ enum {
                    0x1F)
 
 /*****************************************************************************/
+/* Vector status and control register */
+#define VSCR_NJ		16 /* Vector non-java */
+#define VSCR_SAT	0 /* Vector saturation */
+#define vscr_nj		(((env->vscr) >> VSCR_NJ)	& 0x1)
+#define vscr_sat	(((env->vscr) >> VSCR_SAT)	& 0x1)
+
+/*****************************************************************************/
 /* The whole PowerPC CPU context */
 #define NB_MMU_MODES 3
 
@@ -541,55 +543,49 @@ struct CPUPPCState {
     /* First are the most commonly used resources
      * during translated code execution
      */
-#if (HOST_LONG_BITS == 32)
-    /* temporary fixed-point registers
-     * used to emulate 64 bits registers on 32 bits hosts
-     */
-    uint64_t t0, t1, t2;
-#endif
-    ppc_avr_t avr0, avr1, avr2;
-
     /* general purpose registers */
-    ppc_gpr_t gpr[32];
+    target_ulong gpr[32];
 #if !defined(TARGET_PPC64)
     /* Storage for GPR MSB, used by the SPE extension */
-    ppc_gpr_t gprh[32];
+    target_ulong gprh[32];
 #endif
     /* LR */
     target_ulong lr;
     /* CTR */
     target_ulong ctr;
     /* condition register */
-    uint8_t crf[8];
+    uint32_t crf[8];
     /* XER */
-    /* XXX: We use only 5 fields, but we want to keep the structure aligned */
-    uint8_t xer[8];
+    target_ulong xer;
     /* Reservation address */
-    target_ulong reserve;
+    target_ulong reserve_addr;
+    /* Reservation value */
+    target_ulong reserve_val;
+    /* Reservation store address */
+    target_ulong reserve_ea;
+    /* Reserved store source register and size */
+    target_ulong reserve_info;
 
     /* Those ones are used in supervisor mode only */
     /* machine state register */
     target_ulong msr;
     /* temporary general purpose registers */
-    ppc_gpr_t tgpr[4]; /* Used to speed-up TLB assist handlers */
+    target_ulong tgpr[4]; /* Used to speed-up TLB assist handlers */
 
     /* Floating point execution context */
-    /* temporary float registers */
-    float64 ft0;
-    float64 ft1;
-    float64 ft2;
     float_status fp_status;
     /* floating point registers */
     float64 fpr[32];
     /* floating point status and control register */
     uint32_t fpscr;
 
-    CPU_COMMON
-
-    int halted; /* TRUE if the CPU is in suspend state */
+    /* Next instruction pointer */
+    target_ulong nip;
 
     int access_type; /* when a memory exception occurs, the access
                         type is stored here */
+
+    CPU_COMMON
 
     /* MMU context - only relevant for full system emulation */
 #if !defined(CONFIG_USER_ONLY)
@@ -597,11 +593,12 @@ struct CPUPPCState {
     /* Address space register */
     target_ulong asr;
     /* PowerPC 64 SLB area */
+    ppc_slb_t slb[64];
     int slb_nr;
 #endif
     /* segment registers */
     target_ulong sdr1;
-    target_ulong sr[16];
+    target_ulong sr[32];
     /* BATs */
     int nb_BATs;
     target_ulong DBAT[2][8];
@@ -626,9 +623,11 @@ struct CPUPPCState {
     ppc_avr_t avr[32];
     uint32_t vscr;
     /* SPE registers */
-    ppc_gpr_t spe_acc;
-    float_status spe_status;
+    uint64_t spe_acc;
     uint32_t spe_fscr;
+    /* SPE and Altivec can share a status since they will never be used
+     * simultaneously */
+    float_status vec_status;
 
     /* Internal devices resources */
     /* Time base and decrementer */
@@ -647,10 +646,9 @@ struct CPUPPCState {
     powerpc_input_t bus_model;
     int bfd_mach;
     uint32_t flags;
+    uint64_t insns_flags;
 
-    int exception_index;
     int error_code;
-    int interrupt_request;
     uint32_t pending_interrupts;
 #if !defined(CONFIG_USER_ONLY)
     /* This is the IRQ controller, which is implementation dependant
@@ -661,21 +659,17 @@ struct CPUPPCState {
     /* Exception vectors */
     target_ulong excp_vectors[POWERPC_EXCP_NB];
     target_ulong excp_prefix;
+    target_ulong hreset_excp_prefix;
     target_ulong ivor_mask;
     target_ulong ivpr_mask;
     target_ulong hreset_vector;
 #endif
 
     /* Those resources are used only during code translation */
-    /* Next instruction pointer */
-    target_ulong nip;
-
     /* opcode handlers */
     opc_handler_t *opcodes[0x40];
 
     /* Those resources are used only in Qemu core */
-    jmp_buf jmp_env;
-    int user_mode_only; /* user mode only simulation */
     target_ulong hflags;      /* hflags is a MSR & HFLAGS_MASK         */
     target_ulong hflags_nmsr; /* specific hflags, not comming from MSR */
     int mmu_idx;         /* precomputed MMU index to speed up mem accesses */
@@ -692,6 +686,7 @@ struct CPUPPCState {
 typedef struct mmu_ctx_t mmu_ctx_t;
 struct mmu_ctx_t {
     target_phys_addr_t raddr;      /* Real address              */
+    target_phys_addr_t eaddr;      /* Effective address         */
     int prot;                      /* Protection bits           */
     target_phys_addr_t pg_addr[2]; /* PTE tables base addresses */
     target_ulong ptem;             /* Virtual segment ID | API  */
@@ -701,6 +696,7 @@ struct mmu_ctx_t {
 
 /*****************************************************************************/
 CPUPPCState *cpu_ppc_init (const char *cpu_model);
+void ppc_translate_init(void);
 int cpu_ppc_exec (CPUPPCState *s);
 void cpu_ppc_close (CPUPPCState *s);
 /* you can call this signal handler from your SIGBUS and SIGSEGV
@@ -708,46 +704,39 @@ void cpu_ppc_close (CPUPPCState *s);
    is returned if the signal was handled by the virtual CPU.  */
 int cpu_ppc_signal_handler (int host_signum, void *pinfo,
                             void *puc);
-
+int cpu_ppc_handle_mmu_fault (CPUPPCState *env, target_ulong address, int rw,
+                              int mmu_idx, int is_softmmu);
+#define cpu_handle_mmu_fault cpu_ppc_handle_mmu_fault
+int get_physical_address (CPUPPCState *env, mmu_ctx_t *ctx, target_ulong vaddr,
+                          int rw, int access_type);
 void do_interrupt (CPUPPCState *env);
 void ppc_hw_interrupt (CPUPPCState *env);
-void cpu_loop_exit (void);
 
-void dump_stack (CPUPPCState *env);
+void cpu_dump_rfi (target_ulong RA, target_ulong msr);
 
 #if !defined(CONFIG_USER_ONLY)
-target_ulong do_load_ibatu (CPUPPCState *env, int nr);
-target_ulong do_load_ibatl (CPUPPCState *env, int nr);
-void do_store_ibatu (CPUPPCState *env, int nr, target_ulong value);
-void do_store_ibatl (CPUPPCState *env, int nr, target_ulong value);
-target_ulong do_load_dbatu (CPUPPCState *env, int nr);
-target_ulong do_load_dbatl (CPUPPCState *env, int nr);
-void do_store_dbatu (CPUPPCState *env, int nr, target_ulong value);
-void do_store_dbatl (CPUPPCState *env, int nr, target_ulong value);
-void do_store_ibatu_601 (CPUPPCState *env, int nr, target_ulong value);
-void do_store_ibatl_601 (CPUPPCState *env, int nr, target_ulong value);
-target_ulong do_load_sdr1 (CPUPPCState *env);
-void do_store_sdr1 (CPUPPCState *env, target_ulong value);
+void ppc6xx_tlb_store (CPUPPCState *env, target_ulong EPN, int way, int is_code,
+                       target_ulong pte0, target_ulong pte1);
+void ppc_store_ibatu (CPUPPCState *env, int nr, target_ulong value);
+void ppc_store_ibatl (CPUPPCState *env, int nr, target_ulong value);
+void ppc_store_dbatu (CPUPPCState *env, int nr, target_ulong value);
+void ppc_store_dbatl (CPUPPCState *env, int nr, target_ulong value);
+void ppc_store_ibatu_601 (CPUPPCState *env, int nr, target_ulong value);
+void ppc_store_ibatl_601 (CPUPPCState *env, int nr, target_ulong value);
+void ppc_store_sdr1 (CPUPPCState *env, target_ulong value);
 #if defined(TARGET_PPC64)
-target_ulong ppc_load_asr (CPUPPCState *env);
 void ppc_store_asr (CPUPPCState *env, target_ulong value);
 target_ulong ppc_load_slb (CPUPPCState *env, int slb_nr);
-void ppc_store_slb (CPUPPCState *env, int slb_nr, target_ulong rs);
+target_ulong ppc_load_sr (CPUPPCState *env, int sr_nr);
+void ppc_store_slb (CPUPPCState *env, target_ulong rb, target_ulong rs);
 #endif /* defined(TARGET_PPC64) */
-#if 0 // Unused
-target_ulong do_load_sr (CPUPPCState *env, int srnum);
-#endif
-void do_store_sr (CPUPPCState *env, int srnum, target_ulong value);
+void ppc_store_sr (CPUPPCState *env, int srnum, target_ulong value);
 #endif /* !defined(CONFIG_USER_ONLY) */
-target_ulong ppc_load_xer (CPUPPCState *env);
-void ppc_store_xer (CPUPPCState *env, target_ulong value);
 void ppc_store_msr (CPUPPCState *env, target_ulong value);
-
-void cpu_ppc_reset (void *opaque);
 
 void ppc_cpu_list (FILE *f, int (*cpu_fprintf)(FILE *f, const char *fmt, ...));
 
-const ppc_def_t *cpu_ppc_find_by_name (const unsigned char *name);
+const ppc_def_t *cpu_ppc_find_by_name (const char *name);
 int cpu_ppc_register_internal (CPUPPCState *env, const ppc_def_t *def);
 
 /* Time-base and decrementer management */
@@ -787,7 +776,7 @@ int ppcemb_tlb_search (CPUPPCState *env, target_ulong address, uint32_t pid);
 #endif
 #endif
 
-static always_inline uint64_t ppc_dump_gpr (CPUPPCState *env, int gprn)
+static inline uint64_t ppc_dump_gpr(CPUPPCState *env, int gprn)
 {
     uint64_t gprv;
 
@@ -809,12 +798,13 @@ static always_inline uint64_t ppc_dump_gpr (CPUPPCState *env, int gprn)
 int ppc_dcr_read (ppc_dcr_t *dcr_env, int dcrn, target_ulong *valp);
 int ppc_dcr_write (ppc_dcr_t *dcr_env, int dcrn, target_ulong val);
 
-#define CPUState CPUPPCState
 #define cpu_init cpu_ppc_init
 #define cpu_exec cpu_ppc_exec
 #define cpu_gen_code cpu_ppc_gen_code
 #define cpu_signal_handler cpu_ppc_signal_handler
 #define cpu_list ppc_cpu_list
+
+#define CPU_SAVE_VERSION 4
 
 /* MMU modes definitions */
 #define MMU_MODE0_SUFFIX _user
@@ -826,20 +816,40 @@ static inline int cpu_mmu_index (CPUState *env)
     return env->mmu_idx;
 }
 
+#if defined(CONFIG_USER_ONLY)
+static inline void cpu_clone_regs(CPUState *env, target_ulong newsp)
+{
+    if (newsp)
+        env->gpr[1] = newsp;
+    env->gpr[3] = 0;
+}
+#endif
+
 #include "cpu-all.h"
+#include "exec-all.h"
 
 /*****************************************************************************/
-/* Registers definitions */
-#define XER_SO 31
-#define XER_OV 30
-#define XER_CA 29
-#define XER_CMP 8
-#define XER_BC  0
-#define xer_so  env->xer[4]
-#define xer_ov  env->xer[6]
-#define xer_ca  env->xer[2]
-#define xer_cmp env->xer[1]
-#define xer_bc  env->xer[0]
+/* CRF definitions */
+#define CRF_LT        3
+#define CRF_GT        2
+#define CRF_EQ        1
+#define CRF_SO        0
+#define CRF_CH        (1 << 4)
+#define CRF_CL        (1 << 3)
+#define CRF_CH_OR_CL  (1 << 2)
+#define CRF_CH_AND_CL (1 << 1)
+
+/* XER definitions */
+#define XER_SO  31
+#define XER_OV  30
+#define XER_CA  29
+#define XER_CMP  8
+#define XER_BC   0
+#define xer_so  ((env->xer >> XER_SO)  &    1)
+#define xer_ov  ((env->xer >> XER_OV)  &    1)
+#define xer_ca  ((env->xer >> XER_CA)  &    1)
+#define xer_cmp ((env->xer >> XER_CMP) & 0xFF)
+#define xer_bc  ((env->xer >> XER_BC)  & 0x7F)
 
 /* SPR definitions */
 #define SPR_MQ                (0x000)
@@ -1309,6 +1319,144 @@ static inline int cpu_mmu_index (CPUState *env)
 #define SPR_E500_SVR          (0x3FF)
 
 /*****************************************************************************/
+/* PowerPC Instructions types definitions                                    */
+enum {
+    PPC_NONE           = 0x0000000000000000ULL,
+    /* PowerPC base instructions set                                         */
+    PPC_INSNS_BASE     = 0x0000000000000001ULL,
+    /*   integer operations instructions                                     */
+#define PPC_INTEGER PPC_INSNS_BASE
+    /*   flow control instructions                                           */
+#define PPC_FLOW    PPC_INSNS_BASE
+    /*   virtual memory instructions                                         */
+#define PPC_MEM     PPC_INSNS_BASE
+    /*   ld/st with reservation instructions                                 */
+#define PPC_RES     PPC_INSNS_BASE
+    /*   spr/msr access instructions                                         */
+#define PPC_MISC    PPC_INSNS_BASE
+    /* Deprecated instruction sets                                           */
+    /*   Original POWER instruction set                                      */
+    PPC_POWER          = 0x0000000000000002ULL,
+    /*   POWER2 instruction set extension                                    */
+    PPC_POWER2         = 0x0000000000000004ULL,
+    /*   Power RTC support                                                   */
+    PPC_POWER_RTC      = 0x0000000000000008ULL,
+    /*   Power-to-PowerPC bridge (601)                                       */
+    PPC_POWER_BR       = 0x0000000000000010ULL,
+    /* 64 bits PowerPC instruction set                                       */
+    PPC_64B            = 0x0000000000000020ULL,
+    /*   New 64 bits extensions (PowerPC 2.0x)                               */
+    PPC_64BX           = 0x0000000000000040ULL,
+    /*   64 bits hypervisor extensions                                       */
+    PPC_64H            = 0x0000000000000080ULL,
+    /*   New wait instruction (PowerPC 2.0x)                                 */
+    PPC_WAIT           = 0x0000000000000100ULL,
+    /*   Time base mftb instruction                                          */
+    PPC_MFTB           = 0x0000000000000200ULL,
+
+    /* Fixed-point unit extensions                                           */
+    /*   PowerPC 602 specific                                                */
+    PPC_602_SPEC       = 0x0000000000000400ULL,
+    /*   isel instruction                                                    */
+    PPC_ISEL           = 0x0000000000000800ULL,
+    /*   popcntb instruction                                                 */
+    PPC_POPCNTB        = 0x0000000000001000ULL,
+    /*   string load / store                                                 */
+    PPC_STRING         = 0x0000000000002000ULL,
+
+    /* Floating-point unit extensions                                        */
+    /*   Optional floating point instructions                                */
+    PPC_FLOAT          = 0x0000000000010000ULL,
+    /* New floating-point extensions (PowerPC 2.0x)                          */
+    PPC_FLOAT_EXT      = 0x0000000000020000ULL,
+    PPC_FLOAT_FSQRT    = 0x0000000000040000ULL,
+    PPC_FLOAT_FRES     = 0x0000000000080000ULL,
+    PPC_FLOAT_FRSQRTE  = 0x0000000000100000ULL,
+    PPC_FLOAT_FRSQRTES = 0x0000000000200000ULL,
+    PPC_FLOAT_FSEL     = 0x0000000000400000ULL,
+    PPC_FLOAT_STFIWX   = 0x0000000000800000ULL,
+
+    /* Vector/SIMD extensions                                                */
+    /*   Altivec support                                                     */
+    PPC_ALTIVEC        = 0x0000000001000000ULL,
+    /*   PowerPC 2.03 SPE extension                                          */
+    PPC_SPE            = 0x0000000002000000ULL,
+    /*   PowerPC 2.03 SPE single-precision floating-point extension          */
+    PPC_SPE_SINGLE     = 0x0000000004000000ULL,
+    /*   PowerPC 2.03 SPE double-precision floating-point extension          */
+    PPC_SPE_DOUBLE     = 0x0000000008000000ULL,
+
+    /* Optional memory control instructions                                  */
+    PPC_MEM_TLBIA      = 0x0000000010000000ULL,
+    PPC_MEM_TLBIE      = 0x0000000020000000ULL,
+    PPC_MEM_TLBSYNC    = 0x0000000040000000ULL,
+    /*   sync instruction                                                    */
+    PPC_MEM_SYNC       = 0x0000000080000000ULL,
+    /*   eieio instruction                                                   */
+    PPC_MEM_EIEIO      = 0x0000000100000000ULL,
+
+    /* Cache control instructions                                            */
+    PPC_CACHE          = 0x0000000200000000ULL,
+    /*   icbi instruction                                                    */
+    PPC_CACHE_ICBI     = 0x0000000400000000ULL,
+    /*   dcbz instruction with fixed cache line size                         */
+    PPC_CACHE_DCBZ     = 0x0000000800000000ULL,
+    /*   dcbz instruction with tunable cache line size                       */
+    PPC_CACHE_DCBZT    = 0x0000001000000000ULL,
+    /*   dcba instruction                                                    */
+    PPC_CACHE_DCBA     = 0x0000002000000000ULL,
+    /*   Freescale cache locking instructions                                */
+    PPC_CACHE_LOCK     = 0x0000004000000000ULL,
+
+    /* MMU related extensions                                                */
+    /*   external control instructions                                       */
+    PPC_EXTERN         = 0x0000010000000000ULL,
+    /*   segment register access instructions                                */
+    PPC_SEGMENT        = 0x0000020000000000ULL,
+    /*   PowerPC 6xx TLB management instructions                             */
+    PPC_6xx_TLB        = 0x0000040000000000ULL,
+    /* PowerPC 74xx TLB management instructions                              */
+    PPC_74xx_TLB       = 0x0000080000000000ULL,
+    /*   PowerPC 40x TLB management instructions                             */
+    PPC_40x_TLB        = 0x0000100000000000ULL,
+    /*   segment register access instructions for PowerPC 64 "bridge"        */
+    PPC_SEGMENT_64B    = 0x0000200000000000ULL,
+    /*   SLB management                                                      */
+    PPC_SLBI           = 0x0000400000000000ULL,
+
+    /* Embedded PowerPC dedicated instructions                               */
+    PPC_WRTEE          = 0x0001000000000000ULL,
+    /* PowerPC 40x exception model                                           */
+    PPC_40x_EXCP       = 0x0002000000000000ULL,
+    /* PowerPC 405 Mac instructions                                          */
+    PPC_405_MAC        = 0x0004000000000000ULL,
+    /* PowerPC 440 specific instructions                                     */
+    PPC_440_SPEC       = 0x0008000000000000ULL,
+    /* BookE (embedded) PowerPC specification                                */
+    PPC_BOOKE          = 0x0010000000000000ULL,
+    /* mfapidi instruction                                                   */
+    PPC_MFAPIDI        = 0x0020000000000000ULL,
+    /* tlbiva instruction                                                    */
+    PPC_TLBIVA         = 0x0040000000000000ULL,
+    /* tlbivax instruction                                                   */
+    PPC_TLBIVAX        = 0x0080000000000000ULL,
+    /* PowerPC 4xx dedicated instructions                                    */
+    PPC_4xx_COMMON     = 0x0100000000000000ULL,
+    /* PowerPC 40x ibct instructions                                         */
+    PPC_40x_ICBT       = 0x0200000000000000ULL,
+    /* rfmci is not implemented in all BookE PowerPC                         */
+    PPC_RFMCI          = 0x0400000000000000ULL,
+    /* rfdi instruction                                                      */
+    PPC_RFDI           = 0x0800000000000000ULL,
+    /* DCR accesses                                                          */
+    PPC_DCR            = 0x1000000000000000ULL,
+    /* DCR extended accesse                                                  */
+    PPC_DCRX           = 0x2000000000000000ULL,
+    /* user-mode DCR access, implemented in PowerPC 460                      */
+    PPC_DCRUX          = 0x4000000000000000ULL,
+};
+
+/*****************************************************************************/
 /* Memory access type :
  * may be needed for precise access rights control and precise exceptions.
  */
@@ -1352,6 +1500,16 @@ enum {
     PPCBookE_INPUT_INT        = 5,
     PPCBookE_INPUT_CINT       = 6,
     PPCBookE_INPUT_NB,
+};
+
+enum {
+    /* PowerPC E500 input pins */
+    PPCE500_INPUT_RESET_CORE = 0,
+    PPCE500_INPUT_MCK        = 1,
+    PPCE500_INPUT_CINT       = 3,
+    PPCE500_INPUT_INT        = 4,
+    PPCE500_INPUT_DEBUG      = 6,
+    PPCE500_INPUT_NB,
 };
 
 enum {
@@ -1419,5 +1577,29 @@ enum {
 };
 
 /*****************************************************************************/
+
+static inline void cpu_pc_from_tb(CPUState *env, TranslationBlock *tb)
+{
+    env->nip = tb->pc;
+}
+
+static inline void cpu_get_tb_cpu_state(CPUState *env, target_ulong *pc,
+                                        target_ulong *cs_base, int *flags)
+{
+    *pc = env->nip;
+    *cs_base = 0;
+    *flags = env->hflags;
+}
+
+static inline void cpu_set_tls(CPUState *env, target_ulong newtls)
+{
+#if defined(TARGET_PPC64)
+    /* The kernel checks TIF_32BIT here; we don't support loading 32-bit
+       binaries on PPC64 yet. */
+    env->gpr[13] = newtls;
+#else
+    env->gpr[2] = newtls;
+#endif
+}
 
 #endif /* !defined (__CPU_PPC_H__) */

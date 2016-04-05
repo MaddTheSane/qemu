@@ -59,32 +59,31 @@ static int pxa2xx_timer4_freq[8] = {
     [5 ... 7] = 0,
 };
 
-struct pxa2xx_timer0_s {
+typedef struct {
     uint32_t value;
     int level;
     qemu_irq irq;
     QEMUTimer *qtimer;
     int num;
     void *info;
-};
+} PXA2xxTimer0;
 
-struct pxa2xx_timer4_s {
-    struct pxa2xx_timer0_s tm;
+typedef struct {
+    PXA2xxTimer0 tm;
     int32_t oldclock;
     int32_t clock;
     uint64_t lastload;
     uint32_t freq;
     uint32_t control;
-};
+} PXA2xxTimer4;
 
 typedef struct {
-    target_phys_addr_t base;
     int32_t clock;
     int32_t oldclock;
     uint64_t lastload;
     uint32_t freq;
-    struct pxa2xx_timer0_s timer[4];
-    struct pxa2xx_timer4_s *tm4;
+    PXA2xxTimer0 timer[4];
+    PXA2xxTimer4 *tm4;
     uint32_t events;
     uint32_t irq_enabled;
     uint32_t reset3;
@@ -99,11 +98,11 @@ static void pxa2xx_timer_update(void *opaque, uint64_t now_qemu)
     uint64_t new_qemu;
 
     now_vm = s->clock +
-            muldiv64(now_qemu - s->lastload, s->freq, ticks_per_sec);
+            muldiv64(now_qemu - s->lastload, s->freq, get_ticks_per_sec());
 
     for (i = 0; i < 4; i ++) {
         new_qemu = now_qemu + muldiv64((uint32_t) (s->timer[i].value - now_vm),
-                        ticks_per_sec, s->freq);
+                        get_ticks_per_sec(), s->freq);
         qemu_mod_timer(s->timer[i].qtimer, new_qemu);
     }
 }
@@ -128,10 +127,10 @@ static void pxa2xx_timer_update4(void *opaque, uint64_t now_qemu, int n)
 
     now_vm = s->tm4[counter].clock + muldiv64(now_qemu -
                     s->tm4[counter].lastload,
-                    s->tm4[counter].freq, ticks_per_sec);
+                    s->tm4[counter].freq, get_ticks_per_sec());
 
     new_qemu = now_qemu + muldiv64((uint32_t) (s->tm4[n].tm.value - now_vm),
-                    ticks_per_sec, s->tm4[counter].freq);
+                    get_ticks_per_sec(), s->tm4[counter].freq);
     qemu_mod_timer(s->tm4[n].tm.qtimer, new_qemu);
 }
 
@@ -139,8 +138,6 @@ static uint32_t pxa2xx_timer_read(void *opaque, target_phys_addr_t offset)
 {
     pxa2xx_timer_info *s = (pxa2xx_timer_info *) opaque;
     int tm = 0;
-
-    offset -= s->base;
 
     switch (offset) {
     case OSMR3:  tm ++;
@@ -161,7 +158,7 @@ static uint32_t pxa2xx_timer_read(void *opaque, target_phys_addr_t offset)
         return s->tm4[tm].tm.value;
     case OSCR:
         return s->clock + muldiv64(qemu_get_clock(vm_clock) -
-                        s->lastload, s->freq, ticks_per_sec);
+                        s->lastload, s->freq, get_ticks_per_sec());
     case OSCR11: tm ++;
     case OSCR10: tm ++;
     case OSCR9:  tm ++;
@@ -178,7 +175,7 @@ static uint32_t pxa2xx_timer_read(void *opaque, target_phys_addr_t offset)
                 s->snapshot = s->tm4[tm - 1].clock + muldiv64(
                                 qemu_get_clock(vm_clock) -
                                 s->tm4[tm - 1].lastload,
-                                s->tm4[tm - 1].freq, ticks_per_sec);
+                                s->tm4[tm - 1].freq, get_ticks_per_sec());
             else
                 s->snapshot = s->tm4[tm - 1].clock;
         }
@@ -186,7 +183,7 @@ static uint32_t pxa2xx_timer_read(void *opaque, target_phys_addr_t offset)
         if (!s->tm4[tm].freq)
             return s->tm4[tm].clock;
         return s->tm4[tm].clock + muldiv64(qemu_get_clock(vm_clock) -
-                        s->tm4[tm].lastload, s->tm4[tm].freq, ticks_per_sec);
+                        s->tm4[tm].lastload, s->tm4[tm].freq, get_ticks_per_sec());
     case OIER:
         return s->irq_enabled;
     case OSSR:	/* Status register */
@@ -208,8 +205,7 @@ static uint32_t pxa2xx_timer_read(void *opaque, target_phys_addr_t offset)
         return s->snapshot;
     default:
     badreg:
-        cpu_abort(cpu_single_env, "pxa2xx_timer_read: Bad offset "
-                        REG_FMT "\n", offset);
+        hw_error("pxa2xx_timer_read: Bad offset " REG_FMT "\n", offset);
     }
 
     return 0;
@@ -220,8 +216,6 @@ static void pxa2xx_timer_write(void *opaque, target_phys_addr_t offset,
 {
     int i, tm = 0;
     pxa2xx_timer_info *s = (pxa2xx_timer_info *) opaque;
-
-    offset -= s->base;
 
     switch (offset) {
     case OSMR3:  tm ++;
@@ -320,18 +314,17 @@ static void pxa2xx_timer_write(void *opaque, target_phys_addr_t offset,
         break;
     default:
     badreg:
-        cpu_abort(cpu_single_env, "pxa2xx_timer_write: Bad offset "
-                        REG_FMT "\n", offset);
+        hw_error("pxa2xx_timer_write: Bad offset " REG_FMT "\n", offset);
     }
 }
 
-static CPUReadMemoryFunc *pxa2xx_timer_readfn[] = {
+static CPUReadMemoryFunc * const pxa2xx_timer_readfn[] = {
     pxa2xx_timer_read,
     pxa2xx_timer_read,
     pxa2xx_timer_read,
 };
 
-static CPUWriteMemoryFunc *pxa2xx_timer_writefn[] = {
+static CPUWriteMemoryFunc * const pxa2xx_timer_writefn[] = {
     pxa2xx_timer_write,
     pxa2xx_timer_write,
     pxa2xx_timer_write,
@@ -339,7 +332,7 @@ static CPUWriteMemoryFunc *pxa2xx_timer_writefn[] = {
 
 static void pxa2xx_timer_tick(void *opaque)
 {
-    struct pxa2xx_timer0_s *t = (struct pxa2xx_timer0_s *) opaque;
+    PXA2xxTimer0 *t = (PXA2xxTimer0 *) opaque;
     pxa2xx_timer_info *i = (pxa2xx_timer_info *) t->info;
 
     if (i->irq_enabled & (1 << t->num)) {
@@ -357,7 +350,7 @@ static void pxa2xx_timer_tick(void *opaque)
 
 static void pxa2xx_timer_tick4(void *opaque)
 {
-    struct pxa2xx_timer4_s *t = (struct pxa2xx_timer4_s *) opaque;
+    PXA2xxTimer4 *t = (PXA2xxTimer4 *) opaque;
     pxa2xx_timer_info *i = (pxa2xx_timer_info *) t->tm.info;
 
     pxa2xx_timer_tick(&t->tm);
@@ -384,8 +377,8 @@ static void pxa2xx_timer_save(QEMUFile *f, void *opaque)
         for (i = 0; i < 8; i ++) {
             qemu_put_be32s(f, &s->tm4[i].tm.value);
             qemu_put_be32(f, s->tm4[i].tm.level);
-            qemu_put_be32s(f, (uint32_t *) &s->tm4[i].oldclock);
-            qemu_put_be32s(f, (uint32_t *) &s->tm4[i].clock);
+            qemu_put_sbe32s(f, &s->tm4[i].oldclock);
+            qemu_put_sbe32s(f, &s->tm4[i].clock);
             qemu_put_be64s(f, &s->tm4[i].lastload);
             qemu_put_be32s(f, &s->tm4[i].freq);
             qemu_put_be32s(f, &s->tm4[i].control);
@@ -418,8 +411,8 @@ static int pxa2xx_timer_load(QEMUFile *f, void *opaque, int version_id)
         for (i = 0; i < 8; i ++) {
             qemu_get_be32s(f, &s->tm4[i].tm.value);
             s->tm4[i].tm.level = qemu_get_be32(f);
-            qemu_get_be32s(f, (uint32_t *) &s->tm4[i].oldclock);
-            qemu_get_be32s(f, (uint32_t *) &s->tm4[i].clock);
+            qemu_get_sbe32s(f, &s->tm4[i].oldclock);
+            qemu_get_sbe32s(f, &s->tm4[i].clock);
             qemu_get_be64s(f, &s->tm4[i].lastload);
             qemu_get_be32s(f, &s->tm4[i].freq);
             qemu_get_be32s(f, &s->tm4[i].control);
@@ -442,7 +435,6 @@ static pxa2xx_timer_info *pxa2xx_timer_init(target_phys_addr_t base,
     pxa2xx_timer_info *s;
 
     s = (pxa2xx_timer_info *) qemu_mallocz(sizeof(pxa2xx_timer_info));
-    s->base = base;
     s->irq_enabled = 0;
     s->oldclock = 0;
     s->clock = 0;
@@ -459,7 +451,7 @@ static pxa2xx_timer_info *pxa2xx_timer_init(target_phys_addr_t base,
                         pxa2xx_timer_tick, &s->timer[i]);
     }
 
-    iomemtype = cpu_register_io_memory(0, pxa2xx_timer_readfn,
+    iomemtype = cpu_register_io_memory(pxa2xx_timer_readfn,
                     pxa2xx_timer_writefn, s);
     cpu_register_physical_memory(base, 0x00001000, iomemtype);
 
@@ -473,7 +465,7 @@ void pxa25x_timer_init(target_phys_addr_t base, qemu_irq *irqs)
 {
     pxa2xx_timer_info *s = pxa2xx_timer_init(base, irqs);
     s->freq = PXA25X_FREQ;
-    s->tm4 = 0;
+    s->tm4 = NULL;
 }
 
 void pxa27x_timer_init(target_phys_addr_t base,
@@ -482,8 +474,8 @@ void pxa27x_timer_init(target_phys_addr_t base,
     pxa2xx_timer_info *s = pxa2xx_timer_init(base, irqs);
     int i;
     s->freq = PXA27X_FREQ;
-    s->tm4 = (struct pxa2xx_timer4_s *) qemu_mallocz(8 *
-                    sizeof(struct pxa2xx_timer4_s));
+    s->tm4 = (PXA2xxTimer4 *) qemu_mallocz(8 *
+                    sizeof(PXA2xxTimer4));
     for (i = 0; i < 8; i ++) {
         s->tm4[i].tm.value = 0;
         s->tm4[i].tm.irq = irq4;

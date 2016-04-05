@@ -14,35 +14,16 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
 #if !defined(__HELPER_REGS_H__)
 #define __HELPER_REGS_H__
 
-static always_inline target_ulong hreg_load_xer (CPUPPCState *env)
-{
-    return (xer_so << XER_SO) |
-        (xer_ov << XER_OV) |
-        (xer_ca << XER_CA) |
-        (xer_bc << XER_BC) |
-        (xer_cmp << XER_CMP);
-}
-
-static always_inline void hreg_store_xer (CPUPPCState *env, target_ulong value)
-{
-    xer_so = (value >> XER_SO) & 0x01;
-    xer_ov = (value >> XER_OV) & 0x01;
-    xer_ca = (value >> XER_CA) & 0x01;
-    xer_cmp = (value >> XER_CMP) & 0xFF;
-    xer_bc = (value >> XER_BC) & 0x7F;
-}
-
 /* Swap temporary saved registers with GPRs */
-static always_inline void hreg_swap_gpr_tgpr (CPUPPCState *env)
+static inline void hreg_swap_gpr_tgpr(CPUPPCState *env)
 {
-    ppc_gpr_t tmp;
+    target_ulong tmp;
 
     tmp = env->gpr[0];
     env->gpr[0] = env->tgpr[0];
@@ -58,7 +39,7 @@ static always_inline void hreg_swap_gpr_tgpr (CPUPPCState *env)
     env->tgpr[3] = tmp;
 }
 
-static always_inline void hreg_compute_mem_idx (CPUPPCState *env)
+static inline void hreg_compute_mem_idx(CPUPPCState *env)
 {
     /* Precompute MMU index */
     if (msr_pr == 0 && msr_hv != 0) {
@@ -68,7 +49,7 @@ static always_inline void hreg_compute_mem_idx (CPUPPCState *env)
     }
 }
 
-static always_inline void hreg_compute_hflags (CPUPPCState *env)
+static inline void hreg_compute_hflags(CPUPPCState *env)
 {
     target_ulong hflags_mask;
 
@@ -83,8 +64,8 @@ static always_inline void hreg_compute_hflags (CPUPPCState *env)
     env->hflags |= env->hflags_nmsr;
 }
 
-static always_inline int hreg_store_msr (CPUPPCState *env, target_ulong value,
-                                         int alter_hv)
+static inline int hreg_store_msr(CPUPPCState *env, target_ulong value,
+                                 int alter_hv)
 {
     int excp;
 

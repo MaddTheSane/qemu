@@ -14,25 +14,26 @@
 //#define DEBUG_GIC
 
 #ifdef DEBUG_GIC
-#define DPRINTF(fmt, args...) \
-do { printf("arm_gic: " fmt , ##args); } while (0)
+#define DPRINTF(fmt, ...) \
+do { printf("arm_gic: " fmt , ## __VA_ARGS__); } while (0)
 #else
-#define DPRINTF(fmt, args...) do {} while(0)
+#define DPRINTF(fmt, ...) do {} while(0)
 #endif
 
 #ifdef NVIC
 static const uint8_t gic_id[] =
 { 0x00, 0xb0, 0x1b, 0x00, 0x0d, 0xe0, 0x05, 0xb1 };
-#define GIC_DIST_OFFSET 0
 /* The NVIC has 16 internal vectors.  However these are not exposed
    through the normal GIC interface.  */
 #define GIC_BASE_IRQ    32
 #else
 static const uint8_t gic_id[] =
 { 0x90, 0x13, 0x04, 0x00, 0x0d, 0xf0, 0x05, 0xb1 };
-#define GIC_DIST_OFFSET 0x1000
 #define GIC_BASE_IRQ    0
 #endif
+
+#define FROM_SYSBUSGIC(type, dev) \
+    DO_UPCAST(type, gic, FROM_SYSBUS(gic_state, dev))
 
 typedef struct gic_irq_state
 {
@@ -41,12 +42,17 @@ typedef struct gic_irq_state
     unsigned enabled:1;
     unsigned pending:NCPU;
     unsigned active:NCPU;
-    unsigned level:1;
+    unsigned level:NCPU;
     unsigned model:1; /* 0 = N:N, 1 = 1:N */
     unsigned trigger:1; /* nonzero = edge triggered.  */
 } gic_irq_state;
 
 #define ALL_CPU_MASK ((1 << NCPU) - 1)
+#if NCPU > 1
+#define NUM_CPU(s) ((s)->num_cpu)
+#else
+#define NUM_CPU(s) 1
+#endif
 
 #define GIC_SET_ENABLED(irq) s->irq_state[irq].enabled = 1
 #define GIC_CLEAR_ENABLED(irq) s->irq_state[irq].enabled = 0
@@ -76,7 +82,7 @@ typedef struct gic_irq_state
 
 typedef struct gic_state
 {
-    uint32_t base;
+    SysBusDevice busdev;
     qemu_irq parent_irq[NCPU];
     int enabled;
     int cpu_enabled[NCPU];
@@ -94,10 +100,11 @@ typedef struct gic_state
     int running_priority[NCPU];
     int current_pending[NCPU];
 
-    qemu_irq *in;
-#ifdef NVIC
-    void *nvic;
+#if NCPU > 1
+    int num_cpu;
 #endif
+
+    int iomemtype;
 } gic_state;
 
 /* TODO: Many places that call this routine could be optimized.  */
@@ -111,7 +118,7 @@ static void gic_update(gic_state *s)
     int cpu;
     int cm;
 
-    for (cpu = 0; cpu < NCPU; cpu++) {
+    for (cpu = 0; cpu < NUM_CPU(s); cpu++) {
         cm = 1 << cpu;
         s->current_pending[cpu] = 1023;
         if (!s->enabled || !s->cpu_enabled[cpu]) {
@@ -252,13 +259,12 @@ static uint32_t gic_dist_readb(void *opaque, target_phys_addr_t offset)
 
     cpu = gic_get_current_cpu();
     cm = 1 << cpu;
-    offset -= s->base + GIC_DIST_OFFSET;
     if (offset < 0x100) {
 #ifndef NVIC
         if (offset == 0)
             return s->enabled;
         if (offset == 4)
-            return ((GIC_NIRQ / 32) - 1) | ((NCPU - 1) << 5);
+            return ((GIC_NIRQ / 32) - 1) | ((NUM_CPU(s) - 1) << 5);
         if (offset < 0x08)
             return 0;
 #endif
@@ -347,7 +353,7 @@ static uint32_t gic_dist_readb(void *opaque, target_phys_addr_t offset)
     }
     return res;
 bad_reg:
-    cpu_abort(cpu_single_env, "gic_dist_readb: Bad offset %x\n", (int)offset);
+    hw_error("gic_dist_readb: Bad offset %x\n", (int)offset);
     return 0;
 }
 
@@ -365,9 +371,9 @@ static uint32_t gic_dist_readl(void *opaque, target_phys_addr_t offset)
 #ifdef NVIC
     gic_state *s = (gic_state *)opaque;
     uint32_t addr;
-    addr = offset - s->base;
+    addr = offset;
     if (addr < 0x100 || addr > 0xd00)
-        return nvic_readl(s->nvic, addr);
+        return nvic_readl(s, addr);
 #endif
     val = gic_dist_readw(opaque, offset);
     val |= gic_dist_readw(opaque, offset + 2) << 16;
@@ -383,7 +389,6 @@ static void gic_dist_writeb(void *opaque, target_phys_addr_t offset,
     int cpu;
 
     cpu = gic_get_current_cpu();
-    offset -= s->base + GIC_DIST_OFFSET;
     if (offset < 0x100) {
 #ifdef NVIC
         goto bad_reg;
@@ -510,7 +515,7 @@ static void gic_dist_writeb(void *opaque, target_phys_addr_t offset,
     gic_update(s);
     return;
 bad_reg:
-    cpu_abort(cpu_single_env, "gic_dist_writeb: Bad offset %x\n", (int)offset);
+    hw_error("gic_dist_writeb: Bad offset %x\n", (int)offset);
 }
 
 static void gic_dist_writew(void *opaque, target_phys_addr_t offset,
@@ -526,13 +531,13 @@ static void gic_dist_writel(void *opaque, target_phys_addr_t offset,
     gic_state *s = (gic_state *)opaque;
 #ifdef NVIC
     uint32_t addr;
-    addr = offset - s->base;
+    addr = offset;
     if (addr < 0x100 || (addr > 0xd00 && addr != 0xf00)) {
-        nvic_writel(s->nvic, addr, value);
+        nvic_writel(s, addr, value);
         return;
     }
 #endif
-    if (offset - s->base == GIC_DIST_OFFSET + 0xf00) {
+    if (offset == 0xf00) {
         int cpu;
         int irq;
         int mask;
@@ -562,13 +567,13 @@ static void gic_dist_writel(void *opaque, target_phys_addr_t offset,
     gic_dist_writew(opaque, offset + 2, value >> 16);
 }
 
-static CPUReadMemoryFunc *gic_dist_readfn[] = {
+static CPUReadMemoryFunc * const gic_dist_readfn[] = {
    gic_dist_readb,
    gic_dist_readw,
    gic_dist_readl
 };
 
-static CPUWriteMemoryFunc *gic_dist_writefn[] = {
+static CPUWriteMemoryFunc * const gic_dist_writefn[] = {
    gic_dist_writeb,
    gic_dist_writew,
    gic_dist_writel
@@ -592,8 +597,7 @@ static uint32_t gic_cpu_read(gic_state *s, int cpu, int offset)
     case 0x18: /* Highest Pending Interrupt */
         return s->current_pending[cpu];
     default:
-        cpu_abort(cpu_single_env, "gic_cpu_read: Bad offset %x\n",
-                  (int)offset);
+        hw_error("gic_cpu_read: Bad offset %x\n", (int)offset);
         return 0;
     }
 }
@@ -603,7 +607,7 @@ static void gic_cpu_write(gic_state *s, int cpu, int offset, uint32_t value)
     switch (offset) {
     case 0x00: /* Control */
         s->cpu_enabled[cpu] = (value & 1);
-        DPRINTF("CPU %sabled\n", s->cpu_enabled ? "En" : "Dis");
+        DPRINTF("CPU %d %sabled\n", cpu, s->cpu_enabled ? "En" : "Dis");
         break;
     case 0x04: /* Priority mask */
         s->priority_mask[cpu] = (value & 0xff);
@@ -614,8 +618,7 @@ static void gic_cpu_write(gic_state *s, int cpu, int offset, uint32_t value)
     case 0x10: /* End Of Interrupt */
         return gic_complete_irq(s, cpu, value & 0x3ff);
     default:
-        cpu_abort(cpu_single_env, "gic_cpu_write: Bad offset %x\n",
-                  (int)offset);
+        hw_error("gic_cpu_write: Bad offset %x\n", (int)offset);
         return;
     }
     gic_update(s);
@@ -626,7 +629,7 @@ static void gic_reset(gic_state *s)
 {
     int i;
     memset(s->irq_state, 0, GIC_NIRQ * sizeof(gic_irq_state));
-    for (i = 0 ; i < NCPU; i++) {
+    for (i = 0 ; i < NUM_CPU(s); i++) {
         s->priority_mask[i] = 0xf0;
         s->current_pending[i] = 1023;
         s->running_irq[i] = 1023;
@@ -650,24 +653,96 @@ static void gic_reset(gic_state *s)
 #endif
 }
 
-static gic_state *gic_init(uint32_t base, qemu_irq *parent_irq)
+static void gic_save(QEMUFile *f, void *opaque)
 {
-    gic_state *s;
-    int iomemtype;
+    gic_state *s = (gic_state *)opaque;
+    int i;
+    int j;
+
+    qemu_put_be32(f, s->enabled);
+    for (i = 0; i < NUM_CPU(s); i++) {
+        qemu_put_be32(f, s->cpu_enabled[i]);
+#ifndef NVIC
+        qemu_put_be32(f, s->irq_target[i]);
+#endif
+        for (j = 0; j < 32; j++)
+            qemu_put_be32(f, s->priority1[j][i]);
+        for (j = 0; j < GIC_NIRQ; j++)
+            qemu_put_be32(f, s->last_active[j][i]);
+        qemu_put_be32(f, s->priority_mask[i]);
+        qemu_put_be32(f, s->running_irq[i]);
+        qemu_put_be32(f, s->running_priority[i]);
+        qemu_put_be32(f, s->current_pending[i]);
+    }
+    for (i = 0; i < GIC_NIRQ - 32; i++) {
+        qemu_put_be32(f, s->priority2[i]);
+    }
+    for (i = 0; i < GIC_NIRQ; i++) {
+        qemu_put_byte(f, s->irq_state[i].enabled);
+        qemu_put_byte(f, s->irq_state[i].pending);
+        qemu_put_byte(f, s->irq_state[i].active);
+        qemu_put_byte(f, s->irq_state[i].level);
+        qemu_put_byte(f, s->irq_state[i].model);
+        qemu_put_byte(f, s->irq_state[i].trigger);
+    }
+}
+
+static int gic_load(QEMUFile *f, void *opaque, int version_id)
+{
+    gic_state *s = (gic_state *)opaque;
+    int i;
+    int j;
+
+    if (version_id != 1)
+        return -EINVAL;
+
+    s->enabled = qemu_get_be32(f);
+    for (i = 0; i < NUM_CPU(s); i++) {
+        s->cpu_enabled[i] = qemu_get_be32(f);
+#ifndef NVIC
+        s->irq_target[i] = qemu_get_be32(f);
+#endif
+        for (j = 0; j < 32; j++)
+            s->priority1[j][i] = qemu_get_be32(f);
+        for (j = 0; j < GIC_NIRQ; j++)
+            s->last_active[j][i] = qemu_get_be32(f);
+        s->priority_mask[i] = qemu_get_be32(f);
+        s->running_irq[i] = qemu_get_be32(f);
+        s->running_priority[i] = qemu_get_be32(f);
+        s->current_pending[i] = qemu_get_be32(f);
+    }
+    for (i = 0; i < GIC_NIRQ - 32; i++) {
+        s->priority2[i] = qemu_get_be32(f);
+    }
+    for (i = 0; i < GIC_NIRQ; i++) {
+        s->irq_state[i].enabled = qemu_get_byte(f);
+        s->irq_state[i].pending = qemu_get_byte(f);
+        s->irq_state[i].active = qemu_get_byte(f);
+        s->irq_state[i].level = qemu_get_byte(f);
+        s->irq_state[i].model = qemu_get_byte(f);
+        s->irq_state[i].trigger = qemu_get_byte(f);
+    }
+
+    return 0;
+}
+
+#if NCPU > 1
+static void gic_init(gic_state *s, int num_cpu)
+#else
+static void gic_init(gic_state *s)
+#endif
+{
     int i;
 
-    s = (gic_state *)qemu_mallocz(sizeof(gic_state));
-    if (!s)
-        return NULL;
-    s->in = qemu_allocate_irqs(gic_set_irq, s, GIC_NIRQ);
-    for (i = 0; i < NCPU; i++) {
-        s->parent_irq[i] = parent_irq[i];
+#if NCPU > 1
+    s->num_cpu = num_cpu;
+#endif
+    qdev_init_gpio_in(&s->busdev.qdev, gic_set_irq, GIC_NIRQ - 32);
+    for (i = 0; i < NUM_CPU(s); i++) {
+        sysbus_init_irq(&s->busdev, &s->parent_irq[i]);
     }
-    iomemtype = cpu_register_io_memory(0, gic_dist_readfn,
-                                       gic_dist_writefn, s);
-    cpu_register_physical_memory(base + GIC_DIST_OFFSET, 0x00001000,
-                                 iomemtype);
-    s->base = base;
+    s->iomemtype = cpu_register_io_memory(gic_dist_readfn,
+                                          gic_dist_writefn, s);
     gic_reset(s);
-    return s;
+    register_savevm("arm_gic", -1, 1, gic_save, gic_load, s);
 }

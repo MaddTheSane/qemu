@@ -15,8 +15,7 @@
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef CONFIG_USER_ONLY
@@ -30,7 +29,31 @@
 #include "mmu.h"
 #include "exec-all.h"
 
+#ifdef DEBUG
+#define D(x) x
+#define D_LOG(...) qemu_log(__VA__ARGS__)
+#else
 #define D(x)
+#define D_LOG(...) do { } while (0)
+#endif
+
+void cris_mmu_init(CPUState *env)
+{
+	env->mmu_rand_lfsr = 0xcccc;
+}
+
+#define SR_POLYNOM 0x8805
+static inline unsigned int compute_polynom(unsigned int sr)
+{
+	unsigned int i;
+	unsigned int f;
+
+	f = 0;
+	for (i = 0; i < 16; i++)
+		f += ((SR_POLYNOM >> i) & 1) & ((sr >> i) & 1);
+
+	return f;
+}
 
 static inline int cris_mmu_enabled(uint32_t rw_gc_cfg)
 {
@@ -77,6 +100,7 @@ static inline void set_field(uint32_t *dst, unsigned int val,
 	*dst |= val;
 }
 
+#ifdef DEBUG
 static void dump_tlb(CPUState *env, int mmu)
 {
 	int set;
@@ -95,15 +119,16 @@ static void dump_tlb(CPUState *env, int mmu)
 		}
 	}
 }
+#endif
 
 /* rw 0 = read, 1 = write, 2 = exec.  */
-static int cris_mmu_translate_page(struct cris_mmu_result_t *res,
+static int cris_mmu_translate_page(struct cris_mmu_result *res,
 				   CPUState *env, uint32_t vaddr,
 				   int rw, int usermode)
 {
 	unsigned int vpage;
 	unsigned int idx;
-	uint32_t lo, hi;
+	uint32_t pid, lo, hi;
 	uint32_t tlb_vpn, tlb_pfn = 0;
 	int tlb_pid, tlb_g, tlb_v, tlb_k, tlb_w, tlb_x;
 	int cfg_v, cfg_k, cfg_w, cfg_x;	
@@ -116,6 +141,7 @@ static int cris_mmu_translate_page(struct cris_mmu_result_t *res,
 
 	r_cause = env->sregs[SFR_R_MM_CAUSE];
 	r_cfg = env->sregs[SFR_RW_MM_CFG];
+	pid = env->pregs[PR_PID] & 0xff;
 
 	switch (rw) {
 		case 2: rwcause = CRIS_MMU_ERR_EXEC; mmu = 0; break;
@@ -151,12 +177,14 @@ static int cris_mmu_translate_page(struct cris_mmu_result_t *res,
 		lo = env->tlbsets[mmu][set][idx].lo;
 		hi = env->tlbsets[mmu][set][idx].hi;
 
-		tlb_vpn = EXTRACT_FIELD(hi, 13, 31);
-		tlb_pfn = EXTRACT_FIELD(lo, 13, 31);
+		tlb_vpn = hi >> 13;
+		tlb_pid = EXTRACT_FIELD(hi, 0, 7);
+		tlb_g  = EXTRACT_FIELD(lo, 4, 4);
 
-		D(printf("TLB[%d][%d] v=%x vpage=%x -> pfn=%x lo=%x hi=%x\n", 
-				i, idx, tlb_vpn, vpage, tlb_pfn, lo, hi));
-		if (tlb_vpn == vpage) {
+		D_LOG("TLB[%d][%d][%d] v=%x vpage=%x lo=%x hi=%x\n", 
+			 mmu, set, idx, tlb_vpn, vpage, lo, hi);
+		if ((tlb_g || (tlb_pid == pid))
+		    && tlb_vpn == vpage) {
 			match = 1;
 			break;
 		}
@@ -169,9 +197,7 @@ static int cris_mmu_translate_page(struct cris_mmu_result_t *res,
 		cfg_x  = EXTRACT_FIELD(r_cfg, 17, 17);
 		cfg_v  = EXTRACT_FIELD(r_cfg, 16, 16);
 
-		tlb_pid = EXTRACT_FIELD(hi, 0, 7);
 		tlb_pfn = EXTRACT_FIELD(lo, 13, 31);
-		tlb_g  = EXTRACT_FIELD(lo, 4, 4);
 		tlb_v = EXTRACT_FIELD(lo, 3, 3);
 		tlb_k = EXTRACT_FIELD(lo, 2, 2);
 		tlb_w = EXTRACT_FIELD(lo, 1, 1);
@@ -187,13 +213,7 @@ static int cris_mmu_translate_page(struct cris_mmu_result_t *res,
 		set_exception_vector(0x0a, d_mmu_access);
 		set_exception_vector(0x0b, d_mmu_write);
 		*/
-		if (!tlb_g
-		    && tlb_pid != (env->pregs[PR_PID] & 0xff)) {
-			D(printf ("tlb: wrong pid %x %x pc=%x\n", 
-				 tlb_pid, env->pregs[PR_PID], env->pc));
-			match = 0;
-			res->bf_vec = vect_base;
-		} else if (cfg_k && tlb_k && usermode) {
+		if (cfg_k && tlb_k && usermode) {
 			D(printf ("tlb: kernel protected %x lo=%x pc=%x\n", 
 				  vaddr, lo, env->pc));
 			match = 0;
@@ -211,7 +231,6 @@ static int cris_mmu_translate_page(struct cris_mmu_result_t *res,
 			res->bf_vec = vect_base + 3;
 		} else if (cfg_v && !tlb_v) {
 			D(printf ("tlb: invalid %x\n", vaddr));
-			set_field(&r_cause, rwcause, 8, 9);
 			match = 0;
 			res->bf_vec = vect_base + 1;
 		}
@@ -226,62 +245,85 @@ static int cris_mmu_translate_page(struct cris_mmu_result_t *res,
 		}
 		else
 			D(dump_tlb(env, mmu));
-
-		env->sregs[SFR_RW_MM_TLB_HI] = hi;
-		env->sregs[SFR_RW_MM_TLB_LO] = lo;
+	} else {
+		/* If refill, provide a randomized set.  */
+		set = env->mmu_rand_lfsr & 3;
 	}
 
 	if (!match) {
-		/* miss.  */
+		unsigned int f;
+
+		/* Update lfsr at every fault.  */
+		f = compute_polynom(env->mmu_rand_lfsr);
+		env->mmu_rand_lfsr >>= 1;
+		env->mmu_rand_lfsr |= (f << 15);
+		env->mmu_rand_lfsr &= 0xffff;
+		
+		/* Compute index.  */
 		idx = vpage & 15;
-		set = 0;
 
 		/* Update RW_MM_TLB_SEL.  */
 		env->sregs[SFR_RW_MM_TLB_SEL] = 0;
 		set_field(&env->sregs[SFR_RW_MM_TLB_SEL], idx, 0, 4);
-		set_field(&env->sregs[SFR_RW_MM_TLB_SEL], set, 4, 5);
+		set_field(&env->sregs[SFR_RW_MM_TLB_SEL], set, 4, 2);
 
 		/* Update RW_MM_CAUSE.  */
 		set_field(&r_cause, rwcause, 8, 2);
 		set_field(&r_cause, vpage, 13, 19);
-		set_field(&r_cause, env->pregs[PR_PID], 0, 8);
+		set_field(&r_cause, pid, 0, 8);
 		env->sregs[SFR_R_MM_CAUSE] = r_cause;
 		D(printf("refill vaddr=%x pc=%x\n", vaddr, env->pc));
 	}
-
 
 	D(printf ("%s rw=%d mtch=%d pc=%x va=%x vpn=%x tlbvpn=%x pfn=%x pid=%x"
 		  " %x cause=%x sel=%x sp=%x %x %x\n",
 		  __func__, rw, match, env->pc,
 		  vaddr, vpage,
 		  tlb_vpn, tlb_pfn, tlb_pid, 
-		  env->pregs[PR_PID],
+		  pid,
 		  r_cause,
 		  env->sregs[SFR_RW_MM_TLB_SEL],
 		  env->regs[R_SP], env->pregs[PR_USP], env->ksp));
 
-	res->pfn = tlb_pfn;
+	res->phy = tlb_pfn << TARGET_PAGE_BITS;
 	return !match;
 }
 
-/* Give us the vaddr corresponding to the latest TLB update.  */
-target_ulong cris_mmu_tlb_latest_update(CPUState *env)
+void cris_mmu_flush_pid(CPUState *env, uint32_t pid)
 {
-	uint32_t sel = env->sregs[SFR_RW_MM_TLB_SEL];
-	uint32_t vaddr;
-	uint32_t hi;
-	int set;
-	int idx;
+	target_ulong vaddr;
+	unsigned int idx;
+	uint32_t lo, hi;
+	uint32_t tlb_vpn;
+	int tlb_pid, tlb_g, tlb_v;
+	unsigned int set;
+	unsigned int mmu;
 
-	idx = EXTRACT_FIELD(sel, 0, 4);
-	set = EXTRACT_FIELD(sel, 4, 5);
+	pid &= 0xff;
+	for (mmu = 0; mmu < 2; mmu++) {
+		for (set = 0; set < 4; set++)
+		{
+			for (idx = 0; idx < 16; idx++) {
+				lo = env->tlbsets[mmu][set][idx].lo;
+				hi = env->tlbsets[mmu][set][idx].hi;
+				
+				tlb_vpn = EXTRACT_FIELD(hi, 13, 31);
+				tlb_pid = EXTRACT_FIELD(hi, 0, 7);
+				tlb_g  = EXTRACT_FIELD(lo, 4, 4);
+				tlb_v = EXTRACT_FIELD(lo, 3, 3);
 
-	hi = env->tlbsets[1][set][idx].hi;
-	vaddr = EXTRACT_FIELD(hi, 13, 31);
-	return vaddr << TARGET_PAGE_BITS;
+				if (tlb_v && !tlb_g && (tlb_pid == pid)) {
+					vaddr = tlb_vpn << TARGET_PAGE_BITS;
+					D_LOG("flush pid=%x vaddr=%x\n", 
+						  pid, vaddr);
+					tlb_flush_page(env, vaddr);
+				}
+			}
+		}
+	}
 }
 
-int cris_mmu_translate(struct cris_mmu_result_t *res,
+int cris_mmu_translate(struct cris_mmu_result *res,
 		       CPUState *env, uint32_t vaddr,
 		       int rw, int mmu_idx)
 {
@@ -298,12 +340,12 @@ int cris_mmu_translate(struct cris_mmu_result_t *res,
 
 	if (!cris_mmu_enabled(env->sregs[SFR_RW_GC_CFG])) {
 		res->phy = vaddr;
-		res->prot = PAGE_BITS;		
+		res->prot = PAGE_BITS;
 		goto done;
 	}
 
 	seg = vaddr >> 28;
-	if (cris_mmu_segmented_addr(seg, env->sregs[SFR_RW_MM_CFG]))
+	if (!is_user && cris_mmu_segmented_addr(seg, env->sregs[SFR_RW_MM_CFG]))
 	{
 		uint32_t base;
 
@@ -311,14 +353,10 @@ int cris_mmu_translate(struct cris_mmu_result_t *res,
 		base = cris_mmu_translate_seg(env, seg);
 		phy = base | (0x0fffffff & vaddr);
 		res->phy = phy;
-		res->prot = PAGE_BITS;		
+		res->prot = PAGE_BITS;
 	}
 	else
-	{
 		miss = cris_mmu_translate_page(res, env, vaddr, rw, is_user);
-		phy = (res->pfn << 13);
-		res->phy = phy;
-	}
   done:
 	env->pregs[PR_SRS] = old_srs;
 	return miss;

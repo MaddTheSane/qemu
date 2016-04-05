@@ -3,7 +3,6 @@
  */
 OUTPUT_FORMAT("elf32-i386", "elf32-i386", "elf32-i386")
 OUTPUT_ARCH(i386)
-SEARCH_DIR(/lib); SEARCH_DIR(/usr/lib); SEARCH_DIR(/usr/local/lib); SEARCH_DIR(/usr/alpha-unknown-linux-gnu/lib);
 ENTRY(_start)
 SECTIONS
 {
@@ -40,8 +39,20 @@ SECTIONS
   .rela.fini     : { *(.rela.fini)	}
   .rel.bss       : { *(.rel.bss)		}
   .rela.bss      : { *(.rela.bss)		}
-  .rel.plt       : { *(.rel.plt)		}
-  .rela.plt      : { *(.rela.plt)		}
+  .rel.plt      :
+  {
+    *(.rel.plt)
+    PROVIDE_HIDDEN (__rel_iplt_start = .);
+    *(.rel.iplt)
+    PROVIDE_HIDDEN (__rel_iplt_end = .);
+  }
+  .rela.plt       :
+  {
+    *(.rela.plt)
+    PROVIDE_HIDDEN (__rela_iplt_start = .);
+    *(.rela.iplt)
+    PROVIDE_HIDDEN (__rela_iplt_end = .);
+  }
   .init          : { *(.init)	} =0x47ff041f
   .text      :
   {
@@ -69,6 +80,8 @@ SECTIONS
   /* Adjust the address for the data segment.  We want to adjust up to
      the same address within the page on the next page up.  */
   . = ALIGN(0x100000) + (. & (0x100000 - 1));
+  .tdata	  : { *(.tdata .tdata.* .gnu.linkonce.td.*) }
+  .tbss		  : { *(.tbss .tbss.* .gnu.linkonce.tb.*) *(.tcommon) }
   .data    :
   {
     *(.data)

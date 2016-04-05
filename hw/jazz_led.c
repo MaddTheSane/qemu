@@ -34,7 +34,6 @@ typedef enum {
 } screen_state_t;
 
 typedef struct LedState {
-    target_phys_addr_t base;
     uint8_t segments;
     DisplayState *ds;
     screen_state_t state;
@@ -43,10 +42,9 @@ typedef struct LedState {
 static uint32_t led_readb(void *opaque, target_phys_addr_t addr)
 {
     LedState *s = opaque;
-    int relative_addr = addr - s->base;
     uint32_t val;
 
-    switch (relative_addr) {
+    switch (addr) {
         case 0:
             val = s->segments;
             break;
@@ -93,9 +91,8 @@ static uint32_t led_readl(void *opaque, target_phys_addr_t addr)
 static void led_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
 {
     LedState *s = opaque;
-    int relative_addr = addr - s->base;
 
-    switch (relative_addr) {
+    switch (addr) {
         case 0:
             s->segments = val;
             s->state |= REDRAW_SEGMENTS;
@@ -134,13 +131,13 @@ static void led_writel(void *opaque, target_phys_addr_t addr, uint32_t val)
 #endif
 }
 
-static CPUReadMemoryFunc *led_read[3] = {
+static CPUReadMemoryFunc * const led_read[3] = {
     led_readb,
     led_readw,
     led_readl,
 };
 
-static CPUWriteMemoryFunc *led_write[3] = {
+static CPUWriteMemoryFunc * const led_write[3] = {
     led_writeb,
     led_writew,
     led_writel,
@@ -154,8 +151,8 @@ static void draw_horizontal_line(DisplayState *ds, int posy, int posx1, int posx
     uint8_t *d;
     int x, bpp;
 
-    bpp = (ds->depth + 7) >> 3;
-    d = ds->data + ds->linesize * posy + bpp * posx1;
+    bpp = (ds_get_bits_per_pixel(ds) + 7) >> 3;
+    d = ds_get_data(ds) + ds_get_linesize(ds) * posy + bpp * posx1;
     switch(bpp) {
         case 1:
             for (x = posx1; x <= posx2; x++) {
@@ -183,25 +180,25 @@ static void draw_vertical_line(DisplayState *ds, int posx, int posy1, int posy2,
     uint8_t *d;
     int y, bpp;
 
-    bpp = (ds->depth + 7) >> 3;
-    d = ds->data + ds->linesize * posy1 + bpp * posx;
+    bpp = (ds_get_bits_per_pixel(ds) + 7) >> 3;
+    d = ds_get_data(ds) + ds_get_linesize(ds) * posy1 + bpp * posx;
     switch(bpp) {
         case 1:
             for (y = posy1; y <= posy2; y++) {
                 *((uint8_t *)d) = color;
-                d += ds->linesize;
+                d += ds_get_linesize(ds);
             }
             break;
         case 2:
             for (y = posy1; y <= posy2; y++) {
                 *((uint16_t *)d) = color;
-                d += ds->linesize;
+                d += ds_get_linesize(ds);
             }
             break;
         case 4:
             for (y = posy1; y <= posy2; y++) {
                 *((uint32_t *)d) = color;
-                d += ds->linesize;
+                d += ds_get_linesize(ds);
             }
             break;
     }
@@ -217,17 +214,17 @@ static void jazz_led_update_display(void *opaque)
 
     if (s->state & REDRAW_BACKGROUND) {
         /* clear screen */
-        bpp = (ds->depth + 7) >> 3;
-        d1 = ds->data;
-        for (y = 0; y < ds->height; y++) {
-            memset(d1, 0x00, ds->width * bpp);
-            d1 += ds->linesize;
+        bpp = (ds_get_bits_per_pixel(ds) + 7) >> 3;
+        d1 = ds_get_data(ds);
+        for (y = 0; y < ds_get_height(ds); y++) {
+            memset(d1, 0x00, ds_get_width(ds) * bpp);
+            d1 += ds_get_linesize(ds);
         }
     }
 
     if (s->state & REDRAW_SEGMENTS) {
         /* set colors according to bpp */
-        switch (ds->depth) {
+        switch (ds_get_bits_per_pixel(ds)) {
             case 8:
                 color_segment = rgb_to_pixel8(0xaa, 0xaa, 0xaa);
                 color_led = rgb_to_pixel8(0x00, 0xff, 0x00);
@@ -271,7 +268,7 @@ static void jazz_led_update_display(void *opaque)
     }
 
     s->state = REDRAW_NONE;
-    dpy_update(ds, 0, 0, ds->width, ds->height);
+    dpy_update(ds, 0, 0, ds_get_width(ds), ds_get_height(ds));
 }
 
 static void jazz_led_invalidate_display(void *opaque)
@@ -291,7 +288,7 @@ static void jazz_led_text_update(void *opaque, console_ch_t *chardata)
     char buf[2];
 
     dpy_cursor(s->ds, -1, -1);
-    dpy_resize(s->ds, 2, 1);
+    qemu_console_resize(s->ds, 2, 1);
 
     /* TODO: draw the segments */
     snprintf(buf, 2, "%02hhx\n", s->segments);
@@ -301,23 +298,21 @@ static void jazz_led_text_update(void *opaque, console_ch_t *chardata)
     dpy_update(s->ds, 0, 0, 2, 1);
 }
 
-void jazz_led_init(DisplayState *ds, target_phys_addr_t base)
+void jazz_led_init(target_phys_addr_t base)
 {
     LedState *s;
     int io;
 
     s = qemu_mallocz(sizeof(LedState));
-    if (!s)
-        return;
 
-    s->base = base;
-    s->ds = ds;
     s->state = REDRAW_SEGMENTS | REDRAW_BACKGROUND;
 
-    io = cpu_register_io_memory(0, led_read, led_write, s);
-    cpu_register_physical_memory(s->base, 1, io);
+    io = cpu_register_io_memory(led_read, led_write, s);
+    cpu_register_physical_memory(base, 1, io);
 
-    graphic_console_init(ds, jazz_led_update_display,
-                         jazz_led_invalidate_display, jazz_led_screen_dump,
-                         jazz_led_text_update, s);
+    s->ds = graphic_console_init(jazz_led_update_display,
+                                 jazz_led_invalidate_display,
+                                 jazz_led_screen_dump,
+                                 jazz_led_text_update, s);
+    qemu_console_resize(s->ds, 60, 80);
 }
