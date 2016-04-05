@@ -26,6 +26,8 @@
 #include "cpu.h"
 #include "exec-all.h"
 #include "disas.h"
+#include "tcg-op.h"
+#include "qemu-common.h"
 
 /* Include definitions for instructions classes and implementations flags */
 //#define DO_SINGLE_STEP
@@ -36,27 +38,11 @@
 
 /*****************************************************************************/
 /* Code translation helpers                                                  */
-#if defined(USE_DIRECT_JUMP)
-#define TBPARAM(x)
-#else
-#define TBPARAM(x) (long)(x)
-#endif
 
-enum {
-#define DEF(s, n, copy_size) INDEX_op_ ## s,
-#include "opc.h"
-#undef DEF
-    NB_OPS,
-};
-
-static uint16_t *gen_opc_ptr;
-static uint32_t *gen_opparam_ptr;
 #if defined(OPTIMIZE_FPRF_UPDATE)
 static uint16_t *gen_fprf_buf[OPC_BUF_SIZE];
 static uint16_t **gen_fprf_ptr;
 #endif
-
-#include "gen-op.h"
 
 static always_inline void gen_set_T0 (target_ulong val)
 {
@@ -1133,7 +1119,7 @@ GEN_HANDLER(cmpli, 0x0A, 0xFF, 0xFF, 0x00400000, PPC_INTEGER)
 }
 
 /* isel (PowerPC 2.03 specification) */
-GEN_HANDLER(isel, 0x1F, 0x0F, 0x00, 0x00000001, PPC_ISEL)
+GEN_HANDLER(isel, 0x1F, 0x0F, 0xFF, 0x00000001, PPC_ISEL)
 {
     uint32_t bi = rC(ctx->opcode);
     uint32_t mask;
@@ -2798,11 +2784,9 @@ static always_inline void gen_goto_tb (DisasContext *ctx, int n,
 {
     TranslationBlock *tb;
     tb = ctx->tb;
-    if ((tb->pc & TARGET_PAGE_MASK) == (dest & TARGET_PAGE_MASK)) {
-        if (n == 0)
-            gen_op_goto_tb0(TBPARAM(tb));
-        else
-            gen_op_goto_tb1(TBPARAM(tb));
+    if ((tb->pc & TARGET_PAGE_MASK) == (dest & TARGET_PAGE_MASK) &&
+        !ctx->singlestep_enabled) {
+        tcg_gen_goto_tb(n);
         gen_set_T1(dest);
 #if defined(TARGET_PPC64)
         if (ctx->sf_mode)
@@ -2810,10 +2794,7 @@ static always_inline void gen_goto_tb (DisasContext *ctx, int n,
         else
 #endif
             gen_op_b_T1();
-        gen_op_set_T0((long)tb + n);
-        if (ctx->singlestep_enabled)
-            gen_op_debug();
-        gen_op_exit_tb();
+        tcg_gen_exit_tb((long)tb + n);
     } else {
         gen_set_T1(dest);
 #if defined(TARGET_PPC64)
@@ -2822,10 +2803,9 @@ static always_inline void gen_goto_tb (DisasContext *ctx, int n,
         else
 #endif
             gen_op_b_T1();
-        gen_op_reset_T0();
         if (ctx->singlestep_enabled)
             gen_op_debug();
-        gen_op_exit_tb();
+        tcg_gen_exit_tb(0);
     }
 }
 
@@ -2934,7 +2914,6 @@ static always_inline void gen_bcond (DisasContext *ctx, int type)
                 else
 #endif
                     gen_op_b_T1();
-                gen_op_reset_T0();
                 goto no_test;
             }
             break;
@@ -3005,11 +2984,10 @@ static always_inline void gen_bcond (DisasContext *ctx, int type)
         else
 #endif
             gen_op_btest_T1(ctx->nip);
-        gen_op_reset_T0();
     no_test:
         if (ctx->singlestep_enabled)
             gen_op_debug();
-        gen_op_exit_tb();
+        tcg_gen_exit_tb(0);
     }
  out:
     ctx->exception = POWERPC_EXCP_BRANCH;
@@ -6176,13 +6154,10 @@ static always_inline int gen_intermediate_code_internal (CPUState *env,
     int j, lj = -1;
 
     pc_start = tb->pc;
-    gen_opc_ptr = gen_opc_buf;
     gen_opc_end = gen_opc_buf + OPC_MAX_SIZE;
-    gen_opparam_ptr = gen_opparam_buf;
 #if defined(OPTIMIZE_FPRF_UPDATE)
     gen_fprf_ptr = gen_fprf_buf;
 #endif
-    nb_gen_labels = 0;
     ctx.nip = pc_start;
     ctx.tb = tb;
     ctx.exception = POWERPC_EXCP_NONE;
@@ -6332,9 +6307,8 @@ static always_inline int gen_intermediate_code_internal (CPUState *env,
     if (ctx.exception == POWERPC_EXCP_NONE) {
         gen_goto_tb(&ctx, 0, ctx.nip);
     } else if (ctx.exception != POWERPC_EXCP_BRANCH) {
-        gen_op_reset_T0();
         /* Generate the return instruction */
-        gen_op_exit_tb();
+        tcg_gen_exit_tb(0);
     }
     *gen_opc_ptr = INDEX_op_end;
     if (unlikely(search_pc)) {
@@ -6358,11 +6332,6 @@ static always_inline int gen_intermediate_code_internal (CPUState *env,
         target_disas(logfile, pc_start, ctx.nip - pc_start, flags);
         fprintf(logfile, "\n");
     }
-    if (loglevel & CPU_LOG_TB_OP) {
-        fprintf(logfile, "OP:\n");
-        dump_ops(gen_opc_buf, gen_opparam_buf);
-        fprintf(logfile, "\n");
-    }
 #endif
     return 0;
 }
@@ -6375,4 +6344,46 @@ int gen_intermediate_code (CPUState *env, struct TranslationBlock *tb)
 int gen_intermediate_code_pc (CPUState *env, struct TranslationBlock *tb)
 {
     return gen_intermediate_code_internal(env, tb, 1);
+}
+
+void gen_pc_load(CPUState *env, TranslationBlock *tb,
+                unsigned long searched_pc, int pc_pos, void *puc)
+{
+    int type, c;
+    /* for PPC, we need to look at the micro operation to get the
+     * access type */
+    env->nip = gen_opc_pc[pc_pos];
+    c = gen_opc_buf[pc_pos];
+    switch(c) {
+#if defined(CONFIG_USER_ONLY)
+#define CASE3(op)\
+    case INDEX_op_ ## op ## _raw
+#else
+#define CASE3(op)\
+    case INDEX_op_ ## op ## _user:\
+    case INDEX_op_ ## op ## _kernel:\
+    case INDEX_op_ ## op ## _hypv
+#endif
+
+    CASE3(stfd):
+    CASE3(stfs):
+    CASE3(lfd):
+    CASE3(lfs):
+        type = ACCESS_FLOAT;
+        break;
+    CASE3(lwarx):
+        type = ACCESS_RES;
+        break;
+    CASE3(stwcx):
+        type = ACCESS_RES;
+        break;
+    CASE3(eciwx):
+    CASE3(ecowx):
+        type = ACCESS_EXT;
+        break;
+    default:
+        type = ACCESS_INT;
+        break;
+    }
+    env->access_type = type;
 }

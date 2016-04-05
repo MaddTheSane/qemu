@@ -55,7 +55,7 @@ static int pci_slot_get_pirq(PCIDevice *pci_dev, int irq_num)
     return (irq_num + slot_addend) & 3;
 }
 
-static uint32_t isa_page_descs[384 / 4];
+static target_phys_addr_t isa_page_descs[384 / 4];
 static uint8_t smm_enabled;
 static int pci_irq_levels[4];
 
@@ -220,7 +220,6 @@ static void piix3_set_irq(qemu_irq *pic, int irq_num, int level)
 {
     int i, pic_irq, pic_level;
 
-    piix3_dev->config[0x60 + irq_num] &= ~0x80;   // enable bit
     pci_irq_levels[irq_num] = level;
 
     /* now we change the pic irq level according to the piix irq mappings */
@@ -250,6 +249,9 @@ static void piix3_reset(PCIDevice *d)
     pci_conf[0x4e] = 0x03;
     pci_conf[0x4f] = 0x00;
     pci_conf[0x60] = 0x80;
+    pci_conf[0x61] = 0x80;
+    pci_conf[0x62] = 0x80;
+    pci_conf[0x63] = 0x80;
     pci_conf[0x69] = 0x02;
     pci_conf[0x70] = 0x80;
     pci_conf[0x76] = 0x0c;

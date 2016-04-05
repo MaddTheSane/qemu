@@ -506,6 +506,8 @@ static void vnc_update_client(void *opaque)
 	int saved_offset;
 	int has_dirty = 0;
 
+        vga_hw_update();
+
         vnc_set_bits(width_mask, (vs->width / 16), VNC_DIRTY_WORDS);
 
 	/* Walk through the dirty map and eliminate tiles that
@@ -580,22 +582,11 @@ static void vnc_update_client(void *opaque)
 	vnc_flush(vs);
 
     }
-    qemu_mod_timer(vs->timer, qemu_get_clock(rt_clock) + VNC_REFRESH_INTERVAL);
-}
 
-static void vnc_timer_init(VncState *vs)
-{
-    if (vs->timer == NULL) {
-	vs->timer = qemu_new_timer(rt_clock, vnc_update_client, vs);
-	qemu_mod_timer(vs->timer, qemu_get_clock(rt_clock));
+    if (vs->csock != -1) {
+        qemu_mod_timer(vs->timer, qemu_get_clock(rt_clock) + VNC_REFRESH_INTERVAL);
     }
-}
 
-static void vnc_dpy_refresh(DisplayState *ds)
-{
-    VncState *vs = ds->opaque;
-    vnc_timer_init(vs);
-    vga_hw_update();
 }
 
 static int vnc_listen_poll(void *opaque)
@@ -642,8 +633,18 @@ static void buffer_append(Buffer *buffer, const void *data, size_t len)
 static int vnc_client_io_error(VncState *vs, int ret, int last_errno)
 {
     if (ret == 0 || ret == -1) {
-	if (ret == -1 && (last_errno == EINTR || last_errno == EAGAIN))
-	    return 0;
+        if (ret == -1) {
+            switch (last_errno) {
+                case EINTR:
+                case EAGAIN:
+#ifdef _WIN32
+                case WSAEWOULDBLOCK:
+#endif
+                    return 0;
+                default:
+                    break;
+            }
+        }
 
 	VNC_DEBUG("Closing down client sock %d %d\n", ret, ret < 0 ? last_errno : 0);
 	qemu_set_fd_handler2(vs->csock, NULL, NULL, NULL, NULL);
@@ -888,8 +889,8 @@ static void pointer_event(VncState *vs, int button_mask, int x, int y)
 	dz = 1;
 
     if (vs->absolute) {
-	kbd_mouse_event(x * 0x7FFF / vs->ds->width,
-			y * 0x7FFF / vs->ds->height,
+	kbd_mouse_event(x * 0x7FFF / (vs->ds->width - 1),
+			y * 0x7FFF / (vs->ds->height - 1),
 			dz, buttons);
     } else if (vs->has_pointer_type_change) {
 	x -= 0x7FFF;
@@ -954,6 +955,7 @@ static void do_key_event(VncState *vs, int down, uint32_t sym)
             return;
         }
         break;
+    case 0x3a:			/* CapsLock */
     case 0x45:			/* NumLock */
         if (!down)
             vs->modifiers_state[keycode] ^= 1;
@@ -1907,25 +1909,34 @@ static int protocol_version(VncState *vs, uint8_t *version, size_t len)
     return 0;
 }
 
+static void vnc_connect(VncState *vs)
+{
+    VNC_DEBUG("New client on socket %d\n", vs->csock);
+    socket_set_nonblock(vs->csock);
+    qemu_set_fd_handler2(vs->csock, NULL, vnc_client_read, NULL, vs);
+    vnc_write(vs, "RFB 003.008\n", 12);
+    vnc_flush(vs);
+    vnc_read_when(vs, protocol_version, 12);
+    memset(vs->old_data, 0, vs->ds->linesize * vs->ds->height);
+    memset(vs->dirty_row, 0xFF, sizeof(vs->dirty_row));
+    vs->has_resize = 0;
+    vs->has_hextile = 0;
+    vs->ds->dpy_copy = NULL;
+    vnc_update_client(vs);
+}
+
 static void vnc_listen_read(void *opaque)
 {
     VncState *vs = opaque;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
 
+    /* Catch-up */
+    vga_hw_update();
+
     vs->csock = accept(vs->lsock, (struct sockaddr *)&addr, &addrlen);
     if (vs->csock != -1) {
-	VNC_DEBUG("New client on socket %d\n", vs->csock);
-        socket_set_nonblock(vs->csock);
-	qemu_set_fd_handler2(vs->csock, NULL, vnc_client_read, NULL, opaque);
-	vnc_write(vs, "RFB 003.008\n", 12);
-	vnc_flush(vs);
-	vnc_read_when(vs, protocol_version, 12);
-	memset(vs->old_data, 0, vs->ds->linesize * vs->ds->height);
-	memset(vs->dirty_row, 0xFF, sizeof(vs->dirty_row));
-	vs->has_resize = 0;
-	vs->has_hextile = 0;
-	vs->ds->dpy_copy = NULL;
+        vnc_connect(vs);
     }
 }
 
@@ -1959,10 +1970,12 @@ void vnc_display_init(DisplayState *ds)
     if (!vs->kbd_layout)
 	exit(1);
 
+    vs->timer = qemu_new_timer(rt_clock, vnc_update_client, vs);
+
     vs->ds->data = NULL;
     vs->ds->dpy_update = vnc_dpy_update;
     vs->ds->dpy_resize = vnc_dpy_resize;
-    vs->ds->dpy_refresh = vnc_dpy_refresh;
+    vs->ds->dpy_refresh = NULL;
 
     memset(vs->dirty_row, 0xFF, sizeof(vs->dirty_row));
 
@@ -2083,13 +2096,14 @@ int vnc_display_open(DisplayState *ds, const char *display)
     struct sockaddr_in iaddr;
 #ifndef _WIN32
     struct sockaddr_un uaddr;
+    const char *p;
 #endif
     int reuse_addr, ret;
     socklen_t addrlen;
-    const char *p;
     VncState *vs = ds ? (VncState *)ds->opaque : vnc_state;
     const char *options;
     int password = 0;
+    int reverse = 0;
 #if CONFIG_VNC_TLS
     int tls = 0, x509 = 0;
 #endif
@@ -2106,6 +2120,8 @@ int vnc_display_open(DisplayState *ds, const char *display)
 	options++;
 	if (strncmp(options, "password", 8) == 0) {
 	    password = 1; /* Require password auth */
+	} else if (strncmp(options, "reverse", 7) == 0) {
+	    reverse = 1;
 #if CONFIG_VNC_TLS
 	} else if (strncmp(options, "tls", 3) == 0) {
 	    tls = 1; /* Require TLS */
@@ -2199,7 +2215,9 @@ int vnc_display_open(DisplayState *ds, const char *display)
 	memset(uaddr.sun_path, 0, 108);
 	snprintf(uaddr.sun_path, 108, "%s", p);
 
-	unlink(uaddr.sun_path);
+	if (!reverse) {
+	    unlink(uaddr.sun_path);
+	}
     } else
 #endif
     {
@@ -2213,7 +2231,7 @@ int vnc_display_open(DisplayState *ds, const char *display)
 	    return -1;
 	}
 
-	iaddr.sin_port = htons(ntohs(iaddr.sin_port) + 5900);
+	iaddr.sin_port = htons(ntohs(iaddr.sin_port) + (reverse ? 0 : 5900));
 
 	vs->lsock = socket(PF_INET, SOCK_STREAM, 0);
 	if (vs->lsock == -1) {
@@ -2234,6 +2252,22 @@ int vnc_display_open(DisplayState *ds, const char *display)
 	    vs->display = NULL;
 	    return -1;
 	}
+    }
+
+    if (reverse) {
+        if (connect(vs->lsock, addr, addrlen) == -1) {
+            fprintf(stderr, "Connection to VNC client failed\n");
+            close(vs->lsock);
+            vs->lsock = -1;
+            free(vs->display);
+            vs->display = NULL;
+            return -1;
+        } else {
+            vs->csock = vs->lsock;
+            vs->lsock = -1;
+            vnc_connect(vs);
+            return 0;
+        }
     }
 
     if (bind(vs->lsock, addr, addrlen) == -1) {

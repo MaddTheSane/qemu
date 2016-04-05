@@ -30,12 +30,16 @@ void cpu_disable_ticks(void);
 void qemu_system_reset_request(void);
 void qemu_system_shutdown_request(void);
 void qemu_system_powerdown_request(void);
-#if !defined(TARGET_SPARC)
+int qemu_shutdown_requested(void);
+int qemu_reset_requested(void);
+int qemu_powerdown_requested(void);
+#if !defined(TARGET_SPARC) && !defined(TARGET_I386)
 // Please implement a power failure function to signal the OS
 #define qemu_system_powerdown() do{}while(0)
 #else
 void qemu_system_powerdown(void);
 #endif
+void qemu_system_reset(void);
 
 void cpu_save(QEMUFile *f, void *opaque);
 int cpu_load(QEMUFile *f, void *opaque, int version_id);
@@ -69,10 +73,7 @@ int tap_win32_init(VLANState *vlan, const char *ifname);
 /* SLIRP */
 void do_info_slirp(void);
 
-extern int ram_size;
 extern int bios_size;
-extern int rtc_utc;
-extern int rtc_start_date;
 extern int cirrus_vga_enabled;
 extern int vmsvga_enabled;
 extern int graphic_width;
@@ -106,8 +107,6 @@ extern const char *prom_envs[MAX_PROM_ENVS];
 extern unsigned int nb_prom_envs;
 #endif
 
-/* XXX: make it dynamic */
-#define MAX_BIOS_SIZE (4 * 1024 * 1024)
 #if defined (TARGET_PPC)
 #define BIOS_SIZE (1024 * 1024)
 #elif defined (TARGET_SPARC64)

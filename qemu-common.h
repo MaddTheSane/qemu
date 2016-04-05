@@ -76,12 +76,23 @@ int qemu_bh_poll(void);
 
 uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c);
 
+void qemu_get_timedate(struct tm *tm, int offset);
+int qemu_timedate_diff(struct tm *tm);
+
 /* cutils.c */
 void pstrcpy(char *buf, int buf_size, const char *str);
 char *pstrcat(char *buf, int buf_size, const char *s);
 int strstart(const char *str, const char *val, const char **ptr);
 int stristart(const char *str, const char *val, const char **ptr);
 time_t mktimegm(struct tm *tm);
+
+void *qemu_malloc(size_t size);
+void *qemu_mallocz(size_t size);
+void qemu_free(void *ptr);
+char *qemu_strdup(const char *str);
+
+void *get_mmap_addr(unsigned long size);
+
 
 /* Error handling.  */
 

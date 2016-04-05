@@ -58,8 +58,10 @@ struct vmsvga_state_s {
 #ifndef EMBED_STDVGA
     DisplayState *ds;
     int vram_size;
+    ram_addr_t vram_offset;
 #endif
     uint8_t *vram;
+    target_phys_addr_t vram_base;
 
     int index;
     int scratch_size;
@@ -290,12 +292,33 @@ static inline void vmsvga_update_rect(struct vmsvga_state_s *s,
                 int x, int y, int w, int h)
 {
 #ifndef DIRECT_VRAM
-    int line = h;
-    int bypl = s->bypp * s->width;
-    int width = s->bypp * w;
-    int start = s->bypp * x + bypl * y;
-    uint8_t *src = s->vram + start;
-    uint8_t *dst = s->ds->data + start;
+    int line;
+    int bypl;
+    int width;
+    int start;
+    uint8_t *src;
+    uint8_t *dst;
+
+    if (x + w > s->width) {
+        fprintf(stderr, "%s: update width too large x: %d, w: %d\n",
+                        __FUNCTION__, x, w);
+        x = MIN(x, s->width);
+        w = s->width - x;
+    }
+
+    if (y + h > s->height) {
+        fprintf(stderr, "%s: update height too large y: %d, h: %d\n",
+                        __FUNCTION__, y, h);
+        y = MIN(y, s->height);
+        h = s->height - y;
+    }
+
+    line = h;
+    bypl = s->bypp * s->width;
+    width = s->bypp * w;
+    start = s->bypp * x + bypl * y;
+    src = s->vram + start;
+    dst = s->ds->data + start;
 
     for (; line > 0; line --, src += bypl, dst += bypl)
         memcpy(dst, src, width);
@@ -644,7 +667,7 @@ static uint32_t vmsvga_value_read(void *opaque, uint32_t address)
         return ((s->depth + 7) >> 3) * s->new_width;
 
     case SVGA_REG_FB_START:
-        return SVGA_MEM_BASE;
+        return s->vram_base;
 
     case SVGA_REG_FB_OFFSET:
         return 0x0;
@@ -671,7 +694,7 @@ static uint32_t vmsvga_value_read(void *opaque, uint32_t address)
         return caps;
 
     case SVGA_REG_MEM_START:
-        return SVGA_MEM_BASE + s->vram_size - SVGA_FIFO_SIZE;
+        return s->vram_base + s->vram_size - SVGA_FIFO_SIZE;
 
     case SVGA_REG_MEM_SIZE:
         return SVGA_FIFO_SIZE;
@@ -949,11 +972,19 @@ static void vmsvga_screen_dump(void *opaque, const char *filename)
     }
 }
 
+static void vmsvga_text_update(void *opaque, console_ch_t *chardata)
+{
+    struct vmsvga_state_s *s = (struct vmsvga_state_s *) opaque;
+
+    if (s->text_update)
+        s->text_update(opaque, chardata);
+}
+
 #ifdef DIRECT_VRAM
 static uint32_t vmsvga_vram_readb(void *opaque, target_phys_addr_t addr)
 {
     struct vmsvga_state_s *s = (struct vmsvga_state_s *) opaque;
-    addr -= SVGA_MEM_BASE;
+    addr -= s->vram_base;
     if (addr < s->fb_size)
         return *(uint8_t *) (s->ds->data + addr);
     else
@@ -963,7 +994,7 @@ static uint32_t vmsvga_vram_readb(void *opaque, target_phys_addr_t addr)
 static uint32_t vmsvga_vram_readw(void *opaque, target_phys_addr_t addr)
 {
     struct vmsvga_state_s *s = (struct vmsvga_state_s *) opaque;
-    addr -= SVGA_MEM_BASE;
+    addr -= s->vram_base;
     if (addr < s->fb_size)
         return *(uint16_t *) (s->ds->data + addr);
     else
@@ -973,7 +1004,7 @@ static uint32_t vmsvga_vram_readw(void *opaque, target_phys_addr_t addr)
 static uint32_t vmsvga_vram_readl(void *opaque, target_phys_addr_t addr)
 {
     struct vmsvga_state_s *s = (struct vmsvga_state_s *) opaque;
-    addr -= SVGA_MEM_BASE;
+    addr -= s->vram_base;
     if (addr < s->fb_size)
         return *(uint32_t *) (s->ds->data + addr);
     else
@@ -984,7 +1015,7 @@ static void vmsvga_vram_writeb(void *opaque, target_phys_addr_t addr,
                 uint32_t value)
 {
     struct vmsvga_state_s *s = (struct vmsvga_state_s *) opaque;
-    addr -= SVGA_MEM_BASE;
+    addr -= s->vram_base;
     if (addr < s->fb_size)
         *(uint8_t *) (s->ds->data + addr) = value;
     else
@@ -995,7 +1026,7 @@ static void vmsvga_vram_writew(void *opaque, target_phys_addr_t addr,
                 uint32_t value)
 {
     struct vmsvga_state_s *s = (struct vmsvga_state_s *) opaque;
-    addr -= SVGA_MEM_BASE;
+    addr -= s->vram_base;
     if (addr < s->fb_size)
         *(uint16_t *) (s->ds->data + addr) = value;
     else
@@ -1006,7 +1037,7 @@ static void vmsvga_vram_writel(void *opaque, target_phys_addr_t addr,
                 uint32_t value)
 {
     struct vmsvga_state_s *s = (struct vmsvga_state_s *) opaque;
-    addr -= SVGA_MEM_BASE;
+    addr -= s->vram_base;
     if (addr < s->fb_size)
         *(uint32_t *) (s->ds->data + addr) = value;
     else
@@ -1081,40 +1112,19 @@ static void vmsvga_init(struct vmsvga_state_s *s, DisplayState *ds,
                 uint8_t *vga_ram_base, unsigned long vga_ram_offset,
                 int vga_ram_size)
 {
-    int iomemtype;
     s->ds = ds;
     s->vram = vga_ram_base;
     s->vram_size = vga_ram_size;
+    s->vram_offset = vga_ram_offset;
 
     s->scratch_size = SVGA_SCRATCH_SIZE;
     s->scratch = (uint32_t *) qemu_malloc(s->scratch_size * 4);
 
     vmsvga_reset(s);
 
-#ifdef DIRECT_VRAM
-    iomemtype = cpu_register_io_memory(0, vmsvga_vram_read,
-                    vmsvga_vram_write, s);
-#else
-    iomemtype = vga_ram_offset | IO_MEM_RAM;
-#endif
-    cpu_register_physical_memory(SVGA_MEM_BASE, vga_ram_size,
-                    iomemtype);
-
-    register_ioport_read(SVGA_IO_BASE + SVGA_IO_MUL * SVGA_INDEX_PORT,
-                    1, 4, vmsvga_index_read, s);
-    register_ioport_write(SVGA_IO_BASE + SVGA_IO_MUL * SVGA_INDEX_PORT,
-                    1, 4, vmsvga_index_write, s);
-    register_ioport_read(SVGA_IO_BASE + SVGA_IO_MUL * SVGA_VALUE_PORT,
-                    1, 4, vmsvga_value_read, s);
-    register_ioport_write(SVGA_IO_BASE + SVGA_IO_MUL * SVGA_VALUE_PORT,
-                    1, 4, vmsvga_value_write, s);
-    register_ioport_read(SVGA_IO_BASE + SVGA_IO_MUL * SVGA_BIOS_PORT,
-                    1, 4, vmsvga_bios_read, s);
-    register_ioport_write(SVGA_IO_BASE + SVGA_IO_MUL * SVGA_BIOS_PORT,
-                    1, 4, vmsvga_bios_write, s);
-
     graphic_console_init(ds, vmsvga_update_display,
-                    vmsvga_invalidate_display, vmsvga_screen_dump, s);
+                    vmsvga_invalidate_display, vmsvga_screen_dump,
+                    vmsvga_text_update, s);
 
 #ifdef EMBED_STDVGA
     vga_common_init((VGAState *) s, ds,
@@ -1144,6 +1154,44 @@ static int pci_vmsvga_load(QEMUFile *f, void *opaque, int version_id)
         return ret;
 
     return 0;
+}
+
+static void pci_vmsvga_map_ioport(PCIDevice *pci_dev, int region_num,
+                uint32_t addr, uint32_t size, int type)
+{
+    struct pci_vmsvga_state_s *d = (struct pci_vmsvga_state_s *) pci_dev;
+    struct vmsvga_state_s *s = &d->chip;
+
+    register_ioport_read(addr + SVGA_IO_MUL * SVGA_INDEX_PORT,
+                    1, 4, vmsvga_index_read, s);
+    register_ioport_write(addr + SVGA_IO_MUL * SVGA_INDEX_PORT,
+                    1, 4, vmsvga_index_write, s);
+    register_ioport_read(addr + SVGA_IO_MUL * SVGA_VALUE_PORT,
+                    1, 4, vmsvga_value_read, s);
+    register_ioport_write(addr + SVGA_IO_MUL * SVGA_VALUE_PORT,
+                    1, 4, vmsvga_value_write, s);
+    register_ioport_read(addr + SVGA_IO_MUL * SVGA_BIOS_PORT,
+                    1, 4, vmsvga_bios_read, s);
+    register_ioport_write(addr + SVGA_IO_MUL * SVGA_BIOS_PORT,
+                    1, 4, vmsvga_bios_write, s);
+}
+
+static void pci_vmsvga_map_mem(PCIDevice *pci_dev, int region_num,
+                uint32_t addr, uint32_t size, int type)
+{
+    struct pci_vmsvga_state_s *d = (struct pci_vmsvga_state_s *) pci_dev;
+    struct vmsvga_state_s *s = &d->chip;
+    int iomemtype;
+
+    s->vram_base = addr;
+#ifdef DIRECT_VRAM
+    iomemtype = cpu_register_io_memory(0, vmsvga_vram_read,
+                    vmsvga_vram_write, s);
+#else
+    iomemtype = s->vram_offset | IO_MEM_RAM;
+#endif
+    cpu_register_physical_memory(s->vram_base, s->vram_size,
+                    iomemtype);
 }
 
 #define PCI_VENDOR_ID_VMWARE		0x15ad
@@ -1188,6 +1236,11 @@ void pci_vmsvga_init(PCIBus *bus, DisplayState *ds, uint8_t *vga_ram_base,
     s->card.config[0x2e]		= SVGA_PCI_DEVICE_ID & 0xff;
     s->card.config[0x2f]		= SVGA_PCI_DEVICE_ID >> 8;
     s->card.config[0x3c]		= 0xff;		/* End */
+
+    pci_register_io_region(&s->card, 0, 0x10,
+                    PCI_ADDRESS_SPACE_IO, pci_vmsvga_map_ioport);
+    pci_register_io_region(&s->card, 1, vga_ram_size,
+                    PCI_ADDRESS_SPACE_MEM_PREFETCH, pci_vmsvga_map_mem);
 
     vmsvga_init(&s->chip, ds, vga_ram_base, vga_ram_offset, vga_ram_size);
 

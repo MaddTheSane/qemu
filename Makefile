@@ -7,17 +7,14 @@ include config-host.mak
 
 VPATH=$(SRC_PATH):$(SRC_PATH)/hw
 
-BASE_CFLAGS=
-BASE_LDFLAGS=
-
-BASE_CFLAGS += $(OS_CFLAGS) $(ARCH_CFLAGS)
-BASE_LDFLAGS += $(OS_LDFLAGS) $(ARCH_LDFLAGS)
+CFLAGS += $(OS_CFLAGS) $(ARCH_CFLAGS)
+LDFLAGS += $(OS_LDFLAGS) $(ARCH_LDFLAGS)
 
 CPPFLAGS += -I. -I$(SRC_PATH) -MMD -MP
 CPPFLAGS += -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE
 LIBS=
 ifdef CONFIG_STATIC
-BASE_LDFLAGS += -static
+LDFLAGS += -static
 endif
 ifdef BUILD_DOCS
 DOCS=qemu-doc.html qemu-tech.html qemu.1 qemu-img.1
@@ -43,7 +40,7 @@ BLOCK_OBJS+=block-dmg.o block-bochs.o block-vpc.o block-vvfat.o
 BLOCK_OBJS+=block-qcow2.o block-parallels.o
 
 ######################################################################
-# libqemu_common.a: Target indepedent part of system emulation. The
+# libqemu_common.a: Target independent part of system emulation. The
 # long term path is to suppress *all* target specific code in case of
 # system emulation, i.e. a single QEMU executable should support all
 # CPUs and machines.
@@ -54,11 +51,17 @@ OBJS+=block.o
 
 OBJS+=irq.o
 OBJS+=i2c.o smbus.o smbus_eeprom.o max7310.o max111x.o wm8750.o
-OBJS+=ssd0303.o ssd0323.o ads7846.o stellaris_input.o
+OBJS+=ssd0303.o ssd0323.o ads7846.o stellaris_input.o twl92230.o
+OBJS+=tmp105.o
 OBJS+=scsi-disk.o cdrom.o
 OBJS+=scsi-generic.o
-OBJS+=usb.o usb-hub.o usb-linux.o usb-hid.o usb-msd.o usb-wacom.o
+OBJS+=usb.o usb-hub.o usb-linux.o usb-hid.o usb-msd.o usb-wacom.o usb-serial.o
 OBJS+=sd.o ssi-sd.o
+
+ifdef CONFIG_BRLAPI
+OBJS+= baum.o
+LIBS+=-lbrlapi
+endif
 
 ifdef CONFIG_WIN32
 OBJS+=tap-win32.o
@@ -73,6 +76,7 @@ AUDIO_OBJS += ossaudio.o
 endif
 ifdef CONFIG_COREAUDIO
 AUDIO_OBJS += coreaudio.o
+AUDIO_PT = yes
 endif
 ifdef CONFIG_ALSA
 AUDIO_OBJS += alsaaudio.o
@@ -84,11 +88,25 @@ ifdef CONFIG_FMOD
 AUDIO_OBJS += fmodaudio.o
 audio/audio.o audio/fmodaudio.o: CPPFLAGS := -I$(CONFIG_FMOD_INC) $(CPPFLAGS)
 endif
+ifdef CONFIG_ESD
+AUDIO_PT = yes
+AUDIO_PT_INT = yes
+AUDIO_OBJS += esdaudio.o
+endif
+ifdef AUDIO_PT
+LDFLAGS += -pthread
+endif
+ifdef AUDIO_PT_INT
+AUDIO_OBJS += audio_pt_int.o
+endif
 AUDIO_OBJS+= wavcapture.o
 OBJS+=$(addprefix audio/, $(AUDIO_OBJS))
 
 ifdef CONFIG_SDL
 OBJS+=sdl.o x_keymap.o
+endif
+ifdef CONFIG_CURSES
+OBJS+=curses.o
 endif
 OBJS+=vnc.o d3des.o
 
@@ -105,16 +123,19 @@ OBJS+=$(addprefix slirp/, $(SLIRP_OBJS))
 endif
 
 cocoa.o: cocoa.m
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(BASE_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
 
 sdl.o: sdl.c keymaps.c sdl_keysym.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(SDL_CFLAGS) $(BASE_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(SDL_CFLAGS) -c -o $@ $<
 
 vnc.o: vnc.c keymaps.c sdl_keysym.h vnchextile.h d3des.c d3des.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(BASE_CFLAGS) $(CONFIG_VNC_TLS_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(CONFIG_VNC_TLS_CFLAGS) -c -o $@ $<
+
+curses.o: curses.c keymaps.c curses_keys.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
 
 audio/sdlaudio.o: audio/sdlaudio.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(SDL_CFLAGS) $(BASE_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(SDL_CFLAGS) -c -o $@ $<
 
 libqemu_common.a: $(OBJS)
 	rm -f $@ 
@@ -130,17 +151,17 @@ endif
 ######################################################################
 
 qemu-img$(EXESUF): qemu-img.o qemu-img-block.o $(QEMU_IMG_BLOCK_OBJS)
-	$(CC) $(LDFLAGS) $(BASE_LDFLAGS) -o $@ $^ -lz $(LIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ -lz $(LIBS)
 
 qemu-img-%.o: %.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DQEMU_IMG $(BASE_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DQEMU_IMG -c -o $@ $<
 
 %.o: %.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(BASE_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
 
 # dyngen host tool
 dyngen$(EXESUF): dyngen.c
-	$(HOST_CC) $(CFLAGS) $(CPPFLAGS) $(BASE_CFLAGS) -o $@ $^
+	$(HOST_CC) $(CFLAGS) $(CPPFLAGS) -o $@ $^
 
 clean:
 # avoid old build problems by removing potentially incorrect old files
@@ -178,14 +199,14 @@ ifneq ($(TOOLS),)
 	$(INSTALL) -m 755 -s $(TOOLS) "$(DESTDIR)$(bindir)"
 endif
 	mkdir -p "$(DESTDIR)$(datadir)"
-	for x in bios.bin vgabios.bin vgabios-cirrus.bin ppc_rom.bin \
-		video.x openbios-sparc32 pxe-ne2k_pci.bin \
+	set -e; for x in bios.bin vgabios.bin vgabios-cirrus.bin ppc_rom.bin \
+		video.x openbios-sparc32 openbios-sparc64 pxe-ne2k_pci.bin \
 		pxe-rtl8139.bin pxe-pcnet.bin; do \
 		$(INSTALL) -m 644 $(SRC_PATH)/pc-bios/$$x "$(DESTDIR)$(datadir)"; \
 	done
 ifndef CONFIG_WIN32
 	mkdir -p "$(DESTDIR)$(datadir)/keymaps"
-	for x in $(KEYMAPS); do \
+	set -e; for x in $(KEYMAPS); do \
 		$(INSTALL) -m 644 $(SRC_PATH)/keymaps/$$x "$(DESTDIR)$(datadir)/keymaps"; \
 	done
 endif
@@ -236,12 +257,12 @@ FILE = qemu-$(VERSION)
 tar:
 	rm -rf /tmp/$(FILE)
 	cp -r . /tmp/$(FILE)
-	( cd /tmp ; tar zcvf ~/$(FILE).tar.gz $(FILE) --exclude CVS )
+	cd /tmp && tar zcvf ~/$(FILE).tar.gz $(FILE) --exclude CVS --exclude .git --exclude .svn
 	rm -rf /tmp/$(FILE)
 
 # generate a binary distribution
 tarbin:
-	( cd / ; tar zcvf ~/qemu-$(VERSION)-$(ARCH).tar.gz \
+	cd / && tar zcvf ~/qemu-$(VERSION)-$(ARCH).tar.gz \
 	$(bindir)/qemu \
 	$(bindir)/qemu-system-ppc \
 	$(bindir)/qemu-system-ppc64 \
@@ -281,16 +302,13 @@ tarbin:
 	$(datadir)/ppc_rom.bin \
 	$(datadir)/video.x \
 	$(datadir)/openbios-sparc32 \
+	$(datadir)/openbios-sparc64 \
         $(datadir)/pxe-ne2k_pci.bin \
 	$(datadir)/pxe-rtl8139.bin \
         $(datadir)/pxe-pcnet.bin \
 	$(docdir)/qemu-doc.html \
 	$(docdir)/qemu-tech.html \
-	$(mandir)/man1/qemu.1 $(mandir)/man1/qemu-img.1 )
-
-ifneq ($(wildcard .depend),)
-include .depend
-endif
+	$(mandir)/man1/qemu.1 $(mandir)/man1/qemu-img.1
 
 # Include automatically generated dependency files
 -include $(wildcard *.d audio/*.d slirp/*.d)

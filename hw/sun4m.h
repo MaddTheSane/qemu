@@ -54,33 +54,22 @@ void slavio_serial_ms_kbd_init(target_phys_addr_t base, qemu_irq irq,
 
 /* slavio_misc.c */
 void *slavio_misc_init(target_phys_addr_t base, target_phys_addr_t power_base,
-                       qemu_irq irq);
+                       target_phys_addr_t aux1_base,
+                       target_phys_addr_t aux2_base, qemu_irq irq,
+                       CPUState *env, qemu_irq **fdc_tc);
 void slavio_set_power_fail(void *opaque, int power_failing);
-
-/* esp.c */
-#define ESP_MAX_DEVS 7
-void esp_scsi_attach(void *opaque, BlockDriverState *bd, int id);
-void *esp_init(target_phys_addr_t espaddr,
-               void *dma_opaque, qemu_irq irq, qemu_irq *reset);
 
 /* cs4231.c */
 void cs_init(target_phys_addr_t base, int irq, void *intctl);
 
 /* sparc32_dma.c */
-void *sparc32_dma_init(target_phys_addr_t daddr, qemu_irq parent_irq,
-                       void *iommu, qemu_irq **dev_irq, qemu_irq **reset);
-void ledma_memory_read(void *opaque, target_phys_addr_t addr,
-                       uint8_t *buf, int len, int do_bswap);
-void ledma_memory_write(void *opaque, target_phys_addr_t addr,
-                        uint8_t *buf, int len, int do_bswap);
-void espdma_memory_read(void *opaque, uint8_t *buf, int len);
-void espdma_memory_write(void *opaque, uint8_t *buf, int len);
+#include "sparc32_dma.h"
 
 /* pcnet.c */
 void lance_init(NICInfo *nd, target_phys_addr_t leaddr, void *dma_opaque,
                 qemu_irq irq, qemu_irq *reset);
 
 /* eccmemctl.c */
-void *ecc_init(target_phys_addr_t base, uint32_t version);
+void *ecc_init(target_phys_addr_t base, qemu_irq irq, uint32_t version);
 
 #endif

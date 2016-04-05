@@ -151,26 +151,9 @@
 
 /* Microcode.  */
 
-void OPPROTO op_exit_tb (void)
-{
-	EXIT_TB();
-}
-
-void OPPROTO op_goto_tb0 (void)
-{
-	GOTO_TB(op_goto_tb0, PARAM1, 0);
-	RETURN();
-}
-
-void OPPROTO op_goto_tb1 (void)
-{
-	GOTO_TB(op_goto_tb1, PARAM1, 1);
-	RETURN();
-}
-
 void OPPROTO op_break_im(void)
 {
-	env->trapnr = PARAM1;
+	env->trap_vector = PARAM1;
 	env->exception_index = EXCP_BREAK;
 	cpu_loop_exit();
 }
@@ -202,29 +185,46 @@ void OPPROTO op_ccs_lshift (void)
 	uint32_t ccs;
 
 	/* Apply the ccs shift.  */
-	ccs = env->pregs[SR_CCS];
+	ccs = env->pregs[PR_CCS];
 	ccs = (ccs & 0xc0000000) | ((ccs << 12) >> 2);
-	env->pregs[SR_CCS] = ccs;
+	env->pregs[PR_CCS] = ccs;
+	RETURN();
 }
 void OPPROTO op_ccs_rshift (void)
 {
-	uint32_t ccs;
+	register uint32_t ccs;
 
 	/* Apply the ccs shift.  */
-	ccs = env->pregs[SR_CCS];
-	ccs = (ccs & 0xc0000000) | (ccs >> 10);
-	env->pregs[SR_CCS] = ccs;
+	ccs = env->pregs[PR_CCS];
+	ccs = (ccs & 0xc0000000) | ((ccs & 0x0fffffff) >> 10);
+	if (ccs & U_FLAG)
+	{
+		/* Enter user mode.  */
+		env->ksp = env->regs[R_SP];
+		env->regs[R_SP] = env->pregs[PR_USP];
+	}
+
+	env->pregs[PR_CCS] = ccs;
+
+	RETURN();
 }
 
 void OPPROTO op_setf (void)
 {
-	env->pregs[SR_CCS] |= PARAM1;
+	if (!(env->pregs[PR_CCS] & U_FLAG) && (PARAM1 & U_FLAG))
+	{
+		/* Enter user mode.  */
+		env->ksp = env->regs[R_SP];
+		env->regs[R_SP] = env->pregs[PR_USP];
+	}
+
+	env->pregs[PR_CCS] |= PARAM1;
 	RETURN();
 }
 
 void OPPROTO op_clrf (void)
 {
-	env->pregs[SR_CCS] &= ~PARAM1;
+	env->pregs[PR_CCS] &= ~PARAM1;
 	RETURN();
 }
 
@@ -269,49 +269,90 @@ void OPPROTO op_movl_debug3_im (void)
 }
 void OPPROTO op_movl_T0_flags (void)
 {
-	T0 = env->pregs[SR_CCS];
+	T0 = env->pregs[PR_CCS];
 	RETURN();
 }
 void OPPROTO op_movl_flags_T0 (void)
 {
-	env->pregs[SR_CCS] = T0;
+	env->pregs[PR_CCS] = T0;
 	RETURN();
 }
 
 void OPPROTO op_movl_sreg_T0 (void)
 {
-	env->sregs[env->pregs[SR_SRS]][PARAM1] = T0;
+	uint32_t srs;
+	srs = env->pregs[PR_SRS];
+	srs &= 3;
+
+	env->sregs[srs][PARAM1] = T0;
+	RETURN();
+}
+
+void OPPROTO op_movl_tlb_hi_T0 (void)
+{
+	uint32_t srs;
+	srs = env->pregs[PR_SRS];
+	if (srs == 1 || srs == 2)
+	{
+		/* Writes to tlb-hi write to mm_cause as a side effect.  */
+		env->sregs[SFR_RW_MM_TLB_HI] = T0;
+		env->sregs[SFR_R_MM_CAUSE] = T0;
+	}
 	RETURN();
 }
 
 void OPPROTO op_movl_tlb_lo_T0 (void)
 {
-	int srs;
-	srs = env->pregs[SR_SRS];
+	uint32_t srs;
+
+	env->pregs[PR_SRS] &= 3;
+	srs = env->pregs[PR_SRS];
+
 	if (srs == 1 || srs == 2)
 	{
-		int set;
-		int idx;
+		uint32_t set;
+		uint32_t idx;
 		uint32_t lo, hi;
 
 		idx = set = env->sregs[SFR_RW_MM_TLB_SEL];
 		set >>= 4;
 		set &= 3;
 
-		idx &= 31;
+		idx &= 15;
 		/* We've just made a write to tlb_lo.  */
 		lo = env->sregs[SFR_RW_MM_TLB_LO];
-		hi = env->sregs[SFR_RW_MM_TLB_HI];
+		/* Writes are done via r_mm_cause.  */
+		hi = env->sregs[SFR_R_MM_CAUSE];
 		env->tlbsets[srs - 1][set][idx].lo = lo;
 		env->tlbsets[srs - 1][set][idx].hi = hi;
 	}
-
 	RETURN();
 }
 
 void OPPROTO op_movl_T0_sreg (void)
 {
-	T0 = env->sregs[env->pregs[SR_SRS]][PARAM1];
+	uint32_t srs;
+	env->pregs[PR_SRS] &= 3;
+	srs = env->pregs[PR_SRS];
+	
+	if (srs == 1 || srs == 2)
+	{
+		uint32_t set;
+		uint32_t idx;
+		uint32_t lo, hi;
+
+		idx = set = env->sregs[SFR_RW_MM_TLB_SEL];
+		set >>= 4;
+		set &= 3;
+		idx &= 15;
+
+		/* Update the mirror regs.  */
+		hi = env->tlbsets[srs - 1][set][idx].hi;
+		lo = env->tlbsets[srs - 1][set][idx].lo;
+		env->sregs[SFR_RW_MM_TLB_HI] = hi;
+		env->sregs[SFR_RW_MM_TLB_LO] = lo;
+	}
+	T0 = env->sregs[srs][PARAM1];
 	RETURN();
 }
 
@@ -362,340 +403,6 @@ void OPPROTO op_update_cc_x (void)
 {
 	env->cc_x_live = PARAM1;
 	env->cc_x = PARAM2;
-	RETURN();
-}
-
-/* FIXME: is this allowed?  */
-extern inline void evaluate_flags_writeback(uint32_t flags)
-{
-	int x;
-
-	/* Extended arithmetics, leave the z flag alone.  */
-	env->debug3 = env->pregs[SR_CCS];
-
-	if (env->cc_x_live)
-		x = env->cc_x;
-	else
-		x = env->pregs[SR_CCS] & X_FLAG;
-
-	if ((x || env->cc_op == CC_OP_ADDC)
-	    && flags & Z_FLAG)
-		env->cc_mask &= ~Z_FLAG;
-
-	/* all insn clear the x-flag except setf or clrf.  */
-	env->pregs[SR_CCS] &= ~(env->cc_mask | X_FLAG);
-	flags &= env->cc_mask;
-	env->pregs[SR_CCS] |= flags;
-	RETURN();
-}
-
-void OPPROTO op_evaluate_flags_muls(void)
-{
-	uint32_t src;
-	uint32_t dst;
-	uint32_t res;
-	uint32_t flags = 0;
-	/* were gonna have to redo the muls.  */
-	int64_t tmp, t0 ,t1;
-	int32_t mof;
-	int dneg;
-
-	src = env->cc_src;
-	dst = env->cc_dest;
-	res = env->cc_result;
-
-
-	/* cast into signed values to make GCC sign extend.  */
-	t0 = (int32_t)src;
-	t1 = (int32_t)dst;
-	dneg = ((int32_t)res) < 0;
-
-	tmp = t0 * t1;
-	mof = tmp >> 32;
-	if (tmp == 0)
-		flags |= Z_FLAG;
-	else if (tmp < 0)
-		flags |= N_FLAG;
-	if ((dneg && mof != -1)
-	    || (!dneg && mof != 0))
-		flags |= V_FLAG;
-	evaluate_flags_writeback(flags);
-	RETURN();
-}
-
-void OPPROTO op_evaluate_flags_mulu(void)
-{
-	uint32_t src;
-	uint32_t dst;
-	uint32_t res;
-	uint32_t flags = 0;
-	/* were gonna have to redo the muls.  */
-	uint64_t tmp, t0 ,t1;
-	uint32_t mof;
-
-	src = env->cc_src;
-	dst = env->cc_dest;
-	res = env->cc_result;
-
-
-	/* cast into signed values to make GCC sign extend.  */
-	t0 = src;
-	t1 = dst;
-
-	tmp = t0 * t1;
-	mof = tmp >> 32;
-	if (tmp == 0)
-		flags |= Z_FLAG;
-	else if (tmp >> 63)
-		flags |= N_FLAG;
-	if (mof)
-		flags |= V_FLAG;
-
-	evaluate_flags_writeback(flags);
-	RETURN();
-}
-
-void OPPROTO op_evaluate_flags_mcp(void)
-{
-	uint32_t src;
-	uint32_t dst;
-	uint32_t res;
-	uint32_t flags = 0;
-
-	src = env->cc_src;
-	dst = env->cc_dest;
-	res = env->cc_result;
-
-	if ((res & 0x80000000L) != 0L)
-	{
-		flags |= N_FLAG;
-		if (((src & 0x80000000L) == 0L)
-		    && ((dst & 0x80000000L) == 0L))
-		{
-			flags |= V_FLAG;
-		}
-		else if (((src & 0x80000000L) != 0L) &&
-			 ((dst & 0x80000000L) != 0L))
-		{
-			flags |= R_FLAG;
-		}
-	}
-	else
-	{
-		if (res == 0L)
-			flags |= Z_FLAG;
-		if (((src & 0x80000000L) != 0L)
-		    && ((dst & 0x80000000L) != 0L))
-			flags |= V_FLAG;
-		if ((dst & 0x80000000L) != 0L
-		    || (src & 0x80000000L) != 0L)
-			flags |= R_FLAG;
-	}
-
-	evaluate_flags_writeback(flags);
-	RETURN();
-}
-
-void OPPROTO op_evaluate_flags_alu_4(void)
-{
-	uint32_t src;
-	uint32_t dst;
-	uint32_t res;
-	uint32_t flags = 0;
-
-	src = env->cc_src;
-	dst = env->cc_dest;
-	res = env->cc_result;
-
-	if ((res & 0x80000000L) != 0L)
-	{
-		flags |= N_FLAG;
-		if (((src & 0x80000000L) == 0L)
-		    && ((dst & 0x80000000L) == 0L))
-		{
-			flags |= V_FLAG;
-		}
-		else if (((src & 0x80000000L) != 0L) &&
-			 ((dst & 0x80000000L) != 0L))
-		{
-			flags |= C_FLAG;
-		}
-	}
-	else
-	{
-		if (res == 0L)
-			flags |= Z_FLAG;
-		if (((src & 0x80000000L) != 0L)
-		    && ((dst & 0x80000000L) != 0L))
-			flags |= V_FLAG;
-		if ((dst & 0x80000000L) != 0L
-		    || (src & 0x80000000L) != 0L)
-			flags |= C_FLAG;
-	}
-
-	if (env->cc_op == CC_OP_SUB
-	    || env->cc_op == CC_OP_CMP) {
-		flags ^= C_FLAG;
-	}
-	evaluate_flags_writeback(flags);
-	RETURN();
-}
-
-void OPPROTO op_evaluate_flags_move_4 (void)
-{
-	uint32_t src;
-	uint32_t res;
-	uint32_t flags = 0;
-
-	src = env->cc_src;
-	res = env->cc_result;
-
-	if ((int32_t)res < 0)
-		flags |= N_FLAG;
-	else if (res == 0L)
-		flags |= Z_FLAG;
-
-	evaluate_flags_writeback(flags);
-	RETURN();
-}
-void OPPROTO op_evaluate_flags_move_2 (void)
-{
-	uint32_t src;
-	uint32_t flags = 0;
-	uint16_t res;
-
-	src = env->cc_src;
-	res = env->cc_result;
-
-	if ((int16_t)res < 0L)
-		flags |= N_FLAG;
-	else if (res == 0)
-		flags |= Z_FLAG;
-
-	evaluate_flags_writeback(flags);
-	RETURN();
-}
-
-/* TODO: This is expensive. We could split things up and only evaluate part of
-   CCR on a need to know basis. For now, we simply re-evaluate everything.  */
-void OPPROTO op_evaluate_flags (void)
-{
-	uint32_t src;
-	uint32_t dst;
-	uint32_t res;
-	uint32_t flags = 0;
-
-	src = env->cc_src;
-	dst = env->cc_dest;
-	res = env->cc_result;
-
-
-	/* Now, evaluate the flags. This stuff is based on
-	   Per Zander's CRISv10 simulator.  */
-	switch (env->cc_size)
-	{
-		case 1:
-			if ((res & 0x80L) != 0L)
-			{
-				flags |= N_FLAG;
-				if (((src & 0x80L) == 0L)
-				    && ((dst & 0x80L) == 0L))
-				{
-					flags |= V_FLAG;
-				}
-				else if (((src & 0x80L) != 0L)
-					 && ((dst & 0x80L) != 0L))
-				{
-					flags |= C_FLAG;
-				}
-			}
-			else
-			{
-				if ((res & 0xFFL) == 0L)
-				{
-					flags |= Z_FLAG;
-				}
-				if (((src & 0x80L) != 0L)
-				    && ((dst & 0x80L) != 0L))
-				{
-					flags |= V_FLAG;
-				}
-				if ((dst & 0x80L) != 0L
-				    || (src & 0x80L) != 0L)
-				{
-					flags |= C_FLAG;
-				}
-			}
-			break;
-		case 2:
-			if ((res & 0x8000L) != 0L)
-			{
-				flags |= N_FLAG;
-				if (((src & 0x8000L) == 0L)
-				    && ((dst & 0x8000L) == 0L))
-				{
-					flags |= V_FLAG;
-				}
-				else if (((src & 0x8000L) != 0L)
-					 && ((dst & 0x8000L) != 0L))
-				{
-					flags |= C_FLAG;
-				}
-			}
-			else
-			{
-				if ((res & 0xFFFFL) == 0L)
-				{
-					flags |= Z_FLAG;
-				}
-				if (((src & 0x8000L) != 0L)
-				    && ((dst & 0x8000L) != 0L))
-				{
-					flags |= V_FLAG;
-				}
-				if ((dst & 0x8000L) != 0L
-				    || (src & 0x8000L) != 0L)
-				{
-					flags |= C_FLAG;
-				}
-			}
-			break;
-		case 4:
-			if ((res & 0x80000000L) != 0L)
-			{
-				flags |= N_FLAG;
-				if (((src & 0x80000000L) == 0L)
-				    && ((dst & 0x80000000L) == 0L))
-				{
-					flags |= V_FLAG;
-				}
-				else if (((src & 0x80000000L) != 0L) &&
-					 ((dst & 0x80000000L) != 0L))
-				{
-					flags |= C_FLAG;
-				}
-			}
-			else
-			{
-				if (res == 0L)
-					flags |= Z_FLAG;
-				if (((src & 0x80000000L) != 0L)
-				    && ((dst & 0x80000000L) != 0L))
-					flags |= V_FLAG;
-				if ((dst & 0x80000000L) != 0L
-				    || (src & 0x80000000L) != 0L)
-					flags |= C_FLAG;
-			}
-			break;
-		default:
-			break;
-	}
-
-	if (env->cc_op == CC_OP_SUB
-	    || env->cc_op == CC_OP_CMP) {
-		flags ^= C_FLAG;
-	}
-	evaluate_flags_writeback(flags);
 	RETURN();
 }
 
@@ -793,30 +500,30 @@ void OPPROTO op_subl_T0_im (void)
 
 void OPPROTO op_addxl_T0_C (void)
 {
-	if (env->pregs[SR_CCS] & X_FLAG)
-		T0 += !!(env->pregs[SR_CCS] & C_FLAG);
+	if (env->pregs[PR_CCS] & X_FLAG)
+		T0 += !!(env->pregs[PR_CCS] & C_FLAG);
 	RETURN();
 }
 void OPPROTO op_subxl_T0_C (void)
 {
-	if (env->pregs[SR_CCS] & X_FLAG)
-		T0 -= !!(env->pregs[SR_CCS] & C_FLAG);
+	if (env->pregs[PR_CCS] & X_FLAG)
+		T0 -= !!(env->pregs[PR_CCS] & C_FLAG);
 	RETURN();
 }
 void OPPROTO op_addl_T0_C (void)
 {
-	T0 += !!(env->pregs[SR_CCS] & C_FLAG);
+	T0 += !!(env->pregs[PR_CCS] & C_FLAG);
 	RETURN();
 }
 void OPPROTO op_addl_T0_R (void)
 {
-	T0 += !!(env->pregs[SR_CCS] & R_FLAG);
+	T0 += !!(env->pregs[PR_CCS] & R_FLAG);
 	RETURN();
 }
 
 void OPPROTO op_clr_R (void)
 {
-	env->pregs[SR_CCS] &= ~R_FLAG;
+	env->pregs[PR_CCS] &= ~R_FLAG;
 	RETURN();
 }
 
@@ -895,7 +602,7 @@ void OPPROTO op_muls_T0_T1 (void)
 
 	tmp = t0 * t1;
 	T0 = tmp & 0xffffffff;
-	env->pregs[REG_MOF] = tmp >> 32;
+	env->pregs[PR_MOF] = tmp >> 32;
 	RETURN();
 }
 
@@ -907,7 +614,7 @@ void OPPROTO op_mulu_T0_T1 (void)
 
 	tmp = t0 * t1;
 	T0 = tmp & 0xffffffff;
-	env->pregs[REG_MOF] = tmp >> 32;
+	env->pregs[PR_MOF] = tmp >> 32;
 	RETURN();
 }
 
@@ -982,6 +689,8 @@ void OPPROTO op_btst_T0_T1 (void)
 	   The N flag is set according to the selected bit in the dest reg.
 	   The Z flag is set if the selected bit and all bits to the right are
 	   zero.
+	   The X flag is cleared.
+	   Other flags are left untouched.
 	   The destination reg is not affected.*/
 	unsigned int fz, sbit, bset, mask, masked_t0;
 
@@ -990,8 +699,11 @@ void OPPROTO op_btst_T0_T1 (void)
 	mask = sbit == 31 ? -1 : (1 << (sbit + 1)) - 1;
 	masked_t0 = T0 & mask;
 	fz = !(masked_t0 | bset);
+
+	/* Clear the X, N and Z flags.  */
+	T0 = env->pregs[PR_CCS] & ~(X_FLAG | N_FLAG | Z_FLAG);
 	/* Set the N and Z flags accordingly.  */
-	T0 = (bset << 3) | (fz << 2);
+	T0 |= (bset << 3) | (fz << 2);
 	RETURN();
 }
 
@@ -1057,7 +769,7 @@ void OPPROTO op_swapr_T0_T0 (void)
 }
 
 void OPPROTO op_tst_cc_eq (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int z_set;
 
 	z_set = !!(flags & Z_FLAG);
@@ -1071,7 +783,7 @@ void OPPROTO op_tst_cc_eq_fast (void) {
 }
 
 void OPPROTO op_tst_cc_ne (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int z_set;
 
 	z_set = !!(flags & Z_FLAG);
@@ -1084,7 +796,7 @@ void OPPROTO op_tst_cc_ne_fast (void) {
 }
 
 void OPPROTO op_tst_cc_cc (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int c_set;
 
 	c_set = !!(flags & C_FLAG);
@@ -1092,7 +804,7 @@ void OPPROTO op_tst_cc_cc (void) {
 	RETURN();
 }
 void OPPROTO op_tst_cc_cs (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int c_set;
 
 	c_set = !!(flags & C_FLAG);
@@ -1101,7 +813,7 @@ void OPPROTO op_tst_cc_cs (void) {
 }
 
 void OPPROTO op_tst_cc_vc (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int v_set;
 
 	v_set = !!(flags & V_FLAG);
@@ -1109,7 +821,7 @@ void OPPROTO op_tst_cc_vc (void) {
 	RETURN();
 }
 void OPPROTO op_tst_cc_vs (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int v_set;
 
 	v_set = !!(flags & V_FLAG);
@@ -1117,7 +829,7 @@ void OPPROTO op_tst_cc_vs (void) {
 	RETURN();
 }
 void OPPROTO op_tst_cc_pl (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int n_set;
 
 	n_set = !!(flags & N_FLAG);
@@ -1130,7 +842,7 @@ void OPPROTO op_tst_cc_pl_fast (void) {
 }
 
 void OPPROTO op_tst_cc_mi (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int n_set;
 
 	n_set = !!(flags & N_FLAG);
@@ -1143,7 +855,7 @@ void OPPROTO op_tst_cc_mi_fast (void) {
 }
 
 void OPPROTO op_tst_cc_ls (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int c_set;
 	int z_set;
 
@@ -1153,7 +865,7 @@ void OPPROTO op_tst_cc_ls (void) {
 	RETURN();
 }
 void OPPROTO op_tst_cc_hi (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int z_set;
 	int c_set;
 
@@ -1165,7 +877,7 @@ void OPPROTO op_tst_cc_hi (void) {
 }
 
 void OPPROTO op_tst_cc_ge (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int n_set;
 	int v_set;
 
@@ -1181,7 +893,7 @@ void OPPROTO op_tst_cc_ge_fast (void) {
 }
 
 void OPPROTO op_tst_cc_lt (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int n_set;
 	int v_set;
 
@@ -1192,7 +904,7 @@ void OPPROTO op_tst_cc_lt (void) {
 }
 
 void OPPROTO op_tst_cc_gt (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int n_set;
 	int v_set;
 	int z_set;
@@ -1206,7 +918,7 @@ void OPPROTO op_tst_cc_gt (void) {
 }
 
 void OPPROTO op_tst_cc_le (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int n_set;
 	int v_set;
 	int z_set;
@@ -1219,7 +931,7 @@ void OPPROTO op_tst_cc_le (void) {
 }
 
 void OPPROTO op_tst_cc_p (void) {
-	uint32_t flags = env->pregs[SR_CCS];
+	uint32_t flags = env->pregs[PR_CCS];
 	int p_set;
 
 	p_set = !!(flags & P_FLAG);
@@ -1239,7 +951,7 @@ void OPPROTO op_evaluate_bcc (void)
 /* this one is used on every alu op, optimize it!.  */
 void OPPROTO op_goto_if_not_x (void)
 {
-	if (env->pregs[SR_CCS] & X_FLAG)
+	if (env->pregs[PR_CCS] & X_FLAG)
 		GOTO_LABEL_PARAM(1);
 	RETURN();
 }
@@ -1266,22 +978,8 @@ void OPPROTO op_movl_btarget_T0 (void)
 	RETURN();
 }
 
-void OPPROTO op_jmp (void)
+void OPPROTO op_jmp1 (void)
 {
 	env->pc = env->btarget;
 	RETURN();
 }
-
-/* Load and store */
-#define MEMSUFFIX _raw
-#include "op_mem.c"
-#undef MEMSUFFIX
-#if !defined(CONFIG_USER_ONLY)
-#define MEMSUFFIX _user
-#include "op_mem.c"
-#undef MEMSUFFIX
-
-#define MEMSUFFIX _kernel
-#include "op_mem.c"
-#undef MEMSUFFIX
-#endif

@@ -31,12 +31,12 @@ test_path: test_path.c
 # i386/x86_64 emulation test (test various opcodes) */
 test-i386: test-i386.c test-i386-code16.S test-i386-vm86.S \
            test-i386.h test-i386-shift.h test-i386-muldiv.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ \
+	$(CC) -m32 $(CFLAGS) $(LDFLAGS) -static -o $@ \
               test-i386.c test-i386-code16.S test-i386-vm86.S -lm
 
 test-x86_64: test-i386.c \
            test-i386.h test-i386-shift.h test-i386-muldiv.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ test-i386.c -lm
+	$(CC) -m64 $(CFLAGS) $(LDFLAGS) -static -o $@ test-i386.c -lm
 
 ifeq ($(ARCH),i386)
 test: test-i386
@@ -50,6 +50,15 @@ ifeq ($(ARCH),i386)
 	$(QEMU) -no-code-copy test-i386 > test-i386.out
 	@if diff -u test-i386.ref test-i386.out ; then echo "Auto Test OK (no code copy)"; fi
 endif
+
+.PHONY: test-mmap
+test-mmap: test-mmap.c
+	$(CC) $(CFLAGS) -Wall -static -O2 $(LDFLAGS) -o $@ $<
+	-./test-mmap
+	-$(QEMU) ./test-mmap
+	-$(QEMU) -p 8192 ./test-mmap 8192
+	-$(QEMU) -p 16384 ./test-mmap 16384
+	-$(QEMU) -p 32768 ./test-mmap 32768
 
 # generic Linux and CPU test
 linux-test: linux-test.c

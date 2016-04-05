@@ -191,8 +191,12 @@ void get_tmp_filename(char *filename, int size)
 void get_tmp_filename(char *filename, int size)
 {
     int fd;
+    char *tmpdir;
     /* XXX: race condition possible */
-    pstrcpy(filename, size, "/tmp/vl.XXXXXX");
+    tmpdir = getenv("TMPDIR");
+    if (!tmpdir)
+        tmpdir = "/tmp";
+    snprintf(filename, size, "%s/vl.XXXXXX", tmpdir);
     fd = mkstemp(filename);
     close(fd);
 }
@@ -448,7 +452,14 @@ void bdrv_close(BlockDriverState *bs)
 
 void bdrv_delete(BlockDriverState *bs)
 {
-    /* XXX: remove the driver list */
+    BlockDriverState **pbs;
+
+    pbs = &bdrv_first;
+    while (*pbs != bs && *pbs != NULL)
+        pbs = &(*pbs)->next;
+    if (*pbs == bs)
+        *pbs = bs->next;
+
     bdrv_close(bs);
     qemu_free(bs);
 }

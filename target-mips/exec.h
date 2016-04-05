@@ -13,11 +13,9 @@ register struct CPUMIPSState *env asm(AREG0);
 #if TARGET_LONG_BITS > HOST_LONG_BITS
 #define T0 (env->t0)
 #define T1 (env->t1)
-#define T2 (env->t2)
 #else
 register target_ulong T0 asm(AREG1);
 register target_ulong T1 asm(AREG2);
-register target_ulong T2 asm(AREG3);
 #endif
 
 #if defined (USE_HOST_FLOAT_REGS)
@@ -111,8 +109,6 @@ void fpu_dump_state(CPUState *env, FILE *f,
                     int flags);
 void dump_sc (void);
 void do_pmon (int function);
-
-void dump_sc (void);
 
 int cpu_mips_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
                                int mmu_idx, int is_softmmu);
@@ -258,7 +254,7 @@ static always_inline void compute_hflags(CPUState *env)
     if (env->CP0_Status & (1 << CP0St_FR))
         env->hflags |= MIPS_HFLAG_F64;
     if (env->insn_flags & ISA_MIPS32R2) {
-        if (env->fpu->fcr0 & FCR0_F64)
+        if (env->fpu->fcr0 & (1 << FCR0_F64))
             env->hflags |= MIPS_HFLAG_COP1X;
     } else if (env->insn_flags & ISA_MIPS32) {
         if (env->hflags & MIPS_HFLAG_64)

@@ -26,6 +26,10 @@
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #endif
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
 #ifndef always_inline
 #if (__GNUC__ < 3) || defined(__APPLE__)
 #define always_inline inline
@@ -38,23 +42,16 @@
 #endif
 
 #ifdef __i386__
-#define REGPARM(n) __attribute((regparm(n)))
+#define REGPARM __attribute((regparm(3)))
 #else
-#define REGPARM(n)
+#define REGPARM
 #endif
 
 #define qemu_printf printf
 
-void *qemu_malloc(size_t size);
-void *qemu_mallocz(size_t size);
-void qemu_free(void *ptr);
-char *qemu_strdup(const char *str);
-
 void *qemu_memalign(size_t alignment, size_t size);
 void *qemu_vmalloc(size_t size);
 void qemu_vfree(void *ptr);
-
-void *get_mmap_addr(unsigned long size);
 
 int qemu_create_pidfile(const char *filename);
 

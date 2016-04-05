@@ -1183,27 +1183,22 @@ static CPUWriteMemoryFunc *pxa2xx_rtc_writefn[] = {
 
 static void pxa2xx_rtc_init(struct pxa2xx_state_s *s)
 {
-    struct tm *tm;
-    time_t ti;
+    struct tm tm;
     int wom;
 
     s->rttr = 0x7fff;
     s->rtsr = 0;
 
-    time(&ti);
-    if (rtc_utc)
-        tm = gmtime(&ti);
-    else
-        tm = localtime(&ti);
-    wom = ((tm->tm_mday - 1) / 7) + 1;
+    qemu_get_timedate(&tm, 0);
+    wom = ((tm.tm_mday - 1) / 7) + 1;
 
-    s->last_rcnr = (uint32_t) ti;
-    s->last_rdcr = (wom << 20) | ((tm->tm_wday + 1) << 17) |
-            (tm->tm_hour << 12) | (tm->tm_min << 6) | tm->tm_sec;
-    s->last_rycr = ((tm->tm_year + 1900) << 9) |
-            ((tm->tm_mon + 1) << 5) | tm->tm_mday;
-    s->last_swcr = (tm->tm_hour << 19) |
-            (tm->tm_min << 13) | (tm->tm_sec << 7);
+    s->last_rcnr = (uint32_t) mktime(&tm);
+    s->last_rdcr = (wom << 20) | ((tm.tm_wday + 1) << 17) |
+            (tm.tm_hour << 12) | (tm.tm_min << 6) | tm.tm_sec;
+    s->last_rycr = ((tm.tm_year + 1900) << 9) |
+            ((tm.tm_mon + 1) << 5) | tm.tm_mday;
+    s->last_swcr = (tm.tm_hour << 19) |
+            (tm.tm_min << 13) | (tm.tm_sec << 7);
     s->last_rtcpicr = 0;
     s->last_hz = s->last_sw = s->last_pi = qemu_get_clock(rt_clock);
 
@@ -1238,9 +1233,9 @@ static void pxa2xx_rtc_save(QEMUFile *f, void *opaque)
     qemu_put_be32s(f, &s->last_rycr);
     qemu_put_be32s(f, &s->last_swcr);
     qemu_put_be32s(f, &s->last_rtcpicr);
-    qemu_put_be64s(f, &s->last_hz);
-    qemu_put_be64s(f, &s->last_sw);
-    qemu_put_be64s(f, &s->last_pi);
+    qemu_put_be64s(f, (uint64_t *) &s->last_hz);
+    qemu_put_be64s(f, (uint64_t *) &s->last_sw);
+    qemu_put_be64s(f, (uint64_t *) &s->last_pi);
 }
 
 static int pxa2xx_rtc_load(QEMUFile *f, void *opaque, int version_id)
@@ -1262,9 +1257,9 @@ static int pxa2xx_rtc_load(QEMUFile *f, void *opaque, int version_id)
     qemu_get_be32s(f, &s->last_rycr);
     qemu_get_be32s(f, &s->last_swcr);
     qemu_get_be32s(f, &s->last_rtcpicr);
-    qemu_get_be64s(f, &s->last_hz);
-    qemu_get_be64s(f, &s->last_sw);
-    qemu_get_be64s(f, &s->last_pi);
+    qemu_get_be64s(f, (uint64_t *) &s->last_hz);
+    qemu_get_be64s(f, (uint64_t *) &s->last_sw);
+    qemu_get_be64s(f, (uint64_t *) &s->last_pi);
 
     pxa2xx_rtc_alarm_update(s, s->rtsr);
 
@@ -2082,7 +2077,8 @@ struct pxa2xx_state_s *pxa270_init(unsigned int sdram_size,
     for (i = 0; pxa270_serial[i].io_base; i ++)
         if (serial_hds[i])
             serial_mm_init(pxa270_serial[i].io_base, 2,
-                            s->pic[pxa270_serial[i].irqn], serial_hds[i], 1);
+                           s->pic[pxa270_serial[i].irqn], 14857000/16,
+                           serial_hds[i], 1);
         else
             break;
     if (serial_hds[i])
@@ -2207,7 +2203,8 @@ struct pxa2xx_state_s *pxa255_init(unsigned int sdram_size,
     for (i = 0; pxa255_serial[i].io_base; i ++)
         if (serial_hds[i])
             serial_mm_init(pxa255_serial[i].io_base, 2,
-                            s->pic[pxa255_serial[i].irqn], serial_hds[i], 1);
+                           s->pic[pxa255_serial[i].irqn], 14745600/16,
+                           serial_hds[i], 1);
         else
             break;
     if (serial_hds[i])

@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "qemu.h"
+#include "qemu-common.h"
 
 #define DEBUG_LOGFILE "/tmp/qemu.log"
 
@@ -53,7 +54,8 @@ asm(".globl __preinit_array_start\n"
     "__init_array_end:\n"
     "__fini_array_start:\n"
     "__fini_array_end:\n"
-    ".long 0\n");
+    ".long 0\n"
+    ".previous\n");
 #endif
 
 /* XXX: on x86 MAP_GROWSDOWN only works if ESP <= address + 32, so
@@ -377,19 +379,68 @@ void cpu_loop(CPUARMState *env)
             {
                 TaskState *ts = env->opaque;
                 uint32_t opcode;
+                int rc;
 
                 /* we handle the FPU emulation here, as Linux */
                 /* we get the opcode */
                 /* FIXME - what to do if get_user() fails? */
                 get_user_u32(opcode, env->regs[15]);
 
-                if (EmulateAll(opcode, &ts->fpa, env) == 0) {
+                rc = EmulateAll(opcode, &ts->fpa, env);
+                if (rc == 0) { /* illegal instruction */
                     info.si_signo = SIGILL;
                     info.si_errno = 0;
                     info.si_code = TARGET_ILL_ILLOPN;
                     info._sifields._sigfault._addr = env->regs[15];
                     queue_signal(info.si_signo, &info);
-                } else {
+                } else if (rc < 0) { /* FP exception */
+                    int arm_fpe=0;
+
+                    /* translate softfloat flags to FPSR flags */
+                    if (-rc & float_flag_invalid)
+                      arm_fpe |= BIT_IOC;
+                    if (-rc & float_flag_divbyzero)
+                      arm_fpe |= BIT_DZC;
+                    if (-rc & float_flag_overflow)
+                      arm_fpe |= BIT_OFC;
+                    if (-rc & float_flag_underflow)
+                      arm_fpe |= BIT_UFC;
+                    if (-rc & float_flag_inexact)
+                      arm_fpe |= BIT_IXC;
+
+                    FPSR fpsr = ts->fpa.fpsr;
+                    //printf("fpsr 0x%x, arm_fpe 0x%x\n",fpsr,arm_fpe);
+
+                    if (fpsr & (arm_fpe << 16)) { /* exception enabled? */
+                      info.si_signo = SIGFPE;
+                      info.si_errno = 0;
+
+                      /* ordered by priority, least first */
+                      if (arm_fpe & BIT_IXC) info.si_code = TARGET_FPE_FLTRES;
+                      if (arm_fpe & BIT_UFC) info.si_code = TARGET_FPE_FLTUND;
+                      if (arm_fpe & BIT_OFC) info.si_code = TARGET_FPE_FLTOVF;
+                      if (arm_fpe & BIT_DZC) info.si_code = TARGET_FPE_FLTDIV;
+                      if (arm_fpe & BIT_IOC) info.si_code = TARGET_FPE_FLTINV;
+
+                      info._sifields._sigfault._addr = env->regs[15];
+                      queue_signal(info.si_signo, &info);
+                    } else {
+                      env->regs[15] += 4;
+                    }
+
+                    /* accumulate unenabled exceptions */
+                    if ((!(fpsr & BIT_IXE)) && (arm_fpe & BIT_IXC))
+                      fpsr |= BIT_IXC;
+                    if ((!(fpsr & BIT_UFE)) && (arm_fpe & BIT_UFC))
+                      fpsr |= BIT_UFC;
+                    if ((!(fpsr & BIT_OFE)) && (arm_fpe & BIT_OFC))
+                      fpsr |= BIT_OFC;
+                    if ((!(fpsr & BIT_DZE)) && (arm_fpe & BIT_DZC))
+                      fpsr |= BIT_DZC;
+                    if ((!(fpsr & BIT_IOE)) && (arm_fpe & BIT_IOC))
+                      fpsr |= BIT_IOC;
+                    ts->fpa.fpsr=fpsr;
+                } else { /* everything OK */
                     /* increment PC */
                     env->regs[15] += 4;
                 }
@@ -679,7 +730,7 @@ void cpu_loop (CPUSPARCState *env)
                 if (trapnr == TT_DFAULT)
                     info._sifields._sigfault._addr = env->dmmuregs[4];
                 else
-                    info._sifields._sigfault._addr = env->tpc[env->tl];
+                    info._sifields._sigfault._addr = env->tsptr->tpc;
                 queue_signal(info.si_signo, &info);
             }
             break;
@@ -1521,7 +1572,7 @@ void cpu_loop(CPUMIPSState *env)
         trapnr = cpu_mips_exec(env);
         switch(trapnr) {
         case EXCP_SYSCALL:
-            syscall_num = env->gpr[2][env->current_tc] - 4000;
+            syscall_num = env->gpr[env->current_tc][2] - 4000;
             env->PC[env->current_tc] += 4;
             if (syscall_num >= sizeof(mips_syscall_args)) {
                 ret = -ENOSYS;
@@ -1531,7 +1582,7 @@ void cpu_loop(CPUMIPSState *env)
                 abi_ulong arg5 = 0, arg6 = 0, arg7 = 0, arg8 = 0;
 
                 nb_args = mips_syscall_args[syscall_num];
-                sp_reg = env->gpr[29][env->current_tc];
+                sp_reg = env->gpr[env->current_tc][29];
                 switch (nb_args) {
                 /* these arguments are taken from the stack */
                 /* FIXME - what to do if get_user() fails? */
@@ -1542,20 +1593,20 @@ void cpu_loop(CPUMIPSState *env)
                 default:
                     break;
                 }
-                ret = do_syscall(env, env->gpr[2][env->current_tc],
-                                 env->gpr[4][env->current_tc],
-                                 env->gpr[5][env->current_tc],
-                                 env->gpr[6][env->current_tc],
-                                 env->gpr[7][env->current_tc],
+                ret = do_syscall(env, env->gpr[env->current_tc][2],
+                                 env->gpr[env->current_tc][4],
+                                 env->gpr[env->current_tc][5],
+                                 env->gpr[env->current_tc][6],
+                                 env->gpr[env->current_tc][7],
                                  arg5, arg6/*, arg7, arg8*/);
             }
             if ((unsigned int)ret >= (unsigned int)(-1133)) {
-                env->gpr[7][env->current_tc] = 1; /* error flag */
+                env->gpr[env->current_tc][7] = 1; /* error flag */
                 ret = -ret;
             } else {
-                env->gpr[7][env->current_tc] = 0; /* error flag */
+                env->gpr[env->current_tc][7] = 0; /* error flag */
             }
-            env->gpr[2][env->current_tc] = ret;
+            env->gpr[env->current_tc][2] = ret;
             break;
         case EXCP_TLBL:
         case EXCP_TLBS:
@@ -1672,6 +1723,9 @@ void cpu_loop (CPUState *env)
                 queue_signal(info.si_signo, &info);
             }
             break;
+	case EXCP_INTERRUPT:
+	  /* just indicate that signals should be handled asap */
+	  break;
         case EXCP_BREAK:
             ret = do_syscall(env, 
                              env->regs[9], 
@@ -1759,7 +1813,7 @@ void cpu_loop(CPUM68KState *env)
                                           env->dregs[3],
                                           env->dregs[4],
                                           env->dregs[5],
-                                          env->dregs[6]);
+                                          env->aregs[0]);
             }
             break;
         case EXCP_INTERRUPT:
@@ -2295,7 +2349,7 @@ int main(int argc, char **argv)
         int i;
 
         for(i = 0; i < 32; i++) {
-            env->gpr[i][env->current_tc] = regs->regs[i];
+            env->gpr[env->current_tc][i] = regs->regs[i];
         }
         env->PC[env->current_tc] = regs->cp0_epc;
     }

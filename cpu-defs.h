@@ -76,9 +76,6 @@ typedef uint64_t target_phys_addr_t;
 #error TARGET_PHYS_ADDR_BITS undefined
 #endif
 
-/* address in the RAM (different from a physical address) */
-typedef unsigned long ram_addr_t;
-
 #define HOST_LONG_SIZE (HOST_LONG_BITS / 8)
 
 #define EXCP_INTERRUPT 	0x10000 /* async interruption */
@@ -102,6 +99,12 @@ typedef unsigned long ram_addr_t;
 #define CPU_TLB_BITS 8
 #define CPU_TLB_SIZE (1 << CPU_TLB_BITS)
 
+#if TARGET_PHYS_ADDR_BITS == 32 && TARGET_LONG_BITS == 32
+#define CPU_TLB_ENTRY_BITS 4
+#else
+#define CPU_TLB_ENTRY_BITS 5
+#endif
+
 typedef struct CPUTLBEntry {
     /* bit 31 to TARGET_PAGE_BITS : virtual address
        bit TARGET_PAGE_BITS-1..IO_MEM_SHIFT : if non zero, memory io
@@ -113,9 +116,20 @@ typedef struct CPUTLBEntry {
     target_ulong addr_write;
     target_ulong addr_code;
     /* addend to virtual address to get physical address */
+#if TARGET_PHYS_ADDR_BITS == 64
+    /* on i386 Linux make sure it is aligned */
+    target_phys_addr_t addend __attribute__((aligned(8)));
+#else
     target_phys_addr_t addend;
+#endif
+    /* padding to get a power of two size */
+    uint8_t dummy[(1 << CPU_TLB_ENTRY_BITS) - 
+                  (sizeof(target_ulong) * 3 + 
+                   ((-sizeof(target_ulong) * 3) & (sizeof(target_phys_addr_t) - 1)) + 
+                   sizeof(target_phys_addr_t))];
 } CPUTLBEntry;
 
+#define CPU_TEMP_BUF_NLONGS 128
 #define CPU_COMMON                                                      \
     struct TranslationBlock *current_tb; /* currently executing TB  */  \
     /* soft mmu support */                                              \
@@ -129,6 +143,8 @@ typedef struct CPUTLBEntry {
     /* The meaning of the MMU modes is defined in the target code. */   \
     CPUTLBEntry tlb_table[NB_MMU_MODES][CPU_TLB_SIZE];                  \
     struct TranslationBlock *tb_jmp_cache[TB_JMP_CACHE_SIZE];           \
+    /* buffer for temporaries in the code generator */                  \
+    long temp_buf[CPU_TEMP_BUF_NLONGS];                                 \
                                                                         \
     /* from this point: preserved by CPU reset */                       \
     /* ice debug support */                                             \

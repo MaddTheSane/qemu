@@ -68,6 +68,7 @@
 #include <linux/soundcard.h>
 #include <linux/dirent.h>
 #include <linux/kd.h>
+#include <linux/loop.h>
 
 #include "qemu.h"
 
@@ -420,7 +421,7 @@ abi_long do_brk(abi_ulong new_brk)
     if (!new_brk)
         return target_brk;
     if (new_brk < target_original_brk)
-        return -TARGET_ENOMEM;
+        return target_brk;
 
     brk_page = HOST_PAGE_ALIGN(target_brk);
 
@@ -435,12 +436,11 @@ abi_long do_brk(abi_ulong new_brk)
     mapped_addr = get_errno(target_mmap(brk_page, new_alloc_size,
                                         PROT_READ|PROT_WRITE,
                                         MAP_ANON|MAP_FIXED|MAP_PRIVATE, 0, 0));
-    if (is_error(mapped_addr)) {
-	return mapped_addr;
-    } else {
+
+    if (!is_error(mapped_addr))
 	target_brk = new_brk;
-    	return target_brk;
-    }
+    
+    return target_brk;
 }
 
 static inline abi_long copy_from_user_fdset(fd_set *fds,
@@ -1027,9 +1027,14 @@ static abi_long lock_iovec(int type, struct iovec *vec, abi_ulong target_addr,
     for(i = 0;i < count; i++) {
         base = tswapl(target_vec[i].iov_base);
         vec[i].iov_len = tswapl(target_vec[i].iov_len);
-        vec[i].iov_base = lock_user(type, base, vec[i].iov_len, copy);
-	if (!vec[i].iov_base) 
-            goto fail;
+        if (vec[i].iov_len != 0) {
+            vec[i].iov_base = lock_user(type, base, vec[i].iov_len, copy);
+            if (!vec[i].iov_base && vec[i].iov_len) 
+                goto fail;
+        } else {
+            /* zero length pointer is ignored */
+            vec[i].iov_base = NULL;
+        }
     }
     unlock_user (target_vec, target_addr, 0);
     return 0;
@@ -2747,8 +2752,8 @@ int do_fork(CPUState *env, unsigned int flags, abi_ulong newsp)
         /* ??? is this sufficient?  */
 #elif defined(TARGET_MIPS)
         if (!newsp)
-            newsp = env->gpr[29][env->current_tc];
-        new_env->gpr[29][env->current_tc] = newsp;
+            newsp = env->gpr[env->current_tc][29];
+        new_env->gpr[env->current_tc][29] = newsp;
 #elif defined(TARGET_PPC)
         if (!newsp)
             newsp = env->gpr[1];
@@ -3047,6 +3052,37 @@ static inline abi_long host_to_target_timespec(abi_ulong target_addr,
     target_ts->tv_sec = tswapl(host_ts->tv_sec);
     target_ts->tv_nsec = tswapl(host_ts->tv_nsec);
     unlock_user_struct(target_ts, target_addr, 1);
+}
+
+int get_osversion(void)
+{
+    static int osversion;
+    struct new_utsname buf;
+    const char *s;
+    int i, n, tmp;
+    if (osversion)
+        return osversion;
+    if (qemu_uname_release && *qemu_uname_release) {
+        s = qemu_uname_release;
+    } else {
+        if (sys_uname(&buf))
+            return 0;
+        s = buf.release;
+    }
+    tmp = 0;
+    for (i = 0; i < 3; i++) {
+        n = 0;
+        while (*s >= '0' && *s <= '9') {
+            n *= 10;
+            n += *s - '0';
+            s++;
+        }
+        tmp = (tmp << 8) + n;
+        if (*s == '.')
+            s++;
+    }
+    osversion = tmp;
+    return osversion;
 }
 
 /* do_syscall() should always have a single exit point at the end so
@@ -3507,7 +3543,10 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             if (!is_error(ret)) {
 #if defined(TARGET_MIPS)
                 CPUMIPSState *env = (CPUMIPSState*)cpu_env;
-		env->gpr[3][env->current_tc] = host_pipe[1];
+		env->gpr[env->current_tc][3] = host_pipe[1];
+		ret = host_pipe[0];
+#elif defined(TARGET_SH4)
+		((CPUSH4State*)cpu_env)->gregs[1] = host_pipe[1];
 		ret = host_pipe[0];
 #else
                 if (put_user_s32(host_pipe[0], arg1)
@@ -4078,10 +4117,8 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_mmap2
     case TARGET_NR_mmap2:
-#if defined(TARGET_SPARC) || defined(TARGET_MIPS)
+#ifndef MMAP_SHIFT
 #define MMAP_SHIFT 12
-#else
-#define MMAP_SHIFT TARGET_PAGE_BITS
 #endif
         ret = get_errno(target_mmap(arg1, arg2, arg3,
                                     target_to_host_bitmask(arg4, mmap_flags_tbl),
@@ -4723,7 +4760,8 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             struct iovec *vec;
 
             vec = alloca(count * sizeof(struct iovec));
-            lock_iovec(VERIFY_WRITE, vec, arg2, count, 0);
+            if (lock_iovec(VERIFY_WRITE, vec, arg2, count, 0) < 0)
+                goto efault;
             ret = get_errno(readv(arg1, vec, count));
             unlock_iovec(vec, arg2, count, 1);
         }
@@ -4734,7 +4772,8 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             struct iovec *vec;
 
             vec = alloca(count * sizeof(struct iovec));
-            lock_iovec(VERIFY_READ, vec, arg2, count, 1);
+            if (lock_iovec(VERIFY_READ, vec, arg2, count, 1) < 0)
+                goto efault;
             ret = get_errno(writev(arg1, vec, count));
             unlock_iovec(vec, arg2, count, 0);
         }
@@ -4864,6 +4903,20 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
             goto efault;
         ret = get_errno(pwrite(arg1, p, arg3, arg4));
+        unlock_user(p, arg2, 0);
+        break;
+#endif
+#ifdef TARGET_NR_pread64
+    case TARGET_NR_pread64:
+        if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
+            goto efault;
+        ret = get_errno(pread64(arg1, p, arg3, target_offset64(arg4, arg5)));
+        unlock_user(p, arg2, ret);
+        break;
+    case TARGET_NR_pwrite64:
+        if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
+            goto efault;
+        ret = get_errno(pwrite64(arg1, p, arg3, target_offset64(arg4, arg5)));
         unlock_user(p, arg2, 0);
         break;
 #endif

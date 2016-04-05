@@ -49,8 +49,7 @@ int target_mprotect(abi_ulong start, abi_ulong len, int prot)
     end = start + len;
     if (end < start)
         return -EINVAL;
-    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC))
-        return -EINVAL;
+    prot &= PROT_READ | PROT_WRITE | PROT_EXEC;
     if (len == 0)
         return 0;
 
@@ -260,13 +259,24 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
             host_start += offset - host_offset;
         start = h2g(host_start);
     } else {
+        int flg;
+        target_ulong addr;
+
         if (start & ~TARGET_PAGE_MASK) {
             errno = EINVAL;
             return -1;
         }
         end = start + len;
         real_end = HOST_PAGE_ALIGN(end);
-        
+
+        for(addr = real_start; addr < real_end; addr += TARGET_PAGE_SIZE) {
+            flg = page_get_flags(addr);
+            if (flg & PAGE_RESERVED) {
+                errno = ENXIO;
+                return -1;
+            }
+        }
+
         /* worst case: we cannot map the file because the offset is not
            aligned, so we read it */
         if (!(flags & MAP_ANONYMOUS) &&
@@ -337,7 +347,7 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
     page_set_flags(start, start + len, prot | PAGE_VALID);
  the_end:
 #ifdef DEBUG_MMAP
-    printf("ret=0x%llx\n", start);
+    printf("ret=0x" TARGET_FMT_lx "\n", start);
     page_dump(stdout);
     printf("\n");
 #endif
@@ -432,4 +442,3 @@ int target_msync(abi_ulong start, abi_ulong len, int flags)
     start &= qemu_host_page_mask;
     return msync(g2h(start), end - start, flags);
 }
-

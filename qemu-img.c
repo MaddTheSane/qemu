@@ -30,41 +30,6 @@
 #include <windows.h>
 #endif
 
-void *get_mmap_addr(unsigned long size)
-{
-    return NULL;
-}
-
-void qemu_free(void *ptr)
-{
-    free(ptr);
-}
-
-void *qemu_malloc(size_t size)
-{
-    return malloc(size);
-}
-
-void *qemu_mallocz(size_t size)
-{
-    void *ptr;
-    ptr = qemu_malloc(size);
-    if (!ptr)
-        return NULL;
-    memset(ptr, 0, size);
-    return ptr;
-}
-
-char *qemu_strdup(const char *str)
-{
-    char *ptr;
-    ptr = qemu_malloc(strlen(str) + 1);
-    if (!ptr)
-        return NULL;
-    strcpy(ptr, str);
-    return ptr;
-}
-
 static void __attribute__((noreturn)) error(const char *fmt, ...)
 {
     va_list ap;
@@ -90,7 +55,7 @@ static void help(void)
            "Command syntax:\n"
            "  create [-e] [-6] [-b base_image] [-f fmt] filename [size]\n"
            "  commit [-f fmt] filename\n"
-           "  convert [-c] [-e] [-6] [-f fmt] filename [filename2 [...]] [-O output_fmt] output_filename\n"
+           "  convert [-c] [-e] [-6] [-f fmt] [-O output_fmt] filename [filename2 [...]] output_filename\n"
            "  info [-f fmt] filename\n"
            "\n"
            "Command parameters:\n"

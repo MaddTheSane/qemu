@@ -71,10 +71,14 @@
 #define TT_TRAP     0x100
 #endif
 
-#define PSR_NEG   (1<<23)
-#define PSR_ZERO  (1<<22)
-#define PSR_OVF   (1<<21)
-#define PSR_CARRY (1<<20)
+#define PSR_NEG_SHIFT 23
+#define PSR_NEG   (1 << PSR_NEG_SHIFT)
+#define PSR_ZERO_SHIFT 22
+#define PSR_ZERO  (1 << PSR_ZERO_SHIFT)
+#define PSR_OVF_SHIFT 21
+#define PSR_OVF   (1 << PSR_OVF_SHIFT)
+#define PSR_CARRY_SHIFT 20
+#define PSR_CARRY (1 << PSR_CARRY_SHIFT)
 #define PSR_ICC   (PSR_NEG|PSR_ZERO|PSR_OVF|PSR_CARRY)
 #define PSR_EF    (1<<12)
 #define PSR_PIL   0xf00
@@ -141,8 +145,10 @@
 #define FSR_FTT_SEQ_ERROR (4 << 14)
 #define FSR_FTT_INVAL_FPR (6 << 14)
 
-#define FSR_FCC1  (1<<11)
-#define FSR_FCC0  (1<<10)
+#define FSR_FCC1_SHIFT 11
+#define FSR_FCC1  (1 << FSR_FCC1_SHIFT)
+#define FSR_FCC0_SHIFT 10
+#define FSR_FCC0  (1 << FSR_FCC0_SHIFT)
 
 /* MMU */
 #define MMU_E     (1<<0)
@@ -169,6 +175,12 @@
 #define NB_MMU_MODES 2
 #else
 #define NB_MMU_MODES 3
+typedef struct trap_state {
+    uint64_t tpc;
+    uint64_t tnpc;
+    uint64_t tstate;
+    uint32_t tt;
+} trap_state;
 #endif
 
 typedef struct CPUSPARCState {
@@ -178,6 +190,11 @@ typedef struct CPUSPARCState {
     target_ulong pc;       /* program counter */
     target_ulong npc;      /* next program counter */
     target_ulong y;        /* multiply/divide register */
+
+    /* emulator internal flags handling */
+    target_ulong cc_src, cc_src2;
+    target_ulong cc_dst;
+
     uint32_t psr;      /* processor state register */
     target_ulong fsr;      /* FPU state register */
     uint32_t cwp;      /* index of current register window (extracted
@@ -198,6 +215,10 @@ typedef struct CPUSPARCState {
     int interrupt_request;
     int halted;
     uint32_t mmu_bm;
+    uint32_t mmu_ctpr_mask;
+    uint32_t mmu_cxr_mask;
+    uint32_t mmu_sfsr_mask;
+    uint32_t mmu_trcr_mask;
     /* NOTE: we allow 8 more registers to handle wrapping */
     target_ulong regbase[NWINDOWS * 16 + 8];
 
@@ -229,11 +250,9 @@ typedef struct CPUSPARCState {
     float_status fp_status;
 #if defined(TARGET_SPARC64)
 #define MAXTL 4
-    uint64_t t0, t1, t2;
-    uint64_t tpc[MAXTL];
-    uint64_t tnpc[MAXTL];
-    uint64_t tstate[MAXTL];
-    uint32_t tt[MAXTL];
+    uint64_t t0;
+    trap_state *tsptr;
+    trap_state ts[MAXTL];
     uint32_t xcc;               /* Extended integer condition codes */
     uint32_t asi;
     uint32_t pstate;
@@ -252,9 +271,7 @@ typedef struct CPUSPARCState {
     uint64_t hpstate, htstate[MAXTL], hintp, htba, hver, hstick_cmpr, ssr;
     void *hstick; // UA 2005
 #endif
-#if !defined(TARGET_SPARC64) && !defined(reg_T2)
-    target_ulong t2;
-#endif
+    target_ulong t1, t2;
 } CPUSPARCState;
 #if defined(TARGET_SPARC64)
 #define GET_FSR32(env) (env->fsr & 0xcfc1ffff)
@@ -273,6 +290,7 @@ typedef struct CPUSPARCState {
 #endif
 
 CPUSPARCState *cpu_sparc_init(const char *cpu_model);
+void gen_intermediate_code_init(CPUSPARCState *env);
 int cpu_sparc_exec(CPUSPARCState *s);
 int cpu_sparc_close(CPUSPARCState *s);
 void sparc_cpu_list (FILE *f, int (*cpu_fprintf)(FILE *f, const char *fmt,
@@ -313,12 +331,8 @@ void cpu_set_cwp(CPUSPARCState *env1, int new_cwp);
 #endif
 
 int cpu_sparc_signal_handler(int host_signum, void *pinfo, void *puc);
-void raise_exception(int tt);
 void do_unassigned_access(target_phys_addr_t addr, int is_write, int is_exec,
                           int is_asi);
-void do_tick_set_count(void *opaque, uint64_t count);
-uint64_t do_tick_get_count(void *opaque);
-void do_tick_set_limit(void *opaque, uint64_t limit);
 void cpu_check_irqs(CPUSPARCState *env);
 
 #define CPUState CPUSPARCState
@@ -334,20 +348,23 @@ void cpu_check_irqs(CPUSPARCState *env);
 #ifdef TARGET_SPARC64
 #define MMU_MODE2_SUFFIX _hypv
 #endif
-#define MMU_USER_IDX 0
+#define MMU_USER_IDX   0
+#define MMU_KERNEL_IDX 1
+#define MMU_HYPV_IDX   2
+
 static inline int cpu_mmu_index (CPUState *env)
 {
 #if defined(CONFIG_USER_ONLY)
-    return 0;
+    return MMU_USER_IDX;
 #elif !defined(TARGET_SPARC64)
     return env->psrs;
 #else
     if (!env->psrs)
-        return 0;
+        return MMU_USER_IDX;
     else if ((env->hpstate & HS_PRIV) == 0)
-        return 1;
+        return MMU_KERNEL_IDX;
     else
-        return 2;
+        return MMU_HYPV_IDX;
 #endif
 }
 

@@ -20,7 +20,7 @@
 #ifndef CPU_ALL_H
 #define CPU_ALL_H
 
-#if defined(__arm__) || defined(__sparc__) || defined(__mips__)
+#if defined(__arm__) || defined(__sparc__) || defined(__mips__) || defined(__hppa__)
 #define WORDS_ALIGNED
 #endif
 
@@ -115,6 +115,11 @@ static inline void tswap64s(uint64_t *s)
 #define tswapls(s) tswap64s((uint64_t *)(s))
 #define bswaptls(s) bswap64s(s)
 #endif
+
+typedef union {
+    float32 f;
+    uint32_t l;
+} CPU_FloatU;
 
 /* NOTE: arm FPA is horrible as double 32 bit words are stored in big
    endian ! */
@@ -754,6 +759,7 @@ extern int code_copy_enabled;
 #define CPU_INTERRUPT_SMI    0x40 /* (x86 only) SMI interrupt pending */
 #define CPU_INTERRUPT_DEBUG  0x80 /* Debug event occured.  */
 #define CPU_INTERRUPT_VIRQ   0x100 /* virtual interrupt pending.  */
+#define CPU_INTERRUPT_NMI    0x200 /* NMI pending. */
 
 void cpu_interrupt(CPUState *s, int mask);
 void cpu_reset_interrupt(CPUState *env, int mask);
@@ -806,12 +812,20 @@ int cpu_inw(CPUState *env, int addr);
 int cpu_inl(CPUState *env, int addr);
 #endif
 
+/* address in the RAM (different from a physical address) */
+#ifdef USE_KQEMU
+typedef uint32_t ram_addr_t;
+#else
+typedef unsigned long ram_addr_t;
+#endif
+
 /* memory API */
 
-extern int phys_ram_size;
+extern ram_addr_t phys_ram_size;
 extern int phys_ram_fd;
 extern uint8_t *phys_ram_base;
 extern uint8_t *phys_ram_dirty;
+extern ram_addr_t ram_size;
 
 /* physical memory access */
 #define TLB_INVALID_MASK   (1 << 3)
@@ -833,10 +847,10 @@ typedef void CPUWriteMemoryFunc(void *opaque, target_phys_addr_t addr, uint32_t 
 typedef uint32_t CPUReadMemoryFunc(void *opaque, target_phys_addr_t addr);
 
 void cpu_register_physical_memory(target_phys_addr_t start_addr,
-                                  unsigned long size,
-                                  unsigned long phys_offset);
-uint32_t cpu_get_physical_page_desc(target_phys_addr_t addr);
-ram_addr_t qemu_ram_alloc(unsigned int size);
+                                  ram_addr_t size,
+                                  ram_addr_t phys_offset);
+ram_addr_t cpu_get_physical_page_desc(target_phys_addr_t addr);
+ram_addr_t qemu_ram_alloc(ram_addr_t);
 void qemu_ram_free(ram_addr_t addr);
 int cpu_register_io_memory(int io_index,
                            CPUReadMemoryFunc **mem_read,
@@ -953,6 +967,15 @@ static inline int64_t cpu_get_real_ticks(void)
     return val;
 }
 
+#elif defined(__hppa__)
+
+static inline int64_t cpu_get_real_ticks(void)
+{
+    int val;
+    asm volatile ("mfctl %%cr16, %0" : "=r"(val));
+    return val;
+}
+
 #elif defined(__ia64)
 
 static inline int64_t cpu_get_real_ticks(void)
@@ -1040,6 +1063,18 @@ extern int64_t kqemu_ret_int_count;
 extern int64_t kqemu_ret_excp_count;
 extern int64_t kqemu_ret_intr_count;
 
+extern int64_t dyngen_tb_count1;
+extern int64_t dyngen_tb_count;
+extern int64_t dyngen_op_count;
+extern int64_t dyngen_old_op_count;
+extern int64_t dyngen_tcg_del_op_count;
+extern int dyngen_op_count_max;
+extern int64_t dyngen_code_in_len;
+extern int64_t dyngen_code_out_len;
+extern int64_t dyngen_interm_time;
+extern int64_t dyngen_code_time;
+extern int64_t dyngen_restore_count;
+extern int64_t dyngen_restore_time;
 #endif
 
 #endif /* CPU_ALL_H */

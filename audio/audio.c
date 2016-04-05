@@ -56,6 +56,9 @@ static struct audio_driver *drvtab[] = {
 #ifdef CONFIG_SDL
     &sdl_audio_driver,
 #endif
+#ifdef CONFIG_ESD
+    &esd_audio_driver,
+#endif
     &no_audio_driver,
     &wav_audio_driver
 };
@@ -114,8 +117,8 @@ volume_t nominal_volume = {
     1.0,
     1.0
 #else
-    UINT_MAX,
-    UINT_MAX
+    1ULL << 32,
+    1ULL << 32
 #endif
 };
 
@@ -414,7 +417,7 @@ static void audio_print_options (const char *prefix,
             {
                 audfmt_e *fmtp = opt->valp;
                 printf (
-                    "format, %s = %s, (one of: U8 S8 U16 S16)\n",
+                    "format, %s = %s, (one of: U8 S8 U16 S16 U32 S32)\n",
                     state,
                     audio_audfmt_to_string (*fmtp)
                     );
@@ -1537,7 +1540,7 @@ static struct audio_option audio_options[] = {
      "(undocumented)", NULL, 0},
 
     {"LOG_TO_MONITOR", AUD_OPT_BOOL, &conf.log_to_monitor,
-     "print logging messages to montior instead of stderr", NULL, 0},
+     "print logging messages to monitor instead of stderr", NULL, 0},
 
     {NULL, 0, NULL, NULL, NULL, 0}
 };
@@ -1950,5 +1953,23 @@ void AUD_del_capture (CaptureVoiceOut *cap, void *cb_opaque)
             }
             return;
         }
+    }
+}
+
+void AUD_set_volume_out (SWVoiceOut *sw, int mute, uint8_t lvol, uint8_t rvol)
+{
+    if (sw) {
+        sw->vol.mute = mute;
+        sw->vol.l = nominal_volume.l * lvol / 255;
+        sw->vol.r = nominal_volume.r * rvol / 255;
+    }
+}
+
+void AUD_set_volume_in (SWVoiceIn *sw, int mute, uint8_t lvol, uint8_t rvol)
+{
+    if (sw) {
+        sw->vol.mute = mute;
+        sw->vol.l = nominal_volume.l * lvol / 255;
+        sw->vol.r = nominal_volume.r * rvol / 255;
     }
 }

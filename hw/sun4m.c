@@ -31,6 +31,7 @@
 #include "net.h"
 #include "boards.h"
 #include "firmware_abi.h"
+#include "scsi.h"
 
 //#define DEBUG_IRQ
 
@@ -75,6 +76,9 @@
 #define PROM_VADDR           0xffd00000
 #define PROM_FILENAME        "openbios-sparc32"
 
+// Control plane, 8-bit and 24-bit planes
+#define TCX_SIZE             (9 * 1024 * 1024)
+
 #define MAX_CPUS 16
 #define MAX_PILS 16
 
@@ -83,7 +87,7 @@ struct hwdef {
     target_phys_addr_t intctl_base, counter_base, nvram_base, ms_kb_base;
     target_phys_addr_t serial_base, fd_base;
     target_phys_addr_t idreg_base, dma_base, esp_base, le_base;
-    target_phys_addr_t tcx_base, cs_base, power_base;
+    target_phys_addr_t tcx_base, cs_base, apc_base, aux1_base, aux2_base;
     target_phys_addr_t ecc_base;
     uint32_t ecc_version;
     target_phys_addr_t sun4c_intctl_base, sun4c_counter_base;
@@ -91,7 +95,7 @@ struct hwdef {
     // IRQ numbers are not PIL ones, but master interrupt controller
     // register bit numbers
     int intctl_g_intr, esp_irq, le_irq, clock_irq, clock1_irq;
-    int ser_irq, ms_kb_irq, fd_irq, me_irq, cs_irq;
+    int ser_irq, ms_kb_irq, fd_irq, me_irq, cs_irq, ecc_irq;
     int machine_id; // For NVRAM
     uint32_t iommu_version;
     uint32_t intbit_to_level[32];
@@ -152,7 +156,7 @@ void DMA_register_channel (int nchan,
 extern int nographic;
 
 static void nvram_init(m48t59_t *nvram, uint8_t *macaddr, const char *cmdline,
-                       const char *boot_devices, uint32_t RAM_size,
+                       const char *boot_devices, ram_addr_t RAM_size,
                        uint32_t kernel_size,
                        int width, int height, int depth,
                        int machine_id, const char *arch)
@@ -257,12 +261,15 @@ void cpu_check_irqs(CPUState *env)
                 int old_interrupt = env->interrupt_index;
 
                 env->interrupt_index = TT_EXTINT | i;
-                if (old_interrupt != env->interrupt_index)
+                if (old_interrupt != env->interrupt_index) {
+                    DPRINTF("Set CPU IRQ %d\n", i);
                     cpu_interrupt(env, CPU_INTERRUPT_HARD);
+                }
                 break;
             }
         }
     } else if (!env->pil_in && (env->interrupt_index & ~15) == TT_EXTINT) {
+        DPRINTF("Reset CPU IRQ %d\n", env->interrupt_index & 15);
         env->interrupt_index = 0;
         cpu_reset_interrupt(env, CPU_INTERRUPT_HARD);
     }
@@ -359,7 +366,7 @@ static unsigned long sun4m_load_kernel(const char *kernel_filename,
     return kernel_size;
 }
 
-static void sun4m_hw_init(const struct hwdef *hwdef, int RAM_size,
+static void sun4m_hw_init(const struct hwdef *hwdef, ram_addr_t RAM_size,
                           const char *boot_device,
                           DisplayState *ds, const char *kernel_filename,
                           const char *kernel_cmdline,
@@ -372,6 +379,7 @@ static void sun4m_hw_init(const struct hwdef *hwdef, int RAM_size,
     qemu_irq *cpu_irqs[MAX_CPUS], *slavio_irq, *slavio_cpu_irq,
         *espdma_irq, *ledma_irq;
     qemu_irq *esp_reset, *le_reset;
+    qemu_irq *fdc_tc;
     unsigned long prom_offset, kernel_size;
     int ret;
     char buf[1024];
@@ -408,7 +416,7 @@ static void sun4m_hw_init(const struct hwdef *hwdef, int RAM_size,
     /* allocate RAM */
     if ((uint64_t)RAM_size > hwdef->max_mem) {
         fprintf(stderr, "qemu: Too much memory for this machine: %d, maximum %d\n",
-                (unsigned int)RAM_size / (1024 * 1024),
+                (unsigned int)(RAM_size / (1024 * 1024)),
                 (unsigned int)(hwdef->max_mem / (1024 * 1024)));
         exit(1);
     }
@@ -490,14 +498,20 @@ static void sun4m_hw_init(const struct hwdef *hwdef, int RAM_size,
     slavio_serial_init(hwdef->serial_base, slavio_irq[hwdef->ser_irq],
                        serial_hds[1], serial_hds[0]);
 
+    slavio_misc = slavio_misc_init(hwdef->slavio_base, hwdef->apc_base,
+                                   hwdef->aux1_base, hwdef->aux2_base,
+                                   slavio_irq[hwdef->me_irq], envs[0],
+                                   &fdc_tc);
+
     if (hwdef->fd_base != (target_phys_addr_t)-1) {
         /* there is zero or one floppy drive */
-        fd[1] = fd[0] = NULL;
+        memset(fd, 0, sizeof(fd));
         index = drive_get_index(IF_FLOPPY, 0, 0);
         if (index != -1)
             fd[0] = drives_table[index].bdrv;
 
-        sun4m_fdctrl_init(slavio_irq[hwdef->fd_irq], hwdef->fd_base, fd);
+        sun4m_fdctrl_init(slavio_irq[hwdef->fd_irq], hwdef->fd_base, fd,
+                          fdc_tc);
     }
 
     if (drive_get_max_bus(IF_SCSI) > 0) {
@@ -505,8 +519,9 @@ static void sun4m_hw_init(const struct hwdef *hwdef, int RAM_size,
         exit(1);
     }
 
-    main_esp = esp_init(hwdef->esp_base, espdma, *espdma_irq,
-                        esp_reset);
+    main_esp = esp_init(hwdef->esp_base, 2,
+                        espdma_memory_read, espdma_memory_write,
+                        espdma, *espdma_irq, esp_reset);
 
     for (i = 0; i < ESP_MAX_DEVS; i++) {
         index = drive_get_index(IF_SCSI, 0, i);
@@ -515,8 +530,6 @@ static void sun4m_hw_init(const struct hwdef *hwdef, int RAM_size,
         esp_scsi_attach(main_esp, drives_table[index].bdrv, i);
     }
 
-    slavio_misc = slavio_misc_init(hwdef->slavio_base, hwdef->power_base,
-                                   slavio_irq[hwdef->me_irq]);
     if (hwdef->cs_base != (target_phys_addr_t)-1)
         cs_init(hwdef->cs_base, hwdef->cs_irq, slavio_intctl);
 
@@ -528,10 +541,11 @@ static void sun4m_hw_init(const struct hwdef *hwdef, int RAM_size,
                graphic_height, graphic_depth, hwdef->machine_id, "Sun4m");
 
     if (hwdef->ecc_base != (target_phys_addr_t)-1)
-        ecc_init(hwdef->ecc_base, hwdef->ecc_version);
+        ecc_init(hwdef->ecc_base, slavio_irq[hwdef->ecc_irq],
+                 hwdef->ecc_version);
 }
 
-static void sun4c_hw_init(const struct hwdef *hwdef, int RAM_size,
+static void sun4c_hw_init(const struct hwdef *hwdef, ram_addr_t RAM_size,
                           const char *boot_device,
                           DisplayState *ds, const char *kernel_filename,
                           const char *kernel_cmdline,
@@ -542,6 +556,7 @@ static void sun4c_hw_init(const struct hwdef *hwdef, int RAM_size,
     void *iommu, *espdma, *ledma, *main_esp, *nvram;
     qemu_irq *cpu_irqs, *slavio_irq, *espdma_irq, *ledma_irq;
     qemu_irq *esp_reset, *le_reset;
+    qemu_irq *fdc_tc;
     unsigned long prom_offset, kernel_size;
     int ret;
     char buf[1024];
@@ -568,8 +583,8 @@ static void sun4c_hw_init(const struct hwdef *hwdef, int RAM_size,
     /* allocate RAM */
     if ((uint64_t)RAM_size > hwdef->max_mem) {
         fprintf(stderr, "qemu: Too much memory for this machine: %d, maximum %d\n",
-                (unsigned int)RAM_size / (1024 * 1024),
-                (unsigned int)hwdef->max_mem / (1024 * 1024));
+                (unsigned int)(RAM_size / (1024 * 1024)),
+                (unsigned int)(hwdef->max_mem / (1024 * 1024)));
         exit(1);
     }
     cpu_register_physical_memory(0, RAM_size, 0);
@@ -636,6 +651,10 @@ static void sun4c_hw_init(const struct hwdef *hwdef, int RAM_size,
     slavio_serial_init(hwdef->serial_base, slavio_irq[hwdef->ser_irq],
                        serial_hds[1], serial_hds[0]);
 
+    slavio_misc = slavio_misc_init(-1, hwdef->apc_base,
+                                   hwdef->aux1_base, hwdef->aux2_base,
+                                   slavio_irq[hwdef->me_irq], env, &fdc_tc);
+
     if (hwdef->fd_base != (target_phys_addr_t)-1) {
         /* there is zero or one floppy drive */
         fd[1] = fd[0] = NULL;
@@ -643,7 +662,8 @@ static void sun4c_hw_init(const struct hwdef *hwdef, int RAM_size,
         if (index != -1)
             fd[0] = drives_table[index].bdrv;
 
-        sun4m_fdctrl_init(slavio_irq[hwdef->fd_irq], hwdef->fd_base, fd);
+        sun4m_fdctrl_init(slavio_irq[hwdef->fd_irq], hwdef->fd_base, fd,
+                          fdc_tc);
     }
 
     if (drive_get_max_bus(IF_SCSI) > 0) {
@@ -651,8 +671,9 @@ static void sun4c_hw_init(const struct hwdef *hwdef, int RAM_size,
         exit(1);
     }
 
-    main_esp = esp_init(hwdef->esp_base, espdma, *espdma_irq,
-                        esp_reset);
+    main_esp = esp_init(hwdef->esp_base, 2,
+                        espdma_memory_read, espdma_memory_write,
+                        espdma, *espdma_irq, esp_reset);
 
     for (i = 0; i < ESP_MAX_DEVS; i++) {
         index = drive_get_index(IF_SCSI, 0, i);
@@ -686,7 +707,9 @@ static const struct hwdef hwdefs[] = {
         .dma_base     = 0x78400000,
         .esp_base     = 0x78800000,
         .le_base      = 0x78c00000,
-        .power_base   = 0x7a000000,
+        .apc_base     = 0x6a000000,
+        .aux1_base    = 0x71900000,
+        .aux2_base    = 0x71910000,
         .ecc_base     = -1,
         .sun4c_intctl_base  = -1,
         .sun4c_counter_base = -1,
@@ -726,7 +749,9 @@ static const struct hwdef hwdefs[] = {
         .dma_base     = 0xef0400000ULL,
         .esp_base     = 0xef0800000ULL,
         .le_base      = 0xef0c00000ULL,
-        .power_base   = 0xefa000000ULL,
+        .apc_base     = 0xefa000000ULL, // XXX should not exist
+        .aux1_base    = 0xff1800000ULL,
+        .aux2_base    = 0xff1a01000ULL,
         .ecc_base     = 0xf00000000ULL,
         .ecc_version  = 0x10000000, // version 0, implementation 1
         .sun4c_intctl_base  = -1,
@@ -742,13 +767,14 @@ static const struct hwdef hwdefs[] = {
         .fd_irq = 22,
         .me_irq = 30,
         .cs_irq = -1,
+        .ecc_irq = 28,
         .machine_id = 0x72,
         .iommu_version = 0x03000000,
         .intbit_to_level = {
             2, 3, 5, 7, 9, 11, 0, 14,   3, 5, 7, 9, 11, 13, 12, 12,
             6, 0, 4, 10, 8, 0, 11, 0,   0, 0, 0, 0, 15, 0, 15, 0,
         },
-        .max_mem = 0xffffffff, // XXX actually first 62GB ok
+        .max_mem = 0xf00000000ULL,
         .default_cpu_model = "TI SuperSparc II",
     },
     /* SS-600MP */
@@ -767,7 +793,9 @@ static const struct hwdef hwdefs[] = {
         .dma_base     = 0xef0081000ULL,
         .esp_base     = 0xef0080000ULL,
         .le_base      = 0xef0060000ULL,
-        .power_base   = 0xefa000000ULL,
+        .apc_base     = 0xefa000000ULL, // XXX should not exist
+        .aux1_base    = 0xff1800000ULL,
+        .aux2_base    = 0xff1a01000ULL, // XXX should not exist
         .ecc_base     = 0xf00000000ULL,
         .ecc_version  = 0x00000000, // version 0, implementation 0
         .sun4c_intctl_base  = -1,
@@ -783,13 +811,14 @@ static const struct hwdef hwdefs[] = {
         .fd_irq = 22,
         .me_irq = 30,
         .cs_irq = -1,
+        .ecc_irq = 28,
         .machine_id = 0x71,
         .iommu_version = 0x01000000,
         .intbit_to_level = {
             2, 3, 5, 7, 9, 11, 0, 14,   3, 5, 7, 9, 11, 13, 12, 12,
             6, 0, 4, 10, 8, 0, 11, 0,   0, 0, 0, 0, 15, 0, 15, 0,
         },
-        .max_mem = 0xffffffff, // XXX actually first 62GB ok
+        .max_mem = 0xf00000000ULL,
         .default_cpu_model = "TI SuperSparc II",
     },
     /* SS-20 */
@@ -808,7 +837,9 @@ static const struct hwdef hwdefs[] = {
         .dma_base     = 0xef0400000ULL,
         .esp_base     = 0xef0800000ULL,
         .le_base      = 0xef0c00000ULL,
-        .power_base   = 0xefa000000ULL,
+        .apc_base     = 0xefa000000ULL, // XXX should not exist
+        .aux1_base    = 0xff1800000ULL,
+        .aux2_base    = 0xff1a01000ULL,
         .ecc_base     = 0xf00000000ULL,
         .ecc_version  = 0x20000000, // version 0, implementation 2
         .sun4c_intctl_base  = -1,
@@ -824,13 +855,14 @@ static const struct hwdef hwdefs[] = {
         .fd_irq = 22,
         .me_irq = 30,
         .cs_irq = -1,
+        .ecc_irq = 28,
         .machine_id = 0x72,
         .iommu_version = 0x13000000,
         .intbit_to_level = {
             2, 3, 5, 7, 9, 11, 0, 14,   3, 5, 7, 9, 11, 13, 12, 12,
             6, 0, 4, 10, 8, 0, 11, 0,   0, 0, 0, 0, 15, 0, 15, 0,
         },
-        .max_mem = 0xffffffff, // XXX actually first 62GB ok
+        .max_mem = 0xf00000000ULL,
         .default_cpu_model = "TI SuperSparc II",
     },
     /* SS-2 */
@@ -848,7 +880,9 @@ static const struct hwdef hwdefs[] = {
         .dma_base     = 0xf8400000,
         .esp_base     = 0xf8800000,
         .le_base      = 0xf8c00000,
-        .power_base   = -1,
+        .apc_base     = -1,
+        .aux1_base    = 0xf7400003,
+        .aux2_base    = -1,
         .sun4c_intctl_base  = 0xf5000000,
         .sun4c_counter_base = 0xf3000000,
         .vram_size    = 0x00100000,
@@ -866,10 +900,220 @@ static const struct hwdef hwdefs[] = {
         .max_mem = 0x10000000,
         .default_cpu_model = "Cypress CY7C601",
     },
+    /* Voyager */
+    {
+        .iommu_base   = 0x10000000,
+        .tcx_base     = 0x50000000,
+        .cs_base      = -1,
+        .slavio_base  = 0x70000000,
+        .ms_kb_base   = 0x71000000,
+        .serial_base  = 0x71100000,
+        .nvram_base   = 0x71200000,
+        .fd_base      = 0x71400000,
+        .counter_base = 0x71d00000,
+        .intctl_base  = 0x71e00000,
+        .idreg_base   = 0x78000000,
+        .dma_base     = 0x78400000,
+        .esp_base     = 0x78800000,
+        .le_base      = 0x78c00000,
+        .apc_base     = 0x71300000, // pmc
+        .aux1_base    = 0x71900000,
+        .aux2_base    = 0x71910000,
+        .ecc_base     = -1,
+        .sun4c_intctl_base  = -1,
+        .sun4c_counter_base = -1,
+        .vram_size    = 0x00100000,
+        .nvram_size   = 0x2000,
+        .esp_irq = 18,
+        .le_irq = 16,
+        .clock_irq = 7,
+        .clock1_irq = 19,
+        .ms_kb_irq = 14,
+        .ser_irq = 15,
+        .fd_irq = 22,
+        .me_irq = 30,
+        .cs_irq = -1,
+        .machine_id = 0x80,
+        .iommu_version = 0x05000000,
+        .intbit_to_level = {
+            2, 3, 5, 7, 9, 11, 0, 14,   3, 5, 7, 9, 11, 13, 12, 12,
+            6, 0, 4, 10, 8, 0, 11, 0,   0, 0, 0, 0, 15, 0, 15, 0,
+        },
+        .max_mem = 0x10000000,
+        .default_cpu_model = "Fujitsu MB86904",
+    },
+    /* LX */
+    {
+        .iommu_base   = 0x10000000,
+        .tcx_base     = 0x50000000,
+        .cs_base      = -1,
+        .slavio_base  = 0x70000000,
+        .ms_kb_base   = 0x71000000,
+        .serial_base  = 0x71100000,
+        .nvram_base   = 0x71200000,
+        .fd_base      = 0x71400000,
+        .counter_base = 0x71d00000,
+        .intctl_base  = 0x71e00000,
+        .idreg_base   = 0x78000000,
+        .dma_base     = 0x78400000,
+        .esp_base     = 0x78800000,
+        .le_base      = 0x78c00000,
+        .apc_base     = -1,
+        .aux1_base    = 0x71900000,
+        .aux2_base    = 0x71910000,
+        .ecc_base     = -1,
+        .sun4c_intctl_base  = -1,
+        .sun4c_counter_base = -1,
+        .vram_size    = 0x00100000,
+        .nvram_size   = 0x2000,
+        .esp_irq = 18,
+        .le_irq = 16,
+        .clock_irq = 7,
+        .clock1_irq = 19,
+        .ms_kb_irq = 14,
+        .ser_irq = 15,
+        .fd_irq = 22,
+        .me_irq = 30,
+        .cs_irq = -1,
+        .machine_id = 0x80,
+        .iommu_version = 0x04000000,
+        .intbit_to_level = {
+            2, 3, 5, 7, 9, 11, 0, 14,   3, 5, 7, 9, 11, 13, 12, 12,
+            6, 0, 4, 10, 8, 0, 11, 0,   0, 0, 0, 0, 15, 0, 15, 0,
+        },
+        .max_mem = 0x10000000,
+        .default_cpu_model = "TI MicroSparc I",
+    },
+    /* SS-4 */
+    {
+        .iommu_base   = 0x10000000,
+        .tcx_base     = 0x50000000,
+        .cs_base      = 0x6c000000,
+        .slavio_base  = 0x70000000,
+        .ms_kb_base   = 0x71000000,
+        .serial_base  = 0x71100000,
+        .nvram_base   = 0x71200000,
+        .fd_base      = 0x71400000,
+        .counter_base = 0x71d00000,
+        .intctl_base  = 0x71e00000,
+        .idreg_base   = 0x78000000,
+        .dma_base     = 0x78400000,
+        .esp_base     = 0x78800000,
+        .le_base      = 0x78c00000,
+        .apc_base     = 0x6a000000,
+        .aux1_base    = 0x71900000,
+        .aux2_base    = 0x71910000,
+        .ecc_base     = -1,
+        .sun4c_intctl_base  = -1,
+        .sun4c_counter_base = -1,
+        .vram_size    = 0x00100000,
+        .nvram_size   = 0x2000,
+        .esp_irq = 18,
+        .le_irq = 16,
+        .clock_irq = 7,
+        .clock1_irq = 19,
+        .ms_kb_irq = 14,
+        .ser_irq = 15,
+        .fd_irq = 22,
+        .me_irq = 30,
+        .cs_irq = 5,
+        .machine_id = 0x80,
+        .iommu_version = 0x05000000,
+        .intbit_to_level = {
+            2, 3, 5, 7, 9, 11, 0, 14,   3, 5, 7, 9, 11, 13, 12, 12,
+            6, 0, 4, 10, 8, 0, 11, 0,   0, 0, 0, 0, 15, 0, 15, 0,
+        },
+        .max_mem = 0x10000000,
+        .default_cpu_model = "Fujitsu MB86904",
+    },
+    /* SPARCClassic */
+    {
+        .iommu_base   = 0x10000000,
+        .tcx_base     = 0x50000000,
+        .cs_base      = -1,
+        .slavio_base  = 0x70000000,
+        .ms_kb_base   = 0x71000000,
+        .serial_base  = 0x71100000,
+        .nvram_base   = 0x71200000,
+        .fd_base      = 0x71400000,
+        .counter_base = 0x71d00000,
+        .intctl_base  = 0x71e00000,
+        .idreg_base   = 0x78000000,
+        .dma_base     = 0x78400000,
+        .esp_base     = 0x78800000,
+        .le_base      = 0x78c00000,
+        .apc_base     = 0x6a000000,
+        .aux1_base    = 0x71900000,
+        .aux2_base    = 0x71910000,
+        .ecc_base     = -1,
+        .sun4c_intctl_base  = -1,
+        .sun4c_counter_base = -1,
+        .vram_size    = 0x00100000,
+        .nvram_size   = 0x2000,
+        .esp_irq = 18,
+        .le_irq = 16,
+        .clock_irq = 7,
+        .clock1_irq = 19,
+        .ms_kb_irq = 14,
+        .ser_irq = 15,
+        .fd_irq = 22,
+        .me_irq = 30,
+        .cs_irq = -1,
+        .machine_id = 0x80,
+        .iommu_version = 0x05000000,
+        .intbit_to_level = {
+            2, 3, 5, 7, 9, 11, 0, 14,   3, 5, 7, 9, 11, 13, 12, 12,
+            6, 0, 4, 10, 8, 0, 11, 0,   0, 0, 0, 0, 15, 0, 15, 0,
+        },
+        .max_mem = 0x10000000,
+        .default_cpu_model = "TI MicroSparc I",
+    },
+    /* SPARCbook */
+    {
+        .iommu_base   = 0x10000000,
+        .tcx_base     = 0x50000000, // XXX
+        .cs_base      = -1,
+        .slavio_base  = 0x70000000,
+        .ms_kb_base   = 0x71000000,
+        .serial_base  = 0x71100000,
+        .nvram_base   = 0x71200000,
+        .fd_base      = 0x71400000,
+        .counter_base = 0x71d00000,
+        .intctl_base  = 0x71e00000,
+        .idreg_base   = 0x78000000,
+        .dma_base     = 0x78400000,
+        .esp_base     = 0x78800000,
+        .le_base      = 0x78c00000,
+        .apc_base     = 0x6a000000,
+        .aux1_base    = 0x71900000,
+        .aux2_base    = 0x71910000,
+        .ecc_base     = -1,
+        .sun4c_intctl_base  = -1,
+        .sun4c_counter_base = -1,
+        .vram_size    = 0x00100000,
+        .nvram_size   = 0x2000,
+        .esp_irq = 18,
+        .le_irq = 16,
+        .clock_irq = 7,
+        .clock1_irq = 19,
+        .ms_kb_irq = 14,
+        .ser_irq = 15,
+        .fd_irq = 22,
+        .me_irq = 30,
+        .cs_irq = -1,
+        .machine_id = 0x80,
+        .iommu_version = 0x05000000,
+        .intbit_to_level = {
+            2, 3, 5, 7, 9, 11, 0, 14,   3, 5, 7, 9, 11, 13, 12, 12,
+            6, 0, 4, 10, 8, 0, 11, 0,   0, 0, 0, 0, 15, 0, 15, 0,
+        },
+        .max_mem = 0x10000000,
+        .default_cpu_model = "TI MicroSparc I",
+    },
 };
 
 /* SPARCstation 5 hardware initialisation */
-static void ss5_init(int RAM_size, int vga_ram_size,
+static void ss5_init(ram_addr_t RAM_size, int vga_ram_size,
                      const char *boot_device, DisplayState *ds,
                      const char *kernel_filename, const char *kernel_cmdline,
                      const char *initrd_filename, const char *cpu_model)
@@ -879,7 +1123,7 @@ static void ss5_init(int RAM_size, int vga_ram_size,
 }
 
 /* SPARCstation 10 hardware initialisation */
-static void ss10_init(int RAM_size, int vga_ram_size,
+static void ss10_init(ram_addr_t RAM_size, int vga_ram_size,
                       const char *boot_device, DisplayState *ds,
                       const char *kernel_filename, const char *kernel_cmdline,
                       const char *initrd_filename, const char *cpu_model)
@@ -889,7 +1133,7 @@ static void ss10_init(int RAM_size, int vga_ram_size,
 }
 
 /* SPARCserver 600MP hardware initialisation */
-static void ss600mp_init(int RAM_size, int vga_ram_size,
+static void ss600mp_init(ram_addr_t RAM_size, int vga_ram_size,
                          const char *boot_device, DisplayState *ds,
                          const char *kernel_filename, const char *kernel_cmdline,
                          const char *initrd_filename, const char *cpu_model)
@@ -899,7 +1143,7 @@ static void ss600mp_init(int RAM_size, int vga_ram_size,
 }
 
 /* SPARCstation 20 hardware initialisation */
-static void ss20_init(int RAM_size, int vga_ram_size,
+static void ss20_init(ram_addr_t RAM_size, int vga_ram_size,
                       const char *boot_device, DisplayState *ds,
                       const char *kernel_filename, const char *kernel_cmdline,
                       const char *initrd_filename, const char *cpu_model)
@@ -909,7 +1153,7 @@ static void ss20_init(int RAM_size, int vga_ram_size,
 }
 
 /* SPARCstation 2 hardware initialisation */
-static void ss2_init(int RAM_size, int vga_ram_size,
+static void ss2_init(ram_addr_t RAM_size, int vga_ram_size,
                      const char *boot_device, DisplayState *ds,
                      const char *kernel_filename, const char *kernel_cmdline,
                      const char *initrd_filename, const char *cpu_model)
@@ -918,34 +1162,124 @@ static void ss2_init(int RAM_size, int vga_ram_size,
                   kernel_cmdline, initrd_filename, cpu_model);
 }
 
+/* SPARCstation Voyager hardware initialisation */
+static void vger_init(ram_addr_t RAM_size, int vga_ram_size,
+                      const char *boot_device, DisplayState *ds,
+                      const char *kernel_filename, const char *kernel_cmdline,
+                      const char *initrd_filename, const char *cpu_model)
+{
+    sun4m_hw_init(&hwdefs[5], RAM_size, boot_device, ds, kernel_filename,
+                  kernel_cmdline, initrd_filename, cpu_model);
+}
+
+/* SPARCstation LX hardware initialisation */
+static void ss_lx_init(ram_addr_t RAM_size, int vga_ram_size,
+                       const char *boot_device, DisplayState *ds,
+                       const char *kernel_filename, const char *kernel_cmdline,
+                       const char *initrd_filename, const char *cpu_model)
+{
+    sun4m_hw_init(&hwdefs[6], RAM_size, boot_device, ds, kernel_filename,
+                  kernel_cmdline, initrd_filename, cpu_model);
+}
+
+/* SPARCstation 4 hardware initialisation */
+static void ss4_init(ram_addr_t RAM_size, int vga_ram_size,
+                     const char *boot_device, DisplayState *ds,
+                     const char *kernel_filename, const char *kernel_cmdline,
+                     const char *initrd_filename, const char *cpu_model)
+{
+    sun4m_hw_init(&hwdefs[7], RAM_size, boot_device, ds, kernel_filename,
+                  kernel_cmdline, initrd_filename, cpu_model);
+}
+
+/* SPARCClassic hardware initialisation */
+static void scls_init(ram_addr_t RAM_size, int vga_ram_size,
+                      const char *boot_device, DisplayState *ds,
+                      const char *kernel_filename, const char *kernel_cmdline,
+                      const char *initrd_filename, const char *cpu_model)
+{
+    sun4m_hw_init(&hwdefs[8], RAM_size, boot_device, ds, kernel_filename,
+                  kernel_cmdline, initrd_filename, cpu_model);
+}
+
+/* SPARCbook hardware initialisation */
+static void sbook_init(ram_addr_t RAM_size, int vga_ram_size,
+                       const char *boot_device, DisplayState *ds,
+                       const char *kernel_filename, const char *kernel_cmdline,
+                       const char *initrd_filename, const char *cpu_model)
+{
+    sun4m_hw_init(&hwdefs[9], RAM_size, boot_device, ds, kernel_filename,
+                  kernel_cmdline, initrd_filename, cpu_model);
+}
+
 QEMUMachine ss5_machine = {
     "SS-5",
     "Sun4m platform, SPARCstation 5",
     ss5_init,
+    PROM_SIZE_MAX + TCX_SIZE,
 };
 
 QEMUMachine ss10_machine = {
     "SS-10",
     "Sun4m platform, SPARCstation 10",
     ss10_init,
+    PROM_SIZE_MAX + TCX_SIZE,
 };
 
 QEMUMachine ss600mp_machine = {
     "SS-600MP",
     "Sun4m platform, SPARCserver 600MP",
     ss600mp_init,
+    PROM_SIZE_MAX + TCX_SIZE,
 };
 
 QEMUMachine ss20_machine = {
     "SS-20",
     "Sun4m platform, SPARCstation 20",
     ss20_init,
+    PROM_SIZE_MAX + TCX_SIZE,
 };
 
 QEMUMachine ss2_machine = {
     "SS-2",
     "Sun4c platform, SPARCstation 2",
     ss2_init,
+    PROM_SIZE_MAX + TCX_SIZE,
+};
+
+QEMUMachine voyager_machine = {
+    "Voyager",
+    "Sun4m platform, SPARCstation Voyager",
+    vger_init,
+    PROM_SIZE_MAX + TCX_SIZE,
+};
+
+QEMUMachine ss_lx_machine = {
+    "LX",
+    "Sun4m platform, SPARCstation LX",
+    ss_lx_init,
+    PROM_SIZE_MAX + TCX_SIZE,
+};
+
+QEMUMachine ss4_machine = {
+    "SS-4",
+    "Sun4m platform, SPARCstation 4",
+    ss4_init,
+    PROM_SIZE_MAX + TCX_SIZE,
+};
+
+QEMUMachine scls_machine = {
+    "SPARCClassic",
+    "Sun4m platform, SPARCClassic",
+    scls_init,
+    PROM_SIZE_MAX + TCX_SIZE,
+};
+
+QEMUMachine sbook_machine = {
+    "SPARCbook",
+    "Sun4m platform, SPARCbook",
+    sbook_init,
+    PROM_SIZE_MAX + TCX_SIZE,
 };
 
 static const struct sun4d_hwdef sun4d_hwdefs[] = {
@@ -979,7 +1313,7 @@ static const struct sun4d_hwdef sun4d_hwdefs[] = {
         .ser_irq = 12,
         .machine_id = 0x80,
         .iounit_version = 0x03000000,
-        .max_mem = 0xffffffff, // XXX actually first 62GB ok
+        .max_mem = 0xf00000000ULL,
         .default_cpu_model = "TI SuperSparc II",
     },
     /* SS-2000 */
@@ -1012,12 +1346,12 @@ static const struct sun4d_hwdef sun4d_hwdefs[] = {
         .ser_irq = 12,
         .machine_id = 0x80,
         .iounit_version = 0x03000000,
-        .max_mem = 0xffffffff, // XXX actually first 62GB ok
+        .max_mem = 0xf00000000ULL,
         .default_cpu_model = "TI SuperSparc II",
     },
 };
 
-static void sun4d_hw_init(const struct sun4d_hwdef *hwdef, int RAM_size,
+static void sun4d_hw_init(const struct sun4d_hwdef *hwdef, ram_addr_t RAM_size,
                           const char *boot_device,
                           DisplayState *ds, const char *kernel_filename,
                           const char *kernel_cmdline,
@@ -1063,7 +1397,7 @@ static void sun4d_hw_init(const struct sun4d_hwdef *hwdef, int RAM_size,
     /* allocate RAM */
     if ((uint64_t)RAM_size > hwdef->max_mem) {
         fprintf(stderr, "qemu: Too much memory for this machine: %d, maximum %d\n",
-                (unsigned int)RAM_size / (1024 * 1024),
+                (unsigned int)(RAM_size / (1024 * 1024)),
                 (unsigned int)(hwdef->max_mem / (1024 * 1024)));
         exit(1);
     }
@@ -1139,8 +1473,9 @@ static void sun4d_hw_init(const struct sun4d_hwdef *hwdef, int RAM_size,
         exit(1);
     }
 
-    main_esp = esp_init(hwdef->esp_base, espdma, *espdma_irq,
-                        esp_reset);
+    main_esp = esp_init(hwdef->esp_base, 2,
+                        espdma_memory_read, espdma_memory_write,
+                        espdma, *espdma_irq, esp_reset);
 
     for (i = 0; i < ESP_MAX_DEVS; i++) {
         index = drive_get_index(IF_SCSI, 0, i);
@@ -1158,7 +1493,7 @@ static void sun4d_hw_init(const struct sun4d_hwdef *hwdef, int RAM_size,
 }
 
 /* SPARCserver 1000 hardware initialisation */
-static void ss1000_init(int RAM_size, int vga_ram_size,
+static void ss1000_init(ram_addr_t RAM_size, int vga_ram_size,
                         const char *boot_device, DisplayState *ds,
                         const char *kernel_filename, const char *kernel_cmdline,
                         const char *initrd_filename, const char *cpu_model)
@@ -1168,7 +1503,7 @@ static void ss1000_init(int RAM_size, int vga_ram_size,
 }
 
 /* SPARCcenter 2000 hardware initialisation */
-static void ss2000_init(int RAM_size, int vga_ram_size,
+static void ss2000_init(ram_addr_t RAM_size, int vga_ram_size,
                         const char *boot_device, DisplayState *ds,
                         const char *kernel_filename, const char *kernel_cmdline,
                         const char *initrd_filename, const char *cpu_model)
@@ -1181,10 +1516,12 @@ QEMUMachine ss1000_machine = {
     "SS-1000",
     "Sun4d platform, SPARCserver 1000",
     ss1000_init,
+    PROM_SIZE_MAX + TCX_SIZE,
 };
 
 QEMUMachine ss2000_machine = {
     "SS-2000",
     "Sun4d platform, SPARCcenter 2000",
     ss2000_init,
+    PROM_SIZE_MAX + TCX_SIZE,
 };
