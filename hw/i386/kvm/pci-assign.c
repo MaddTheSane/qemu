@@ -20,12 +20,9 @@
  *  Copyright (C) 2008, Red Hat, Amit Shah (amit.shah@redhat.com)
  *  Copyright (C) 2008, IBM, Muli Ben-Yehuda (muli@il.ibm.com)
  */
-#include <stdio.h>
-#include <unistd.h>
-#include <sys/io.h>
+#include "qemu/osdep.h"
+#include "qapi/error.h"
 #include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include "hw/hw.h"
 #include "hw/i386/pc.h"
 #include "qemu/error-report.h"
@@ -771,7 +768,7 @@ static char *assign_failed_examine(const AssignedDevice *dev)
         "*** $ echo \"%04x:%02x:%02x.%x\" > /sys/bus/pci/drivers/"
         "pci-stub/bind\n"
         "*** $ echo \"%04x %04x\" > /sys/bus/pci/drivers/pci-stub/remove_id\n"
-        "***",
+        "***\n",
         ns, dev->host.domain, dev->host.bus, dev->host.slot,
         dev->host.function, vendor_id, device_id,
         dev->host.domain, dev->host.bus, dev->host.slot, dev->host.function,
@@ -779,7 +776,7 @@ static char *assign_failed_examine(const AssignedDevice *dev)
         dev->host.function, vendor_id, device_id);
 
 fail:
-    return g_strdup("Couldn't find out why.");
+    return g_strdup("Couldn't find out why.\n");
 }
 
 static void assign_device(AssignedDevice *dev, Error **errp)
@@ -813,8 +810,9 @@ static void assign_device(AssignedDevice *dev, Error **errp)
             char *cause;
 
             cause = assign_failed_examine(dev);
-            error_setg_errno(errp, -r, "Failed to assign device \"%s\"\n%s",
-                             dev->dev.qdev.id, cause);
+            error_setg_errno(errp, -r, "Failed to assign device \"%s\"",
+                             dev->dev.qdev.id);
+            error_append_hint(errp, "%s", cause);
             g_free(cause);
             break;
         }
@@ -913,11 +911,10 @@ retry:
             dev->features |= ASSIGNED_DEVICE_PREFER_MSI_MASK;
             goto retry;
         }
-        error_setg_errno(errp, -r,
-                         "Failed to assign irq for \"%s\"\n"
-                         "Perhaps you are assigning a device "
-                         "that shares an IRQ with another device?",
+        error_setg_errno(errp, -r, "Failed to assign irq for \"%s\"",
                          dev->dev.qdev.id);
+        error_append_hint(errp, "Perhaps you are assigning a device "
+                          "that shares an IRQ with another device?\n");
         return r;
     }
 
@@ -980,7 +977,7 @@ static void assigned_dev_update_msi(PCIDevice *pci_dev)
         MSIMessage msg = msi_get_message(pci_dev, 0);
         int virq;
 
-        virq = kvm_irqchip_add_msi_route(kvm_state, msg);
+        virq = kvm_irqchip_add_msi_route(kvm_state, msg, pci_dev);
         if (virq < 0) {
             perror("assigned_dev_update_msi: kvm_irqchip_add_msi_route");
             return;
@@ -1018,7 +1015,7 @@ static void assigned_dev_update_msi_msg(PCIDevice *pci_dev)
     }
 
     kvm_irqchip_update_msi_route(kvm_state, assigned_dev->msi_virq[0],
-                                 msi_get_message(pci_dev, 0));
+                                 msi_get_message(pci_dev, 0), pci_dev);
 }
 
 static bool assigned_dev_msix_masked(MSIXTableEntry *entry)
@@ -1084,7 +1081,7 @@ static int assigned_dev_update_msix_mmio(PCIDevice *pci_dev)
 
         msg.address = entry->addr_lo | ((uint64_t)entry->addr_hi << 32);
         msg.data = entry->data;
-        r = kvm_irqchip_add_msi_route(kvm_state, msg);
+        r = kvm_irqchip_add_msi_route(kvm_state, msg, pci_dev);
         if (r < 0) {
             return r;
         }
@@ -1484,7 +1481,7 @@ static int assigned_device_pci_cap_init(PCIDevice *pci_dev, Error **errp)
          * error bits, leave the rest. */
         status = pci_get_long(pci_dev->config + pos + PCI_X_STATUS);
         status &= ~(PCI_X_STATUS_BUS | PCI_X_STATUS_DEVFN);
-        status |= (pci_bus_num(pci_dev->bus) << 8) | pci_dev->devfn;
+        status |= pci_requester_id(pci_dev);
         status &= ~(PCI_X_STATUS_SPL_DISC | PCI_X_STATUS_UNX_SPL |
                     PCI_X_STATUS_SPL_ERR);
         pci_set_long(pci_dev->config + pos + PCI_X_STATUS, status);
@@ -1603,7 +1600,8 @@ static void assigned_dev_msix_mmio_write(void *opaque, hwaddr addr,
                 msg.data = entry->data;
 
                 ret = kvm_irqchip_update_msi_route(kvm_state,
-                                                   adev->msi_virq[i], msg);
+                                                   adev->msi_virq[i], msg,
+                                                   pdev);
                 if (ret) {
                     error_report("Error updating irq routing entry (%d)", ret);
                 }

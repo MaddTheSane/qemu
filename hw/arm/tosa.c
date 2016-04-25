@@ -11,6 +11,8 @@
  * GNU GPL, version 2 or (at your option) any later version.
  */
 
+#include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/hw.h"
 #include "hw/arm/pxa.h"
 #include "hw/arm/arm.h"
@@ -19,7 +21,7 @@
 #include "hw/pcmcia.h"
 #include "hw/boards.h"
 #include "hw/i2c/i2c.h"
-#include "hw/ssi.h"
+#include "hw/ssi/ssi.h"
 #include "sysemu/block-backend.h"
 #include "hw/sysbus.h"
 #include "exec/address-spaces.h"
@@ -254,7 +256,7 @@ static void tosa_init(MachineState *machine)
 
 static void tosapda_machine_init(MachineClass *mc)
 {
-    mc->desc = "Tosa PDA (PXA255)";
+    mc->desc = "Sharp SL-6000 (Tosa) PDA (PXA255)";
     mc->init = tosa_init;
 }
 

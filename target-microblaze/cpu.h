@@ -19,7 +19,6 @@
 #ifndef CPU_MICROBLAZE_H
 #define CPU_MICROBLAZE_H
 
-#include "config.h"
 #include "qemu-common.h"
 
 #define TARGET_LONG_BITS 32
@@ -295,7 +294,6 @@ int cpu_mb_signal_handler(int host_signum, void *pinfo,
 #define cpu_init(cpu_model) CPU(cpu_mb_init(cpu_model))
 
 #define cpu_exec cpu_mb_exec
-#define cpu_gen_code cpu_mb_gen_code
 #define cpu_signal_handler cpu_mb_signal_handler
 
 /* MMU modes definitions */

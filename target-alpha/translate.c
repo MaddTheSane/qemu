@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "cpu.h"
 #include "disas/disas.h"
 #include "qemu/host-utils.h"
@@ -27,6 +28,7 @@
 #include "exec/helper-gen.h"
 
 #include "trace-tcg.h"
+#include "exec/log.h"
 
 
 #undef ALPHA_DEBUG_DISAS
@@ -91,7 +93,7 @@ typedef enum {
 } ExitStatus;
 
 /* global register indexes */
-static TCGv_ptr cpu_env;
+static TCGv_env cpu_env;
 static TCGv cpu_std_ir[31];
 static TCGv cpu_fir[31];
 static TCGv cpu_pc;
@@ -150,13 +152,13 @@ void alpha_translate_init(void)
     cpu_env = tcg_global_reg_new_ptr(TCG_AREG0, "env");
 
     for (i = 0; i < 31; i++) {
-        cpu_std_ir[i] = tcg_global_mem_new_i64(TCG_AREG0,
+        cpu_std_ir[i] = tcg_global_mem_new_i64(cpu_env,
                                                offsetof(CPUAlphaState, ir[i]),
                                                greg_names[i]);
     }
 
     for (i = 0; i < 31; i++) {
-        cpu_fir[i] = tcg_global_mem_new_i64(TCG_AREG0,
+        cpu_fir[i] = tcg_global_mem_new_i64(cpu_env,
                                             offsetof(CPUAlphaState, fir[i]),
                                             freg_names[i]);
     }
@@ -165,7 +167,7 @@ void alpha_translate_init(void)
     memcpy(cpu_pal_ir, cpu_std_ir, sizeof(cpu_pal_ir));
     for (i = 0; i < 8; i++) {
         int r = (i == 7 ? 25 : i + 8);
-        cpu_pal_ir[r] = tcg_global_mem_new_i64(TCG_AREG0,
+        cpu_pal_ir[r] = tcg_global_mem_new_i64(cpu_env,
                                                offsetof(CPUAlphaState,
                                                         shadow[i]),
                                                shadow_names[i]);
@@ -174,7 +176,7 @@ void alpha_translate_init(void)
 
     for (i = 0; i < ARRAY_SIZE(vars); ++i) {
         const GlobalVar *v = &vars[i];
-        *v->var = tcg_global_mem_new_i64(TCG_AREG0, v->ofs, v->name);
+        *v->var = tcg_global_mem_new_i64(cpu_env, v->ofs, v->name);
     }
 }
 
@@ -2858,18 +2860,14 @@ static ExitStatus translate_one(DisasContext *ctx, uint32_t insn)
     return ret;
 }
 
-static inline void gen_intermediate_code_internal(AlphaCPU *cpu,
-                                                  TranslationBlock *tb,
-                                                  bool search_pc)
+void gen_intermediate_code(CPUAlphaState *env, struct TranslationBlock *tb)
 {
+    AlphaCPU *cpu = alpha_env_get_cpu(env);
     CPUState *cs = CPU(cpu);
-    CPUAlphaState *env = &cpu->env;
     DisasContext ctx, *ctxp = &ctx;
     target_ulong pc_start;
     target_ulong pc_mask;
     uint32_t insn;
-    CPUBreakpoint *bp;
-    int j, lj = -1;
     ExitStatus ret;
     int num_insns;
     int max_insns;
@@ -2904,6 +2902,9 @@ static inline void gen_intermediate_code_internal(AlphaCPU *cpu,
     if (max_insns == 0) {
         max_insns = CF_COUNT_MASK;
     }
+    if (max_insns > TCG_MAX_INSNS) {
+        max_insns = TCG_MAX_INSNS;
+    }
 
     if (in_superpage(&ctx, pc_start)) {
         pc_mask = (1ULL << 41) - 1;
@@ -2913,35 +2914,22 @@ static inline void gen_intermediate_code_internal(AlphaCPU *cpu,
 
     gen_tb_start(tb);
     do {
-        if (unlikely(!QTAILQ_EMPTY(&cs->breakpoints))) {
-            QTAILQ_FOREACH(bp, &cs->breakpoints, entry) {
-                if (bp->pc == ctx.pc) {
-                    gen_excp(&ctx, EXCP_DEBUG, 0);
-                    break;
-                }
-            }
+        tcg_gen_insn_start(ctx.pc);
+        num_insns++;
+
+        if (unlikely(cpu_breakpoint_test(cs, ctx.pc, BP_ANY))) {
+            ret = gen_excp(&ctx, EXCP_DEBUG, 0);
+            /* The address covered by the breakpoint must be included in
+               [tb->pc, tb->pc + tb->size) in order to for it to be
+               properly cleared -- thus we increment the PC here so that
+               the logic setting tb->size below does the right thing.  */
+            ctx.pc += 4;
+            break;
         }
-        if (search_pc) {
-            j = tcg_op_buf_count();
-            if (lj < j) {
-                lj++;
-                while (lj < j) {
-                    tcg_ctx.gen_opc_instr_start[lj++] = 0;
-                }
-            }
-            tcg_ctx.gen_opc_pc[lj] = ctx.pc;
-            tcg_ctx.gen_opc_instr_start[lj] = 1;
-            tcg_ctx.gen_opc_icount[lj] = num_insns;
-        }
-        if (num_insns + 1 == max_insns && (tb->cflags & CF_LAST_IO)) {
+        if (num_insns == max_insns && (tb->cflags & CF_LAST_IO)) {
             gen_io_start();
         }
         insn = cpu_ldl_code(env, ctx.pc);
-        num_insns++;
-
-	if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT))) {
-            tcg_gen_debug_insn_start(ctx.pc);
-        }
 
         TCGV_UNUSED_I64(ctx.zero);
         TCGV_UNUSED_I64(ctx.sink);
@@ -2997,16 +2985,8 @@ static inline void gen_intermediate_code_internal(AlphaCPU *cpu,
 
     gen_tb_end(tb, num_insns);
 
-    if (search_pc) {
-        j = tcg_op_buf_count();
-        lj++;
-        while (lj <= j) {
-            tcg_ctx.gen_opc_instr_start[lj++] = 0;
-        }
-    } else {
-        tb->size = ctx.pc - pc_start;
-        tb->icount = num_insns;
-    }
+    tb->size = ctx.pc - pc_start;
+    tb->icount = num_insns;
 
 #ifdef DEBUG_DISAS
     if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)) {
@@ -3017,17 +2997,8 @@ static inline void gen_intermediate_code_internal(AlphaCPU *cpu,
 #endif
 }
 
-void gen_intermediate_code (CPUAlphaState *env, struct TranslationBlock *tb)
+void restore_state_to_opc(CPUAlphaState *env, TranslationBlock *tb,
+                          target_ulong *data)
 {
-    gen_intermediate_code_internal(alpha_env_get_cpu(env), tb, false);
-}
-
-void gen_intermediate_code_pc (CPUAlphaState *env, struct TranslationBlock *tb)
-{
-    gen_intermediate_code_internal(alpha_env_get_cpu(env), tb, true);
-}
-
-void restore_state_to_opc(CPUAlphaState *env, TranslationBlock *tb, int pc_pos)
-{
-    env->pc = tcg_ctx.gen_opc_pc[pc_pos];
+    env->pc = data[0];
 }

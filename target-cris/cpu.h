@@ -20,7 +20,6 @@
 #ifndef CPU_CRIS_H
 #define CPU_CRIS_H
 
-#include "config.h"
 #include "qemu-common.h"
 
 #define TARGET_LONG_BITS 32
@@ -223,7 +222,6 @@ enum {
 #define cpu_init(cpu_model) CPU(cpu_cris_init(cpu_model))
 
 #define cpu_exec cpu_cris_exec
-#define cpu_gen_code cpu_cris_gen_code
 #define cpu_signal_handler cpu_cris_signal_handler
 
 /* MMU modes definitions */

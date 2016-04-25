@@ -18,9 +18,11 @@
  *
  */
 
+#include "qemu/osdep.h"
 #include "crypto/tlssession.h"
 #include "crypto/tlscredsanon.h"
 #include "crypto/tlscredsx509.h"
+#include "qapi/error.h"
 #include "qemu/acl.h"
 #include "trace.h"
 
@@ -304,9 +306,9 @@ qcrypto_tls_session_check_certificate(QCryptoTLSSession *session,
 
                 allow = qemu_acl_party_is_allowed(acl, session->peername);
 
-                error_setg(errp, "TLS x509 ACL check for %s is %s",
-                           session->peername, allow ? "allowed" : "denied");
                 if (!allow) {
+                    error_setg(errp, "TLS x509 ACL check for %s is denied",
+                               session->peername);
                     goto error;
                 }
             }

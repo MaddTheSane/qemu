@@ -18,8 +18,8 @@
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include <zlib.h>
-#include <stdint.h>
 
 #include "qemu-common.h"
 #include "qemu/timer.h"
@@ -1156,7 +1156,9 @@ static void qxl_soft_reset(PCIQXLDevice *d)
     trace_qxl_soft_reset(d->id);
     qxl_check_state(d);
     qxl_clear_guest_bug(d);
+    qemu_mutex_lock(&d->async_lock);
     d->current_async = QXL_UNDEFINED_IO;
+    qemu_mutex_unlock(&d->async_lock);
 
     if (d->id == 0) {
         qxl_enter_vga_mode(d);
@@ -2156,7 +2158,7 @@ static int qxl_post_load(void *opaque, int version)
         qxl_create_guest_primary(d, 1, QXL_SYNC);
 
         /* replay surface-create and cursor-set commands */
-        cmds = g_malloc0(sizeof(QXLCommandExt) * (d->ssd.num_surfaces + 1));
+        cmds = g_new0(QXLCommandExt, d->ssd.num_surfaces + 1);
         for (in = 0, out = 0; in < d->ssd.num_surfaces; in++) {
             if (d->guest_surfaces.cmds[in] == 0) {
                 continue;

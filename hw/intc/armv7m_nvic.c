@@ -10,6 +10,9 @@
  * NVIC.  Much of that is also implemented here.
  */
 
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu-common.h"
 #include "hw/sysbus.h"
 #include "qemu/timer.h"
 #include "hw/arm/arm.h"
@@ -28,6 +31,7 @@ typedef struct {
     MemoryRegion gic_iomem_alias;
     MemoryRegion container;
     uint32_t num_irq;
+    qemu_irq sysresetreq;
 } nvic_state;
 
 #define TYPE_NVIC "armv7m_nvic"
@@ -348,10 +352,13 @@ static void nvic_writel(nvic_state *s, uint32_t offset, uint32_t value)
         break;
     case 0xd0c: /* Application Interrupt/Reset Control.  */
         if ((value >> 16) == 0x05fa) {
+            if (value & 4) {
+                qemu_irq_pulse(s->sysresetreq);
+            }
             if (value & 2) {
                 qemu_log_mask(LOG_UNIMP, "VECTCLRACTIVE unimplemented\n");
             }
-            if (value & 5) {
+            if (value & 1) {
                 qemu_log_mask(LOG_UNIMP, "AIRCR system reset unimplemented\n");
             }
             if (value & 0x700) {
@@ -535,11 +542,14 @@ static void armv7m_nvic_instance_init(Object *obj)
      * value in the GICState struct.
      */
     GICState *s = ARM_GIC_COMMON(obj);
+    DeviceState *dev = DEVICE(obj);
+    nvic_state *nvic = NVIC(obj);
     /* The ARM v7m may have anything from 0 to 496 external interrupt
      * IRQ lines. We default to 64. Other boards may differ and should
      * set the num-irq property appropriately.
      */
     s->num_irq = 64;
+    qdev_init_gpio_out_named(dev, &nvic->sysresetreq, "SYSRESETREQ", 1);
 }
 
 static void armv7m_nvic_class_init(ObjectClass *klass, void *data)

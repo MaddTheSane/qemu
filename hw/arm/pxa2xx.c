@@ -7,15 +7,20 @@
  * This code is licensed under the GPL.
  */
 
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu-common.h"
+#include "cpu.h"
 #include "hw/sysbus.h"
 #include "hw/arm/pxa.h"
 #include "sysemu/sysemu.h"
 #include "hw/char/serial.h"
 #include "hw/i2c/i2c.h"
-#include "hw/ssi.h"
+#include "hw/ssi/ssi.h"
 #include "sysemu/char.h"
 #include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
+#include "qemu/cutils.h"
 
 static struct {
     hwaddr io_base;
@@ -1958,7 +1963,7 @@ static void pxa2xx_fir_instance_init(Object *obj)
     PXA2xxFIrState *s = PXA2XX_FIR(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    memory_region_init_io(&s->iomem, NULL, &pxa2xx_fir_ops, s,
+    memory_region_init_io(&s->iomem, obj, &pxa2xx_fir_ops, s,
                           "pxa2xx-fir", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);

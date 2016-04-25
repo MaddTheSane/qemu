@@ -16,11 +16,7 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
-#include <stdarg.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
+#include "qemu/osdep.h"
 
 #include "cpu.h"
 #include "tcg-op.h"
@@ -35,6 +31,7 @@
 
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
+#include "exec/log.h"
 
 #include "trace-tcg.h"
 
@@ -89,16 +86,16 @@ void a64_translate_init(void)
 {
     int i;
 
-    cpu_pc = tcg_global_mem_new_i64(TCG_AREG0,
+    cpu_pc = tcg_global_mem_new_i64(cpu_env,
                                     offsetof(CPUARMState, pc),
                                     "pc");
     for (i = 0; i < 32; i++) {
-        cpu_X[i] = tcg_global_mem_new_i64(TCG_AREG0,
+        cpu_X[i] = tcg_global_mem_new_i64(cpu_env,
                                           offsetof(CPUARMState, xregs[i]),
                                           regnames[i]);
     }
 
-    cpu_exclusive_high = tcg_global_mem_new_i64(TCG_AREG0,
+    cpu_exclusive_high = tcg_global_mem_new_i64(cpu_env,
         offsetof(CPUARMState, exclusive_high), "exclusive_high");
 }
 
@@ -126,6 +123,8 @@ void aarch64_cpu_dump_state(CPUState *cs, FILE *f,
     CPUARMState *env = &cpu->env;
     uint32_t psr = pstate_read(env);
     int i;
+    int el = arm_current_el(env);
+    const char *ns_status;
 
     cpu_fprintf(f, "PC=%016"PRIx64"  SP=%016"PRIx64"\n",
             env->pc, env->xregs[31]);
@@ -137,13 +136,22 @@ void aarch64_cpu_dump_state(CPUState *cs, FILE *f,
             cpu_fprintf(f, " ");
         }
     }
-    cpu_fprintf(f, "PSTATE=%08x (flags %c%c%c%c)\n",
+
+    if (arm_feature(env, ARM_FEATURE_EL3) && el != 3) {
+        ns_status = env->cp15.scr_el3 & SCR_NS ? "NS " : "S ";
+    } else {
+        ns_status = "";
+    }
+
+    cpu_fprintf(f, "\nPSTATE=%08x %c%c%c%c %sEL%d%c\n",
                 psr,
                 psr & PSTATE_N ? 'N' : '-',
                 psr & PSTATE_Z ? 'Z' : '-',
                 psr & PSTATE_C ? 'C' : '-',
-                psr & PSTATE_V ? 'V' : '-');
-    cpu_fprintf(f, "\n");
+                psr & PSTATE_V ? 'V' : '-',
+                ns_status,
+                el,
+                psr & PSTATE_SP ? 'h' : 't');
 
     if (flags & CPU_DUMP_FPU) {
         int numvfpregs = 32;
@@ -715,7 +723,7 @@ static void do_gpr_st_memidx(DisasContext *s, TCGv_i64 source,
                              TCGv_i64 tcg_addr, int size, int memidx)
 {
     g_assert(size <= 3);
-    tcg_gen_qemu_st_i64(source, tcg_addr, memidx, MO_TE + size);
+    tcg_gen_qemu_st_i64(source, tcg_addr, memidx, s->be_data + size);
 }
 
 static void do_gpr_st(DisasContext *s, TCGv_i64 source,
@@ -730,7 +738,7 @@ static void do_gpr_st(DisasContext *s, TCGv_i64 source,
 static void do_gpr_ld_memidx(DisasContext *s, TCGv_i64 dest, TCGv_i64 tcg_addr,
                              int size, bool is_signed, bool extend, int memidx)
 {
-    TCGMemOp memop = MO_TE + size;
+    TCGMemOp memop = s->be_data + size;
 
     g_assert(size <= 3);
 
@@ -762,13 +770,18 @@ static void do_fp_st(DisasContext *s, int srcidx, TCGv_i64 tcg_addr, int size)
     TCGv_i64 tmp = tcg_temp_new_i64();
     tcg_gen_ld_i64(tmp, cpu_env, fp_reg_offset(s, srcidx, MO_64));
     if (size < 4) {
-        tcg_gen_qemu_st_i64(tmp, tcg_addr, get_mem_index(s), MO_TE + size);
+        tcg_gen_qemu_st_i64(tmp, tcg_addr, get_mem_index(s),
+                            s->be_data + size);
     } else {
+        bool be = s->be_data == MO_BE;
         TCGv_i64 tcg_hiaddr = tcg_temp_new_i64();
-        tcg_gen_qemu_st_i64(tmp, tcg_addr, get_mem_index(s), MO_TEQ);
-        tcg_gen_ld_i64(tmp, cpu_env, fp_reg_hi_offset(s, srcidx));
+
         tcg_gen_addi_i64(tcg_hiaddr, tcg_addr, 8);
-        tcg_gen_qemu_st_i64(tmp, tcg_hiaddr, get_mem_index(s), MO_TEQ);
+        tcg_gen_qemu_st_i64(tmp, be ? tcg_hiaddr : tcg_addr, get_mem_index(s),
+                            s->be_data | MO_Q);
+        tcg_gen_ld_i64(tmp, cpu_env, fp_reg_hi_offset(s, srcidx));
+        tcg_gen_qemu_st_i64(tmp, be ? tcg_addr : tcg_hiaddr, get_mem_index(s),
+                            s->be_data | MO_Q);
         tcg_temp_free_i64(tcg_hiaddr);
     }
 
@@ -785,17 +798,21 @@ static void do_fp_ld(DisasContext *s, int destidx, TCGv_i64 tcg_addr, int size)
     TCGv_i64 tmphi;
 
     if (size < 4) {
-        TCGMemOp memop = MO_TE + size;
+        TCGMemOp memop = s->be_data + size;
         tmphi = tcg_const_i64(0);
         tcg_gen_qemu_ld_i64(tmplo, tcg_addr, get_mem_index(s), memop);
     } else {
+        bool be = s->be_data == MO_BE;
         TCGv_i64 tcg_hiaddr;
+
         tmphi = tcg_temp_new_i64();
         tcg_hiaddr = tcg_temp_new_i64();
 
-        tcg_gen_qemu_ld_i64(tmplo, tcg_addr, get_mem_index(s), MO_TEQ);
         tcg_gen_addi_i64(tcg_hiaddr, tcg_addr, 8);
-        tcg_gen_qemu_ld_i64(tmphi, tcg_hiaddr, get_mem_index(s), MO_TEQ);
+        tcg_gen_qemu_ld_i64(tmplo, be ? tcg_hiaddr : tcg_addr, get_mem_index(s),
+                            s->be_data | MO_Q);
+        tcg_gen_qemu_ld_i64(tmphi, be ? tcg_addr : tcg_hiaddr, get_mem_index(s),
+                            s->be_data | MO_Q);
         tcg_temp_free_i64(tcg_hiaddr);
     }
 
@@ -934,7 +951,7 @@ static void clear_vec_high(DisasContext *s, int rd)
 static void do_vec_st(DisasContext *s, int srcidx, int element,
                       TCGv_i64 tcg_addr, int size)
 {
-    TCGMemOp memop = MO_TE + size;
+    TCGMemOp memop = s->be_data + size;
     TCGv_i64 tcg_tmp = tcg_temp_new_i64();
 
     read_vec_element(s, tcg_tmp, srcidx, element, size);
@@ -947,7 +964,7 @@ static void do_vec_st(DisasContext *s, int srcidx, int element,
 static void do_vec_ld(DisasContext *s, int destidx, int element,
                       TCGv_i64 tcg_addr, int size)
 {
-    TCGMemOp memop = MO_TE + size;
+    TCGMemOp memop = s->be_data + size;
     TCGv_i64 tcg_tmp = tcg_temp_new_i64();
 
     tcg_gen_qemu_ld_i64(tcg_tmp, tcg_addr, get_mem_index(s), memop);
@@ -1230,8 +1247,14 @@ static void handle_sync(DisasContext *s, uint32_t insn,
         return;
     case 4: /* DSB */
     case 5: /* DMB */
-    case 6: /* ISB */
         /* We don't emulate caches so barriers are no-ops */
+        return;
+    case 6: /* ISB */
+        /* We need to break the TB after this insn to execute
+         * a self-modified code correctly and also to take
+         * any pending interrupts immediately.
+         */
+        s->is_jmp = DISAS_UPDATE;
         return;
     default:
         unallocated_encoding(s);
@@ -1353,16 +1376,18 @@ static void handle_sys(DisasContext *s, uint32_t insn, bool isread,
          * runtime; this may result in an exception.
          */
         TCGv_ptr tmpptr;
-        TCGv_i32 tcg_syn;
+        TCGv_i32 tcg_syn, tcg_isread;
         uint32_t syndrome;
 
         gen_a64_set_pc_im(s->pc - 4);
         tmpptr = tcg_const_ptr(ri);
         syndrome = syn_aa64_sysregtrap(op0, op1, op2, crn, crm, rt, isread);
         tcg_syn = tcg_const_i32(syndrome);
-        gen_helper_access_check_cp_reg(cpu_env, tmpptr, tcg_syn);
+        tcg_isread = tcg_const_i32(isread);
+        gen_helper_access_check_cp_reg(cpu_env, tmpptr, tcg_syn, tcg_isread);
         tcg_temp_free_ptr(tmpptr);
         tcg_temp_free_i32(tcg_syn);
+        tcg_temp_free_i32(tcg_isread);
     }
 
     /* Handle special cases first */
@@ -1686,7 +1711,7 @@ static void gen_load_exclusive(DisasContext *s, int rt, int rt2,
                                TCGv_i64 addr, int size, bool is_pair)
 {
     TCGv_i64 tmp = tcg_temp_new_i64();
-    TCGMemOp memop = MO_TE + size;
+    TCGMemOp memop = s->be_data + size;
 
     g_assert(size <= 3);
     tcg_gen_qemu_ld_i64(tmp, addr, get_mem_index(s), memop);
@@ -1748,7 +1773,7 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
     tcg_gen_brcond_i64(TCG_COND_NE, addr, cpu_exclusive_addr, fail_label);
 
     tmp = tcg_temp_new_i64();
-    tcg_gen_qemu_ld_i64(tmp, addr, get_mem_index(s), MO_TE + size);
+    tcg_gen_qemu_ld_i64(tmp, addr, get_mem_index(s), s->be_data + size);
     tcg_gen_brcond_i64(TCG_COND_NE, tmp, cpu_exclusive_val, fail_label);
     tcg_temp_free_i64(tmp);
 
@@ -1757,7 +1782,8 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
         TCGv_i64 tmphi = tcg_temp_new_i64();
 
         tcg_gen_addi_i64(addrhi, addr, 1 << size);
-        tcg_gen_qemu_ld_i64(tmphi, addrhi, get_mem_index(s), MO_TE + size);
+        tcg_gen_qemu_ld_i64(tmphi, addrhi, get_mem_index(s),
+                            s->be_data + size);
         tcg_gen_brcond_i64(TCG_COND_NE, tmphi, cpu_exclusive_high, fail_label);
 
         tcg_temp_free_i64(tmphi);
@@ -1765,13 +1791,14 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
     }
 
     /* We seem to still have the exclusive monitor, so do the store */
-    tcg_gen_qemu_st_i64(cpu_reg(s, rt), addr, get_mem_index(s), MO_TE + size);
+    tcg_gen_qemu_st_i64(cpu_reg(s, rt), addr, get_mem_index(s),
+                        s->be_data + size);
     if (is_pair) {
         TCGv_i64 addrhi = tcg_temp_new_i64();
 
         tcg_gen_addi_i64(addrhi, addr, 1 << size);
         tcg_gen_qemu_st_i64(cpu_reg(s, rt2), addrhi,
-                            get_mem_index(s), MO_TE + size);
+                            get_mem_index(s), s->be_data + size);
         tcg_temp_free_i64(addrhi);
     }
 
@@ -1799,9 +1826,6 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
  *  o2: 0 -> exclusive, 1 -> not
  *  o1: 0 -> single register, 1 -> register pair
  *  o0: 1 -> load-acquire/store-release, 0 -> not
- *
- *  o0 == 0 AND o2 == 1 is un-allocated
- *  o1 == 1 is un-allocated except for 32 and 64 bit sizes
  */
 static void disas_ldst_excl(DisasContext *s, uint32_t insn)
 {
@@ -1816,7 +1840,8 @@ static void disas_ldst_excl(DisasContext *s, uint32_t insn)
     int size = extract32(insn, 30, 2);
     TCGv_i64 tcg_addr;
 
-    if ((!is_excl && !is_lasr) ||
+    if ((!is_excl && !is_pair && !is_lasr) ||
+        (!is_excl && is_pair) ||
         (is_pair && size < 2)) {
         unallocated_encoding(s);
         return;
@@ -1844,15 +1869,6 @@ static void disas_ldst_excl(DisasContext *s, uint32_t insn)
             do_gpr_st(s, tcg_rt, tcg_addr, size);
         } else {
             do_gpr_ld(s, tcg_rt, tcg_addr, size, false, false);
-        }
-        if (is_pair) {
-            TCGv_i64 tcg_rt2 = cpu_reg(s, rt);
-            tcg_gen_addi_i64(tcg_addr, tcg_addr, 1 << size);
-            if (is_store) {
-                do_gpr_st(s, tcg_rt2, tcg_addr, size);
-            } else {
-                do_gpr_ld(s, tcg_rt2, tcg_addr, size, false, false);
-            }
         }
     }
 }
@@ -2597,7 +2613,7 @@ static void disas_ldst_single_struct(DisasContext *s, uint32_t insn)
             TCGv_i64 tcg_tmp = tcg_temp_new_i64();
 
             tcg_gen_qemu_ld_i64(tcg_tmp, tcg_addr,
-                                get_mem_index(s), MO_TE + scale);
+                                get_mem_index(s), s->be_data + scale);
             switch (scale) {
             case 0:
                 mulconst = 0x0101010101010101ULL;
@@ -2627,9 +2643,9 @@ static void disas_ldst_single_struct(DisasContext *s, uint32_t insn)
         } else {
             /* Load/store one element per register */
             if (is_load) {
-                do_vec_ld(s, rt, index, tcg_addr, MO_TE + scale);
+                do_vec_ld(s, rt, index, tcg_addr, s->be_data + scale);
             } else {
-                do_vec_st(s, rt, index, tcg_addr, MO_TE + scale);
+                do_vec_st(s, rt, index, tcg_addr, s->be_data + scale);
             }
         }
         tcg_gen_addi_i64(tcg_addr, tcg_addr, ebytes);
@@ -10961,7 +10977,7 @@ static void disas_a64_insn(CPUARMState *env, DisasContext *s)
 {
     uint32_t insn;
 
-    insn = arm_ldl_code(env, s->pc, s->bswap_code);
+    insn = arm_ldl_code(env, s->pc, s->sctlr_b);
     s->insn = insn;
     s->pc += 4;
 
@@ -11000,15 +11016,11 @@ static void disas_a64_insn(CPUARMState *env, DisasContext *s)
     free_tmp_a64(s);
 }
 
-void gen_intermediate_code_internal_a64(ARMCPU *cpu,
-                                        TranslationBlock *tb,
-                                        bool search_pc)
+void gen_intermediate_code_a64(ARMCPU *cpu, TranslationBlock *tb)
 {
     CPUState *cs = CPU(cpu);
     CPUARMState *env = &cpu->env;
     DisasContext dc1, *dc = &dc1;
-    CPUBreakpoint *bp;
-    int j, lj;
     target_ulong pc_start;
     target_ulong next_page_start;
     int num_insns;
@@ -11030,7 +11042,8 @@ void gen_intermediate_code_internal_a64(ARMCPU *cpu,
     dc->secure_routed_to_el3 = arm_feature(env, ARM_FEATURE_EL3) &&
                                !arm_el_is_aa64(env, 3);
     dc->thumb = 0;
-    dc->bswap_code = 0;
+    dc->sctlr_b = 0;
+    dc->be_data = ARM_TBFLAG_BE_DATA(tb->flags) ? MO_BE : MO_LE;
     dc->condexec_mask = 0;
     dc->condexec_cond = 0;
     dc->mmu_idx = ARM_TBFLAG_MMUIDX(tb->flags);
@@ -11067,11 +11080,13 @@ void gen_intermediate_code_internal_a64(ARMCPU *cpu,
     init_tmp_a64_array(dc);
 
     next_page_start = (pc_start & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
-    lj = -1;
     num_insns = 0;
     max_insns = tb->cflags & CF_COUNT_MASK;
     if (max_insns == 0) {
         max_insns = CF_COUNT_MASK;
+    }
+    if (max_insns > TCG_MAX_INSNS) {
+        max_insns = TCG_MAX_INSNS;
     }
 
     gen_tb_start(tb);
@@ -11079,37 +11094,35 @@ void gen_intermediate_code_internal_a64(ARMCPU *cpu,
     tcg_clear_temp_count();
 
     do {
+        tcg_gen_insn_start(dc->pc, 0);
+        num_insns++;
+
         if (unlikely(!QTAILQ_EMPTY(&cs->breakpoints))) {
+            CPUBreakpoint *bp;
             QTAILQ_FOREACH(bp, &cs->breakpoints, entry) {
                 if (bp->pc == dc->pc) {
-                    gen_exception_internal_insn(dc, 0, EXCP_DEBUG);
-                    /* Advance PC so that clearing the breakpoint will
-                       invalidate this TB.  */
-                    dc->pc += 2;
-                    goto done_generating;
+                    if (bp->flags & BP_CPU) {
+                        gen_a64_set_pc_im(dc->pc);
+                        gen_helper_check_breakpoints(cpu_env);
+                        /* End the TB early; it likely won't be executed */
+                        dc->is_jmp = DISAS_UPDATE;
+                    } else {
+                        gen_exception_internal_insn(dc, 0, EXCP_DEBUG);
+                        /* The address covered by the breakpoint must be
+                           included in [tb->pc, tb->pc + tb->size) in order
+                           to for it to be properly cleared -- thus we
+                           increment the PC here so that the logic setting
+                           tb->size below does the right thing.  */
+                        dc->pc += 4;
+                        goto done_generating;
+                    }
+                    break;
                 }
             }
         }
 
-        if (search_pc) {
-            j = tcg_op_buf_count();
-            if (lj < j) {
-                lj++;
-                while (lj < j) {
-                    tcg_ctx.gen_opc_instr_start[lj++] = 0;
-                }
-            }
-            tcg_ctx.gen_opc_pc[lj] = dc->pc;
-            tcg_ctx.gen_opc_instr_start[lj] = 1;
-            tcg_ctx.gen_opc_icount[lj] = num_insns;
-        }
-
-        if (num_insns + 1 == max_insns && (tb->cflags & CF_LAST_IO)) {
+        if (num_insns == max_insns && (tb->cflags & CF_LAST_IO)) {
             gen_io_start();
-        }
-
-        if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT))) {
-            tcg_gen_debug_insn_start(dc->pc);
         }
 
         if (dc->ss_active && !dc->pstate_ss) {
@@ -11123,7 +11136,7 @@ void gen_intermediate_code_internal_a64(ARMCPU *cpu,
              * "did not step an insn" case, and so the syndrome ISV and EX
              * bits should be zero.
              */
-            assert(num_insns == 0);
+            assert(num_insns == 1);
             gen_exception(EXCP_UDEF, syn_swstep(dc->ss_same_el, 0, 0),
                           default_exception_el(dc));
             dc->is_jmp = DISAS_EXC;
@@ -11142,7 +11155,6 @@ void gen_intermediate_code_internal_a64(ARMCPU *cpu,
          * Also stop translation when a page boundary is reached.  This
          * ensures prefetch aborts occur at the right place.
          */
-        num_insns++;
     } while (!dc->is_jmp && !tcg_op_buf_full() &&
              !cs->singlestep_enabled &&
              !singlestep &&
@@ -11213,22 +11225,15 @@ done_generating:
     gen_tb_end(tb, num_insns);
 
 #ifdef DEBUG_DISAS
-    if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)) {
+    if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM) &&
+        qemu_log_in_addr_range(pc_start)) {
         qemu_log("----------------\n");
         qemu_log("IN: %s\n", lookup_symbol(pc_start));
         log_target_disas(cs, pc_start, dc->pc - pc_start,
-                         4 | (dc->bswap_code << 1));
+                         4 | (bswap_code(dc->sctlr_b) ? 2 : 0));
         qemu_log("\n");
     }
 #endif
-    if (search_pc) {
-        j = tcg_op_buf_count();
-        lj++;
-        while (lj <= j) {
-            tcg_ctx.gen_opc_instr_start[lj++] = 0;
-        }
-    } else {
-        tb->size = dc->pc - pc_start;
-        tb->icount = num_insns;
-    }
+    tb->size = dc->pc - pc_start;
+    tb->icount = num_insns;
 }

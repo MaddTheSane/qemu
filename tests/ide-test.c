@@ -22,9 +22,7 @@
  * THE SOFTWARE.
  */
 
-#include <stdint.h>
-#include <string.h>
-#include <stdio.h>
+#include "qemu/osdep.h"
 
 #include <glib.h>
 
@@ -510,9 +508,7 @@ static void test_flush(void)
         tmp_path);
 
     /* Delay the completion of the flush request until we explicitly do it */
-    qmp_discard_response("{'execute':'human-monitor-command', 'arguments': {"
-                         " 'command-line':"
-                         " 'qemu-io ide0-hd0 \"break flush_to_os A\"'} }");
+    g_free(hmp("qemu-io ide0-hd0 \"break flush_to_os A\""));
 
     /* FLUSH CACHE command on device 0*/
     outb(IDE_BASE + reg_device, 0);
@@ -524,9 +520,7 @@ static void test_flush(void)
     assert_bit_clear(data, DF | ERR | DRQ);
 
     /* Complete the command */
-    qmp_discard_response("{'execute':'human-monitor-command', 'arguments': {"
-                         " 'command-line':"
-                         " 'qemu-io ide0-hd0 \"resume A\"'} }");
+    g_free(hmp("qemu-io ide0-hd0 \"resume A\""));
 
     /* Check registers */
     data = inb(IDE_BASE + reg_device);
@@ -597,12 +591,12 @@ static void test_flush_nodev(void)
     ide_test_quit();
 }
 
-static void test_pci_retry_flush(const char *machine)
+static void test_pci_retry_flush(void)
 {
     test_retry_flush("pc");
 }
 
-static void test_isa_retry_flush(const char *machine)
+static void test_isa_retry_flush(void)
 {
     test_retry_flush("isapc");
 }
@@ -633,7 +627,7 @@ static void send_scsi_cdb_read10(uint64_t lba, int nblocks)
 
     /* Send Packet */
     for (i = 0; i < sizeof(Read10CDB)/2; i++) {
-        outw(IDE_BASE + reg_data, ((uint16_t *)&pkt)[i]);
+        outw(IDE_BASE + reg_data, cpu_to_le16(((uint16_t *)&pkt)[i]));
     }
 }
 
@@ -646,14 +640,18 @@ static void nsleep(int64_t nsecs)
 
 static uint8_t ide_wait_clear(uint8_t flag)
 {
-    int i;
     uint8_t data;
+    time_t st;
 
     /* Wait with a 5 second timeout */
-    for (i = 0; i <= 12500000; i++) {
+    time(&st);
+    while (true) {
         data = inb(IDE_BASE + reg_status);
         if (!(data & flag)) {
             return data;
+        }
+        if (difftime(time(NULL), st) > 5.0) {
+            break;
         }
         nsleep(400);
     }
@@ -662,13 +660,17 @@ static uint8_t ide_wait_clear(uint8_t flag)
 
 static void ide_wait_intr(int irq)
 {
-    int i;
+    time_t st;
     bool intr;
 
-    for (i = 0; i <= 12500000; i++) {
+    time(&st);
+    while (true) {
         intr = get_irq(irq);
         if (intr) {
             return;
+        }
+        if (difftime(time(NULL), st) > 5.0) {
+            break;
         }
         nsleep(400);
     }
@@ -703,23 +705,15 @@ static void cdrom_pio_impl(int nblocks)
     outb(IDE_BASE + reg_lba_middle, BYTE_COUNT_LIMIT & 0xFF);
     outb(IDE_BASE + reg_lba_high, (BYTE_COUNT_LIMIT >> 8 & 0xFF));
     outb(IDE_BASE + reg_command, CMD_PACKET);
-    /* HPD0: Check_Status_A State */
+    /* HP0: Check_Status_A State */
     nsleep(400);
     data = ide_wait_clear(BSY);
-    /* HPD1: Send_Packet State */
+    /* HP1: Send_Packet State */
     assert_bit_set(data, DRQ | DRDY);
     assert_bit_clear(data, ERR | DF | BSY);
 
     /* SCSI CDB (READ10) -- read n*2048 bytes from block 0 */
     send_scsi_cdb_read10(0, nblocks);
-
-    /* HPD3: INTRQ_Wait */
-    ide_wait_intr(IDE_PRIMARY_IRQ);
-
-    /* HPD2: Check_Status_B */
-    data = ide_wait_clear(BSY);
-    assert_bit_set(data, DRQ | DRDY);
-    assert_bit_clear(data, ERR | DF | BSY);
 
     /* Read data back: occurs in bursts of 'BYTE_COUNT_LIMIT' bytes.
      * If BYTE_COUNT_LIMIT is odd, we transfer BYTE_COUNT_LIMIT - 1 bytes.
@@ -732,11 +726,25 @@ static void cdrom_pio_impl(int nblocks)
     for (i = 0; i < DIV_ROUND_UP(rxsize, limit); i++) {
         size_t offset = i * (limit / 2);
         size_t rem = (rxsize / 2) - offset;
-        for (j = 0; j < MIN((limit / 2), rem); j++) {
-            rx[offset + j] = inw(IDE_BASE + reg_data);
-        }
+
+        /* HP3: INTRQ_Wait */
         ide_wait_intr(IDE_PRIMARY_IRQ);
+
+        /* HP2: Check_Status_B (and clear IRQ) */
+        data = ide_wait_clear(BSY);
+        assert_bit_set(data, DRQ | DRDY);
+        assert_bit_clear(data, ERR | DF | BSY);
+
+        /* HP4: Transfer_Data */
+        for (j = 0; j < MIN((limit / 2), rem); j++) {
+            rx[offset + j] = le16_to_cpu(inw(IDE_BASE + reg_data));
+        }
     }
+
+    /* Check for final completion IRQ */
+    ide_wait_intr(IDE_PRIMARY_IRQ);
+
+    /* Sanity check final state */
     data = ide_wait_clear(DRQ);
     assert_bit_set(data, DRDY);
     assert_bit_clear(data, DRQ | ERR | DF | BSY);

@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "sysemu/sysemu.h"
@@ -34,7 +35,7 @@ uint64_t helper_load_pcc(CPUAlphaState *env)
 #else
     /* In user-mode, QEMU_CLOCK_VIRTUAL doesn't exist.  Just pass through the host cpu
        clock ticks.  Also, don't bother taking PCC_OFS into account.  */
-    return (uint32_t)cpu_get_real_ticks();
+    return (uint32_t)cpu_get_host_ticks();
 #endif
 }
 

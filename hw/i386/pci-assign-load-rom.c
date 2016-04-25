@@ -1,10 +1,8 @@
 /*
  * This is splited from hw/i386/kvm/pci-assign.c
  */
-#include <stdio.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/hw.h"
 #include "hw/i386/pc.h"
 #include "qemu/error-report.h"
@@ -45,14 +43,10 @@ void *pci_assign_dev_load_option_rom(PCIDevice *dev, struct Object *owner,
         return NULL;
     }
 
-    if (access(rom_file, F_OK)) {
-        error_report("pci-assign: Insufficient privileges for %s", rom_file);
-        return NULL;
-    }
-
     /* Write "1" to the ROM file to enable it */
     fp = fopen(rom_file, "r+");
     if (fp == NULL) {
+        error_report("pci-assign: Cannot open %s: %s", rom_file, strerror(errno));
         return NULL;
     }
     val = 1;

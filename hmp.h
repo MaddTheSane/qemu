@@ -69,6 +69,7 @@ void hmp_migrate_set_capability(Monitor *mon, const QDict *qdict);
 void hmp_migrate_set_parameter(Monitor *mon, const QDict *qdict);
 void hmp_migrate_set_cache_size(Monitor *mon, const QDict *qdict);
 void hmp_client_migrate_info(Monitor *mon, const QDict *qdict);
+void hmp_migrate_start_postcopy(Monitor *mon, const QDict *qdict);
 void hmp_set_password(Monitor *mon, const QDict *qdict);
 void hmp_expire_password(Monitor *mon, const QDict *qdict);
 void hmp_eject(Monitor *mon, const QDict *qdict);
@@ -130,5 +131,6 @@ void hmp_rocker(Monitor *mon, const QDict *qdict);
 void hmp_rocker_ports(Monitor *mon, const QDict *qdict);
 void hmp_rocker_of_dpa_flows(Monitor *mon, const QDict *qdict);
 void hmp_rocker_of_dpa_groups(Monitor *mon, const QDict *qdict);
+void hmp_info_dump(Monitor *mon, const QDict *qdict);
 
 #endif

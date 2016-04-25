@@ -8,6 +8,7 @@
  *
  */
 
+#include "qemu/osdep.h"
 #include "clients.h"
 #include "net/vhost_net.h"
 #include "net/vhost-user.h"
@@ -15,6 +16,7 @@
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
 #include "qmp-commands.h"
+#include "trace.h"
 
 typedef struct VhostUserState {
     NetClientState nc;
@@ -25,7 +27,6 @@ typedef struct VhostUserState {
 typedef struct VhostUserChardevProps {
     bool is_socket;
     bool is_unix;
-    bool is_server;
 } VhostUserChardevProps;
 
 VHostNetState *vhost_user_get_vhost_net(NetClientState *nc)
@@ -81,15 +82,15 @@ static int vhost_user_start(int queues, NetClientState *ncs[])
         options.opaque      = s->chr;
         s->vhost_net = vhost_net_init(&options);
         if (!s->vhost_net) {
-            error_report("failed to init vhost_net for queue %d\n", i);
+            error_report("failed to init vhost_net for queue %d", i);
             goto err;
         }
 
         if (i == 0) {
             max_queues = vhost_net_get_max_queues(s->vhost_net);
             if (queues > max_queues) {
-                error_report("you are asking more queues than "
-                             "supported: %d\n", max_queues);
+                error_report("you are asking more queues than supported: %d",
+                             max_queues);
                 goto err;
             }
         }
@@ -100,6 +101,35 @@ static int vhost_user_start(int queues, NetClientState *ncs[])
 err:
     vhost_user_stop(i + 1, ncs);
     return -1;
+}
+
+static ssize_t vhost_user_receive(NetClientState *nc, const uint8_t *buf,
+                                  size_t size)
+{
+    /* In case of RARP (message size is 60) notify backup to send a fake RARP.
+       This fake RARP will be sent by backend only for guest
+       without GUEST_ANNOUNCE capability.
+     */
+    if (size == 60) {
+        VhostUserState *s = DO_UPCAST(VhostUserState, nc, nc);
+        int r;
+        static int display_rarp_failure = 1;
+        char mac_addr[6];
+
+        /* extract guest mac address from the RARP message */
+        memcpy(mac_addr, &buf[6], 6);
+
+        r = vhost_net_notify_migration_done(s->vhost_net, mac_addr);
+
+        if ((r != 0) && (display_rarp_failure)) {
+            fprintf(stderr,
+                    "Vhost user backend fails to broadcast fake RARP\n");
+            fflush(stderr);
+            display_rarp_failure = 0;
+        }
+    }
+
+    return size;
 }
 
 static void vhost_user_cleanup(NetClientState *nc)
@@ -131,6 +161,7 @@ static bool vhost_user_has_ufo(NetClientState *nc)
 static NetClientInfo net_vhost_user_info = {
         .type = NET_CLIENT_OPTIONS_KIND_VHOST_USER,
         .size = sizeof(VhostUserState),
+        .receive = vhost_user_receive,
         .cleanup = vhost_user_cleanup,
         .has_vnet_hdr = vhost_user_has_vnet_hdr,
         .has_ufo = vhost_user_has_ufo,
@@ -147,19 +178,20 @@ static void net_vhost_user_event(void *opaque, int event)
     queues = qemu_find_net_clients_except(name, ncs,
                                           NET_CLIENT_OPTIONS_KIND_NIC,
                                           MAX_QUEUE_NUM);
+    assert(queues < MAX_QUEUE_NUM);
+
     s = DO_UPCAST(VhostUserState, nc, ncs[0]);
+    trace_vhost_user_event(s->chr->label, event);
     switch (event) {
     case CHR_EVENT_OPENED:
         if (vhost_user_start(queues, ncs) < 0) {
             exit(1);
         }
         qmp_set_link(name, true, &err);
-        error_report("chardev \"%s\" went up", s->chr->label);
         break;
     case CHR_EVENT_CLOSED:
-        qmp_set_link(name, true, &err);
+        qmp_set_link(name, false, &err);
         vhost_user_stop(queues, ncs);
-        error_report("chardev \"%s\" went down", s->chr->label);
         break;
     }
 
@@ -176,21 +208,22 @@ static int net_vhost_user_init(NetClientState *peer, const char *device,
     VhostUserState *s;
     int i;
 
+    assert(name);
+    assert(queues > 0);
+
     for (i = 0; i < queues; i++) {
         nc = qemu_new_net_client(&net_vhost_user_info, peer, device, name);
 
         snprintf(nc->info_str, sizeof(nc->info_str), "vhost-user%d to %s",
                  i, chr->label);
 
-        /* We don't provide a receive callback */
-        nc->receive_disabled = 1;
         nc->queue_index = i;
 
         s = DO_UPCAST(VhostUserState, nc, nc);
         s->chr = chr;
     }
 
-    qemu_chr_add_handlers(chr, NULL, NULL, net_vhost_user_event, (void*)name);
+    qemu_chr_add_handlers(chr, NULL, NULL, net_vhost_user_event, nc[0].name);
 
     return 0;
 }
@@ -206,7 +239,6 @@ static int net_vhost_chardev_opts(void *opaque,
     } else if (strcmp(name, "path") == 0) {
         props->is_unix = true;
     } else if (strcmp(name, "server") == 0) {
-        props->is_server = true;
     } else {
         error_setg(errp,
                    "vhost-user does not support a chardev with option %s=%s",
@@ -273,8 +305,8 @@ int net_init_vhost_user(const NetClientOptions *opts, const char *name,
     const NetdevVhostUserOptions *vhost_user_opts;
     CharDriverState *chr;
 
-    assert(opts->kind == NET_CLIENT_OPTIONS_KIND_VHOST_USER);
-    vhost_user_opts = opts->vhost_user;
+    assert(opts->type == NET_CLIENT_OPTIONS_KIND_VHOST_USER);
+    vhost_user_opts = opts->u.vhost_user.data;
 
     chr = net_vhost_parse_chardev(vhost_user_opts, errp);
     if (!chr) {
@@ -288,6 +320,12 @@ int net_init_vhost_user(const NetClientOptions *opts, const char *name,
     }
 
     queues = vhost_user_opts->has_queues ? vhost_user_opts->queues : 1;
+    if (queues < 1 || queues > MAX_QUEUE_NUM) {
+        error_setg(errp,
+                   "vhost-user number of queues must be in range [1, %d]",
+                   MAX_QUEUE_NUM);
+        return -1;
+    }
 
     return net_vhost_user_init(peer, "vhost_user", name, chr, queues);
 }

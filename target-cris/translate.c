@@ -23,6 +23,7 @@
  * The condition code translation is in need of attention.
  */
 
+#include "qemu/osdep.h"
 #include "cpu.h"
 #include "disas/disas.h"
 #include "tcg-op.h"
@@ -34,6 +35,7 @@
 #include "exec/helper-gen.h"
 
 #include "trace-tcg.h"
+#include "exec/log.h"
 
 
 #define DISAS_CRIS 0
@@ -58,7 +60,7 @@
 #define CC_MASK_NZVC 0xf
 #define CC_MASK_RNZV 0x10e
 
-static TCGv_ptr cpu_env;
+static TCGv_env cpu_env;
 static TCGv cpu_R[16];
 static TCGv cpu_PR[16];
 static TCGv cc_x;
@@ -130,8 +132,10 @@ typedef struct DisasContext {
 
 static void gen_BUG(DisasContext *dc, const char *file, int line)
 {
-    printf("BUG: pc=%x %s %d\n", dc->pc, file, line);
-    qemu_log("BUG: pc=%x %s %d\n", dc->pc, file, line);
+    fprintf(stderr, "BUG: pc=%x %s %d\n", dc->pc, file, line);
+    if (qemu_log_separate()) {
+        qemu_log("BUG: pc=%x %s %d\n", dc->pc, file, line);
+    }
     cpu_abort(CPU(dc->cpu), "%s:%d\n", file, line);
 }
 
@@ -777,7 +781,7 @@ static void cris_alu_op_exec(DisasContext *dc, int op,
         t_gen_subx_carry(dc, dst);
         break;
     default:
-        qemu_log("illegal ALU op.\n");
+        qemu_log_mask(LOG_GUEST_ERROR, "illegal ALU op.\n");
         BUG();
         break;
     }
@@ -2994,10 +2998,6 @@ static unsigned int crisv32_decoder(CPUCRISState *env, DisasContext *dc)
     int insn_len = 2;
     int i;
 
-    if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT))) {
-        tcg_gen_debug_insn_start(dc->pc);
-        }
-
     /* Load a halfword onto the instruction register.  */
         dc->ir = cris_fetch(env, dc, dc->pc, 2, 0);
 
@@ -3032,23 +3032,6 @@ static unsigned int crisv32_decoder(CPUCRISState *env, DisasContext *dc)
     }
 #endif
     return insn_len;
-}
-
-static void check_breakpoint(CPUCRISState *env, DisasContext *dc)
-{
-    CPUState *cs = CPU(cris_env_get_cpu(env));
-    CPUBreakpoint *bp;
-
-    if (unlikely(!QTAILQ_EMPTY(&cs->breakpoints))) {
-        QTAILQ_FOREACH(bp, &cs->breakpoints, entry) {
-            if (bp->pc == dc->pc) {
-                cris_evaluate_flags(dc);
-                tcg_gen_movi_tl(env_pc, dc->pc);
-                t_gen_raise_exception(EXCP_DEBUG);
-                dc->is_jmp = DISAS_UPDATE;
-            }
-        }
-    }
 }
 
 #include "translate_v10.c"
@@ -3088,15 +3071,12 @@ static void check_breakpoint(CPUCRISState *env, DisasContext *dc)
  */
 
 /* generate intermediate code for basic block 'tb'.  */
-static inline void
-gen_intermediate_code_internal(CRISCPU *cpu, TranslationBlock *tb,
-                               bool search_pc)
+void gen_intermediate_code(CPUCRISState *env, struct TranslationBlock *tb)
 {
+    CRISCPU *cpu = cris_env_get_cpu(env);
     CPUState *cs = CPU(cpu);
-    CPUCRISState *env = &cpu->env;
     uint32_t pc_start;
     unsigned int insn_len;
-    int j, lj;
     struct DisasContext ctx;
     struct DisasContext *dc = &ctx;
     uint32_t next_page_start;
@@ -3148,13 +3128,13 @@ gen_intermediate_code_internal(CRISCPU *cpu, TranslationBlock *tb,
 
     if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)) {
         qemu_log(
-                "srch=%d pc=%x %x flg=%" PRIx64 " bt=%x ds=%u ccs=%x\n"
+                "pc=%x %x flg=%" PRIx64 " bt=%x ds=%u ccs=%x\n"
                 "pid=%x usp=%x\n"
                 "%x.%x.%x.%x\n"
                 "%x.%x.%x.%x\n"
                 "%x.%x.%x.%x\n"
                 "%x.%x.%x.%x\n",
-                search_pc, dc->pc, dc->ppc,
+                dc->pc, dc->ppc,
                 (uint64_t)tb->flags,
                 env->btarget, (unsigned)tb->flags & 7,
                 env->pregs[PR_CCS],
@@ -3170,38 +3150,38 @@ gen_intermediate_code_internal(CRISCPU *cpu, TranslationBlock *tb,
     }
 
     next_page_start = (pc_start & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
-    lj = -1;
     num_insns = 0;
     max_insns = tb->cflags & CF_COUNT_MASK;
     if (max_insns == 0) {
         max_insns = CF_COUNT_MASK;
     }
+    if (max_insns > TCG_MAX_INSNS) {
+        max_insns = TCG_MAX_INSNS;
+    }
 
     gen_tb_start(tb);
     do {
-        check_breakpoint(env, dc);
+        tcg_gen_insn_start(dc->delayed_branch == 1
+                           ? dc->ppc | 1 : dc->pc);
+        num_insns++;
 
-        if (search_pc) {
-            j = tcg_op_buf_count();
-            if (lj < j) {
-                lj++;
-                while (lj < j) {
-                    tcg_ctx.gen_opc_instr_start[lj++] = 0;
-                }
-            }
-            if (dc->delayed_branch == 1) {
-                tcg_ctx.gen_opc_pc[lj] = dc->ppc | 1;
-            } else {
-                tcg_ctx.gen_opc_pc[lj] = dc->pc;
-            }
-            tcg_ctx.gen_opc_instr_start[lj] = 1;
-            tcg_ctx.gen_opc_icount[lj] = num_insns;
+        if (unlikely(cpu_breakpoint_test(cs, dc->pc, BP_ANY))) {
+            cris_evaluate_flags(dc);
+            tcg_gen_movi_tl(env_pc, dc->pc);
+            t_gen_raise_exception(EXCP_DEBUG);
+            dc->is_jmp = DISAS_UPDATE;
+            /* The address covered by the breakpoint must be included in
+               [tb->pc, tb->pc + tb->size) in order to for it to be
+               properly cleared -- thus we increment the PC here so that
+               the logic setting tb->size below does the right thing.  */
+            dc->pc += 2;
+            break;
         }
 
         /* Pretty disas.  */
         LOG_DIS("%8.8x:\t", dc->pc);
 
-        if (num_insns + 1 == max_insns && (tb->cflags & CF_LAST_IO)) {
+        if (num_insns == max_insns && (tb->cflags & CF_LAST_IO)) {
             gen_io_start();
         }
         dc->clear_x = 1;
@@ -3213,7 +3193,6 @@ gen_intermediate_code_internal(CRISCPU *cpu, TranslationBlock *tb,
             cris_clear_x_flag(dc);
         }
 
-        num_insns++;
         /* Check for delayed branches here. If we do it before
            actually generating any host code, the simulator will just
            loop doing nothing for on this program location.  */
@@ -3318,16 +3297,8 @@ gen_intermediate_code_internal(CRISCPU *cpu, TranslationBlock *tb,
     }
     gen_tb_end(tb, num_insns);
 
-    if (search_pc) {
-        j = tcg_op_buf_count();
-        lj++;
-        while (lj <= j) {
-            tcg_ctx.gen_opc_instr_start[lj++] = 0;
-        }
-    } else {
-        tb->size = dc->pc - pc_start;
-        tb->icount = num_insns;
-    }
+    tb->size = dc->pc - pc_start;
+    tb->icount = num_insns;
 
 #ifdef DEBUG_DISAS
 #if !DISAS_CRIS
@@ -3339,16 +3310,6 @@ gen_intermediate_code_internal(CRISCPU *cpu, TranslationBlock *tb,
     }
 #endif
 #endif
-}
-
-void gen_intermediate_code (CPUCRISState *env, struct TranslationBlock *tb)
-{
-    gen_intermediate_code_internal(cris_env_get_cpu(env), tb, false);
-}
-
-void gen_intermediate_code_pc (CPUCRISState *env, struct TranslationBlock *tb)
-{
-    gen_intermediate_code_internal(cris_env_get_cpu(env), tb, true);
 }
 
 void cris_cpu_dump_state(CPUState *cs, FILE *f, fprintf_function cpu_fprintf,
@@ -3403,47 +3364,48 @@ void cris_initialize_tcg(void)
     int i;
 
     cpu_env = tcg_global_reg_new_ptr(TCG_AREG0, "env");
-    cc_x = tcg_global_mem_new(TCG_AREG0,
+    cc_x = tcg_global_mem_new(cpu_env,
                               offsetof(CPUCRISState, cc_x), "cc_x");
-    cc_src = tcg_global_mem_new(TCG_AREG0,
+    cc_src = tcg_global_mem_new(cpu_env,
                                 offsetof(CPUCRISState, cc_src), "cc_src");
-    cc_dest = tcg_global_mem_new(TCG_AREG0,
+    cc_dest = tcg_global_mem_new(cpu_env,
                                  offsetof(CPUCRISState, cc_dest),
                                  "cc_dest");
-    cc_result = tcg_global_mem_new(TCG_AREG0,
+    cc_result = tcg_global_mem_new(cpu_env,
                                    offsetof(CPUCRISState, cc_result),
                                    "cc_result");
-    cc_op = tcg_global_mem_new(TCG_AREG0,
+    cc_op = tcg_global_mem_new(cpu_env,
                                offsetof(CPUCRISState, cc_op), "cc_op");
-    cc_size = tcg_global_mem_new(TCG_AREG0,
+    cc_size = tcg_global_mem_new(cpu_env,
                                  offsetof(CPUCRISState, cc_size),
                                  "cc_size");
-    cc_mask = tcg_global_mem_new(TCG_AREG0,
+    cc_mask = tcg_global_mem_new(cpu_env,
                                  offsetof(CPUCRISState, cc_mask),
                                  "cc_mask");
 
-    env_pc = tcg_global_mem_new(TCG_AREG0,
+    env_pc = tcg_global_mem_new(cpu_env,
                                 offsetof(CPUCRISState, pc),
                                 "pc");
-    env_btarget = tcg_global_mem_new(TCG_AREG0,
+    env_btarget = tcg_global_mem_new(cpu_env,
                                      offsetof(CPUCRISState, btarget),
                                      "btarget");
-    env_btaken = tcg_global_mem_new(TCG_AREG0,
+    env_btaken = tcg_global_mem_new(cpu_env,
                                     offsetof(CPUCRISState, btaken),
                                     "btaken");
     for (i = 0; i < 16; i++) {
-        cpu_R[i] = tcg_global_mem_new(TCG_AREG0,
+        cpu_R[i] = tcg_global_mem_new(cpu_env,
                                       offsetof(CPUCRISState, regs[i]),
                                       regnames[i]);
     }
     for (i = 0; i < 16; i++) {
-        cpu_PR[i] = tcg_global_mem_new(TCG_AREG0,
+        cpu_PR[i] = tcg_global_mem_new(cpu_env,
                                        offsetof(CPUCRISState, pregs[i]),
                                        pregnames[i]);
     }
 }
 
-void restore_state_to_opc(CPUCRISState *env, TranslationBlock *tb, int pc_pos)
+void restore_state_to_opc(CPUCRISState *env, TranslationBlock *tb,
+                          target_ulong *data)
 {
-    env->pc = tcg_ctx.gen_opc_pc[pc_pos];
+    env->pc = data[0];
 }

@@ -28,6 +28,7 @@
 #  define LOG_DISAS(...) do { } while (0)
 #endif
 
+#include "qemu/osdep.h"
 #include "cpu.h"
 #include "disas/disas.h"
 #include "tcg-op.h"
@@ -36,13 +37,14 @@
 #include "exec/cpu_ldst.h"
 
 /* global register indexes */
-static TCGv_ptr cpu_env;
+static TCGv_env cpu_env;
 
 #include "exec/gen-icount.h"
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
 
 #include "trace-tcg.h"
+#include "exec/log.h"
 
 
 /* Information that (most) every instruction needs to manipulate.  */
@@ -124,7 +126,7 @@ void s390_cpu_dump_state(CPUState *cs, FILE *f, fprintf_function cpu_fprintf,
     for (i = 0; i < 32; i++) {
         cpu_fprintf(f, "V%02d=%016" PRIx64 "%016" PRIx64, i,
                     env->vregs[i][0].ll, env->vregs[i][1].ll);
-        cpu_fprintf(f, (i % 2) ? " " : "\n");
+        cpu_fprintf(f, (i % 2) ? "\n" : " ");
     }
 
 #ifndef CONFIG_USER_ONLY
@@ -161,42 +163,40 @@ static char cpu_reg_names[32][4];
 static TCGv_i64 regs[16];
 static TCGv_i64 fregs[16];
 
-static uint8_t gen_opc_cc_op[OPC_BUF_SIZE];
-
 void s390x_translate_init(void)
 {
     int i;
 
     cpu_env = tcg_global_reg_new_ptr(TCG_AREG0, "env");
-    psw_addr = tcg_global_mem_new_i64(TCG_AREG0,
+    psw_addr = tcg_global_mem_new_i64(cpu_env,
                                       offsetof(CPUS390XState, psw.addr),
                                       "psw_addr");
-    psw_mask = tcg_global_mem_new_i64(TCG_AREG0,
+    psw_mask = tcg_global_mem_new_i64(cpu_env,
                                       offsetof(CPUS390XState, psw.mask),
                                       "psw_mask");
-    gbea = tcg_global_mem_new_i64(TCG_AREG0,
+    gbea = tcg_global_mem_new_i64(cpu_env,
                                   offsetof(CPUS390XState, gbea),
                                   "gbea");
 
-    cc_op = tcg_global_mem_new_i32(TCG_AREG0, offsetof(CPUS390XState, cc_op),
+    cc_op = tcg_global_mem_new_i32(cpu_env, offsetof(CPUS390XState, cc_op),
                                    "cc_op");
-    cc_src = tcg_global_mem_new_i64(TCG_AREG0, offsetof(CPUS390XState, cc_src),
+    cc_src = tcg_global_mem_new_i64(cpu_env, offsetof(CPUS390XState, cc_src),
                                     "cc_src");
-    cc_dst = tcg_global_mem_new_i64(TCG_AREG0, offsetof(CPUS390XState, cc_dst),
+    cc_dst = tcg_global_mem_new_i64(cpu_env, offsetof(CPUS390XState, cc_dst),
                                     "cc_dst");
-    cc_vr = tcg_global_mem_new_i64(TCG_AREG0, offsetof(CPUS390XState, cc_vr),
+    cc_vr = tcg_global_mem_new_i64(cpu_env, offsetof(CPUS390XState, cc_vr),
                                    "cc_vr");
 
     for (i = 0; i < 16; i++) {
         snprintf(cpu_reg_names[i], sizeof(cpu_reg_names[0]), "r%d", i);
-        regs[i] = tcg_global_mem_new(TCG_AREG0,
+        regs[i] = tcg_global_mem_new(cpu_env,
                                      offsetof(CPUS390XState, regs[i]),
                                      cpu_reg_names[i]);
     }
 
     for (i = 0; i < 16; i++) {
         snprintf(cpu_reg_names[i + 16], sizeof(cpu_reg_names[0]), "f%d", i);
-        fregs[i] = tcg_global_mem_new(TCG_AREG0,
+        fregs[i] = tcg_global_mem_new(cpu_env,
                                       offsetof(CPUS390XState, vregs[i][0].d),
                                       cpu_reg_names[i + 16]);
     }
@@ -5319,18 +5319,14 @@ static ExitStatus translate_one(CPUS390XState *env, DisasContext *s)
     return ret;
 }
 
-static inline void gen_intermediate_code_internal(S390CPU *cpu,
-                                                  TranslationBlock *tb,
-                                                  bool search_pc)
+void gen_intermediate_code(CPUS390XState *env, struct TranslationBlock *tb)
 {
+    S390CPU *cpu = s390_env_get_cpu(env);
     CPUState *cs = CPU(cpu);
-    CPUS390XState *env = &cpu->env;
     DisasContext dc;
     target_ulong pc_start;
     uint64_t next_page_start;
-    int j, lj = -1;
     int num_insns, max_insns;
-    CPUBreakpoint *bp;
     ExitStatus status;
     bool do_debug;
 
@@ -5353,41 +5349,32 @@ static inline void gen_intermediate_code_internal(S390CPU *cpu,
     if (max_insns == 0) {
         max_insns = CF_COUNT_MASK;
     }
+    if (max_insns > TCG_MAX_INSNS) {
+        max_insns = TCG_MAX_INSNS;
+    }
 
     gen_tb_start(tb);
 
     do {
-        if (search_pc) {
-            j = tcg_op_buf_count();
-            if (lj < j) {
-                lj++;
-                while (lj < j) {
-                    tcg_ctx.gen_opc_instr_start[lj++] = 0;
-                }
-            }
-            tcg_ctx.gen_opc_pc[lj] = dc.pc;
-            gen_opc_cc_op[lj] = dc.cc_op;
-            tcg_ctx.gen_opc_instr_start[lj] = 1;
-            tcg_ctx.gen_opc_icount[lj] = num_insns;
+        tcg_gen_insn_start(dc.pc, dc.cc_op);
+        num_insns++;
+
+        if (unlikely(cpu_breakpoint_test(cs, dc.pc, BP_ANY))) {
+            status = EXIT_PC_STALE;
+            do_debug = true;
+            /* The address covered by the breakpoint must be included in
+               [tb->pc, tb->pc + tb->size) in order to for it to be
+               properly cleared -- thus we increment the PC here so that
+               the logic setting tb->size below does the right thing.  */
+            dc.pc += 2;
+            break;
         }
-        if (++num_insns == max_insns && (tb->cflags & CF_LAST_IO)) {
+
+        if (num_insns == max_insns && (tb->cflags & CF_LAST_IO)) {
             gen_io_start();
         }
 
-        if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT))) {
-            tcg_gen_debug_insn_start(dc.pc);
-        }
-
         status = NO_EXIT;
-        if (unlikely(!QTAILQ_EMPTY(&cs->breakpoints))) {
-            QTAILQ_FOREACH(bp, &cs->breakpoints, entry) {
-                if (bp->pc == dc.pc) {
-                    status = EXIT_PC_STALE;
-                    do_debug = true;
-                    break;
-                }
-            }
-        }
         if (status == NO_EXIT) {
             status = translate_one(env, &dc);
         }
@@ -5432,16 +5419,8 @@ static inline void gen_intermediate_code_internal(S390CPU *cpu,
 
     gen_tb_end(tb, num_insns);
 
-    if (search_pc) {
-        j = tcg_op_buf_count();
-        lj++;
-        while (lj <= j) {
-            tcg_ctx.gen_opc_instr_start[lj++] = 0;
-        }
-    } else {
-        tb->size = dc.pc - pc_start;
-        tb->icount = num_insns;
-    }
+    tb->size = dc.pc - pc_start;
+    tb->icount = num_insns;
 
 #if defined(S390X_DEBUG_DISAS)
     if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)) {
@@ -5452,21 +5431,11 @@ static inline void gen_intermediate_code_internal(S390CPU *cpu,
 #endif
 }
 
-void gen_intermediate_code (CPUS390XState *env, struct TranslationBlock *tb)
+void restore_state_to_opc(CPUS390XState *env, TranslationBlock *tb,
+                          target_ulong *data)
 {
-    gen_intermediate_code_internal(s390_env_get_cpu(env), tb, false);
-}
-
-void gen_intermediate_code_pc (CPUS390XState *env, struct TranslationBlock *tb)
-{
-    gen_intermediate_code_internal(s390_env_get_cpu(env), tb, true);
-}
-
-void restore_state_to_opc(CPUS390XState *env, TranslationBlock *tb, int pc_pos)
-{
-    int cc_op;
-    env->psw.addr = tcg_ctx.gen_opc_pc[pc_pos];
-    cc_op = gen_opc_cc_op[pc_pos];
+    int cc_op = data[1];
+    env->psw.addr = data[0];
     if ((cc_op != CC_OP_DYNAMIC) && (cc_op != CC_OP_STATIC)) {
         env->cc_op = cc_op;
     }

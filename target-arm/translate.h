@@ -16,7 +16,8 @@ typedef struct DisasContext {
     struct TranslationBlock *tb;
     int singlestep_enabled;
     int thumb;
-    int bswap_code;
+    int sctlr_b;
+    TCGMemOp be_data;
 #if !defined(CONFIG_USER_ONLY)
     int user;
 #endif
@@ -70,7 +71,7 @@ typedef struct DisasCompare {
 } DisasCompare;
 
 /* Share the TCG temporaries common between 32 and 64 bit modes.  */
-extern TCGv_ptr cpu_env;
+extern TCGv_env cpu_env;
 extern TCGv_i32 cpu_NF, cpu_ZF, cpu_CF, cpu_VF;
 extern TCGv_i64 cpu_exclusive_addr;
 extern TCGv_i64 cpu_exclusive_val;
@@ -122,9 +123,7 @@ static inline int default_exception_el(DisasContext *s)
 
 #ifdef TARGET_AARCH64
 void a64_translate_init(void);
-void gen_intermediate_code_internal_a64(ARMCPU *cpu,
-                                        TranslationBlock *tb,
-                                        bool search_pc);
+void gen_intermediate_code_a64(ARMCPU *cpu, TranslationBlock *tb);
 void gen_a64_set_pc_im(uint64_t val);
 void aarch64_cpu_dump_state(CPUState *cs, FILE *f,
                             fprintf_function cpu_fprintf, int flags);
@@ -133,9 +132,7 @@ static inline void a64_translate_init(void)
 {
 }
 
-static inline void gen_intermediate_code_internal_a64(ARMCPU *cpu,
-                                                      TranslationBlock *tb,
-                                                      bool search_pc)
+static inline void gen_intermediate_code_a64(ARMCPU *cpu, TranslationBlock *tb)
 {
 }
 

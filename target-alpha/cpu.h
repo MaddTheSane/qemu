@@ -20,7 +20,6 @@
 #if !defined (__CPU_ALPHA_H__)
 #define __CPU_ALPHA_H__
 
-#include "config.h"
 #include "qemu-common.h"
 
 #define TARGET_LONG_BITS 64
@@ -287,7 +286,6 @@ struct CPUAlphaState {
 
 #define cpu_list alpha_cpu_list
 #define cpu_exec cpu_alpha_exec
-#define cpu_gen_code cpu_alpha_gen_code
 #define cpu_signal_handler cpu_alpha_signal_handler
 
 #include "exec/cpu-all.h"

@@ -700,17 +700,53 @@ static inline void tcg_gen_concat32_i64(TCGv_i64 ret, TCGv_i64 lo, TCGv_i64 hi)
 #error must include QEMU headers
 #endif
 
-/* debug info: write the PC of the corresponding QEMU CPU instruction */
-static inline void tcg_gen_debug_insn_start(uint64_t pc)
+#if TARGET_INSN_START_WORDS == 1
+# if TARGET_LONG_BITS <= TCG_TARGET_REG_BITS
+static inline void tcg_gen_insn_start(target_ulong pc)
 {
-    /* XXX: must really use a 32 bit size for TCGArg in all cases */
-#if TARGET_LONG_BITS > TCG_TARGET_REG_BITS
-    tcg_gen_op2ii(INDEX_op_debug_insn_start,
-                  (uint32_t)(pc), (uint32_t)(pc >> 32));
-#else
-    tcg_gen_op1i(INDEX_op_debug_insn_start, pc);
-#endif
+    tcg_gen_op1(&tcg_ctx, INDEX_op_insn_start, pc);
 }
+# else
+static inline void tcg_gen_insn_start(target_ulong pc)
+{
+    tcg_gen_op2(&tcg_ctx, INDEX_op_insn_start,
+                (uint32_t)pc, (uint32_t)(pc >> 32));
+}
+# endif
+#elif TARGET_INSN_START_WORDS == 2
+# if TARGET_LONG_BITS <= TCG_TARGET_REG_BITS
+static inline void tcg_gen_insn_start(target_ulong pc, target_ulong a1)
+{
+    tcg_gen_op2(&tcg_ctx, INDEX_op_insn_start, pc, a1);
+}
+# else
+static inline void tcg_gen_insn_start(target_ulong pc, target_ulong a1)
+{
+    tcg_gen_op4(&tcg_ctx, INDEX_op_insn_start,
+                (uint32_t)pc, (uint32_t)(pc >> 32),
+                (uint32_t)a1, (uint32_t)(a1 >> 32));
+}
+# endif
+#elif TARGET_INSN_START_WORDS == 3
+# if TARGET_LONG_BITS <= TCG_TARGET_REG_BITS
+static inline void tcg_gen_insn_start(target_ulong pc, target_ulong a1,
+                                      target_ulong a2)
+{
+    tcg_gen_op3(&tcg_ctx, INDEX_op_insn_start, pc, a1, a2);
+}
+# else
+static inline void tcg_gen_insn_start(target_ulong pc, target_ulong a1,
+                                      target_ulong a2)
+{
+    tcg_gen_op6(&tcg_ctx, INDEX_op_insn_start,
+                (uint32_t)pc, (uint32_t)(pc >> 32),
+                (uint32_t)a1, (uint32_t)(a1 >> 32),
+                (uint32_t)a2, (uint32_t)(a2 >> 32));
+}
+# endif
+#else
+# error "Unhandled number of operands to insn_start"
+#endif
 
 static inline void tcg_gen_exit_tb(uintptr_t val)
 {
@@ -720,7 +756,6 @@ static inline void tcg_gen_exit_tb(uintptr_t val)
 void tcg_gen_goto_tb(unsigned idx);
 
 #if TARGET_LONG_BITS == 32
-#define TCGv TCGv_i32
 #define tcg_temp_new() tcg_temp_new_i32()
 #define tcg_global_reg_new tcg_global_reg_new_i32
 #define tcg_global_mem_new tcg_global_mem_new_i32
@@ -732,7 +767,6 @@ void tcg_gen_goto_tb(unsigned idx);
 #define tcg_gen_qemu_ld_tl tcg_gen_qemu_ld_i32
 #define tcg_gen_qemu_st_tl tcg_gen_qemu_st_i32
 #else
-#define TCGv TCGv_i64
 #define tcg_temp_new() tcg_temp_new_i64()
 #define tcg_global_reg_new tcg_global_reg_new_i64
 #define tcg_global_mem_new tcg_global_mem_new_i64

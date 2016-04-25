@@ -62,26 +62,16 @@ typedef struct TranslationBlock TranslationBlock;
 #define OPC_BUF_SIZE 640
 #define OPC_MAX_SIZE (OPC_BUF_SIZE - MAX_OP_PER_INSTR)
 
-/* Maximum size a TCG op can expand to.  This is complicated because a
-   single op may require several host instructions and register reloads.
-   For now take a wild guess at 192 bytes, which should allow at least
-   a couple of fixup instructions per argument.  */
-#define TCG_MAX_OP_SIZE 192
-
 #define OPPARAM_BUF_SIZE (OPC_BUF_SIZE * MAX_OPC_PARAM)
 
 #include "qemu/log.h"
 
 void gen_intermediate_code(CPUArchState *env, struct TranslationBlock *tb);
-void gen_intermediate_code_pc(CPUArchState *env, struct TranslationBlock *tb);
 void restore_state_to_opc(CPUArchState *env, struct TranslationBlock *tb,
-                          int pc_pos);
+                          target_ulong *data);
 
 void cpu_gen_init(void);
-int cpu_gen_code(CPUArchState *env, struct TranslationBlock *tb,
-                 int *gen_code_size_ptr);
 bool cpu_restore_state(CPUState *cpu, uintptr_t searched_pc);
-void page_size_init(void);
 
 void QEMU_NORETURN cpu_resume_from_signal(CPUState *cpu, void *puc);
 void QEMU_NORETURN cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
@@ -93,9 +83,35 @@ void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
 void QEMU_NORETURN cpu_loop_exit_restore(CPUState *cpu, uintptr_t pc);
 
 #if !defined(CONFIG_USER_ONLY)
-bool qemu_in_vcpu_thread(void);
-void cpu_reload_memory_map(CPUState *cpu);
-void tcg_cpu_address_space_init(CPUState *cpu, AddressSpace *as);
+void cpu_reloading_memory_map(void);
+/**
+ * cpu_address_space_init:
+ * @cpu: CPU to add this address space to
+ * @as: address space to add
+ * @asidx: integer index of this address space
+ *
+ * Add the specified address space to the CPU's cpu_ases list.
+ * The address space added with @asidx 0 is the one used for the
+ * convenience pointer cpu->as.
+ * The target-specific code which registers ASes is responsible
+ * for defining what semantics address space 0, 1, 2, etc have.
+ *
+ * Before the first call to this function, the caller must set
+ * cpu->num_ases to the total number of address spaces it needs
+ * to support.
+ *
+ * Note that with KVM only one address space is supported.
+ */
+void cpu_address_space_init(CPUState *cpu, AddressSpace *as, int asidx);
+/**
+ * cpu_get_address_space:
+ * @cpu: CPU to get address space from
+ * @asidx: index identifying which address space to get
+ *
+ * Return the requested address space of this CPU. @asidx
+ * specifies which address space to read.
+ */
+AddressSpace *cpu_get_address_space(CPUState *cpu, int asidx);
 /* cputlb.c */
 /**
  * tlb_flush_page:
@@ -137,12 +153,40 @@ void tlb_flush_page_by_mmuidx(CPUState *cpu, target_ulong addr, ...);
  * MMU indexes.
  */
 void tlb_flush_by_mmuidx(CPUState *cpu, ...);
-void tlb_set_page(CPUState *cpu, target_ulong vaddr,
-                  hwaddr paddr, int prot,
-                  int mmu_idx, target_ulong size);
+/**
+ * tlb_set_page_with_attrs:
+ * @cpu: CPU to add this TLB entry for
+ * @vaddr: virtual address of page to add entry for
+ * @paddr: physical address of the page
+ * @attrs: memory transaction attributes
+ * @prot: access permissions (PAGE_READ/PAGE_WRITE/PAGE_EXEC bits)
+ * @mmu_idx: MMU index to insert TLB entry for
+ * @size: size of the page in bytes
+ *
+ * Add an entry to this CPU's TLB (a mapping from virtual address
+ * @vaddr to physical address @paddr) with the specified memory
+ * transaction attributes. This is generally called by the target CPU
+ * specific code after it has been called through the tlb_fill()
+ * entry point and performed a successful page table walk to find
+ * the physical address and attributes for the virtual address
+ * which provoked the TLB miss.
+ *
+ * At most one entry for a given virtual address is permitted. Only a
+ * single TARGET_PAGE_SIZE region is mapped; the supplied @size is only
+ * used by tlb_flush_page.
+ */
 void tlb_set_page_with_attrs(CPUState *cpu, target_ulong vaddr,
                              hwaddr paddr, MemTxAttrs attrs,
                              int prot, int mmu_idx, target_ulong size);
+/* tlb_set_page:
+ *
+ * This function is equivalent to calling tlb_set_page_with_attrs()
+ * with an @attrs argument of MEMTXATTRS_UNSPECIFIED. It's provided
+ * as a convenience for CPUs which don't use memory transaction attributes.
+ */
+void tlb_set_page(CPUState *cpu, target_ulong vaddr,
+                  hwaddr paddr, int prot,
+                  int mmu_idx, target_ulong size);
 void tb_invalidate_phys_addr(AddressSpace *as, hwaddr addr);
 void probe_write(CPUArchState *env, target_ulong addr, int mmu_idx,
                  uintptr_t retaddr);
@@ -170,13 +214,14 @@ static inline void tlb_flush_by_mmuidx(CPUState *cpu, ...)
 #define CODE_GEN_PHYS_HASH_BITS     15
 #define CODE_GEN_PHYS_HASH_SIZE     (1 << CODE_GEN_PHYS_HASH_BITS)
 
-/* estimated block size for TB allocation */
-/* XXX: use a per code average code fragment size and modulate it
-   according to the host CPU */
+/* Estimated block size for TB allocation.  */
+/* ??? The following is based on a 2015 survey of x86_64 host output.
+   Better would seem to be some sort of dynamically sized TB array,
+   adapting to the block sizes actually being produced.  */
 #if defined(CONFIG_SOFTMMU)
-#define CODE_GEN_AVG_BLOCK_SIZE 128
+#define CODE_GEN_AVG_BLOCK_SIZE 400
 #else
-#define CODE_GEN_AVG_BLOCK_SIZE 64
+#define CODE_GEN_AVG_BLOCK_SIZE 150
 #endif
 
 #if defined(__arm__) || defined(_ARCH_PPC) \
@@ -199,8 +244,10 @@ struct TranslationBlock {
 #define CF_LAST_IO     0x8000 /* Last insn may be an IO access.  */
 #define CF_NOCACHE     0x10000 /* To be freed after execution */
 #define CF_USE_ICOUNT  0x20000
+#define CF_IGNORE_ICOUNT 0x40000 /* Do not generate icount code */
 
     void *tc_ptr;    /* pointer to the translated code */
+    uint8_t *tc_search;  /* pointer to search data */
     /* next matching tb for physical address. */
     struct TranslationBlock *phys_hash_next;
     /* original tb when cflags has CF_NOCACHE */
@@ -332,6 +379,11 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 {
     /* NOTE: this test is only needed for thread safety */
     if (!tb->jmp_next[n]) {
+        qemu_log_mask_and_addr(CPU_LOG_EXEC, tb->pc,
+                               "Linking TBs %p [" TARGET_FMT_lx
+                               "] index %d -> %p [" TARGET_FMT_lx "]\n",
+                               tb->tc_ptr, tb->pc, n,
+                               tb_next->tc_ptr, tb_next->pc);
         /* patch the native jump address */
         tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc_ptr);
 
@@ -364,10 +416,8 @@ extern uintptr_t tci_tb_ptr;
 
 #if !defined(CONFIG_USER_ONLY)
 
-void phys_mem_set_alloc(void *(*alloc)(size_t, uint64_t *align));
-
 struct MemoryRegion *iotlb_to_region(CPUState *cpu,
-                                     hwaddr index);
+                                     hwaddr index, MemTxAttrs attrs);
 
 void tlb_fill(CPUState *cpu, target_ulong addr, int is_write, int mmu_idx,
               uintptr_t retaddr);
@@ -396,8 +446,8 @@ void tlb_set_dirty(CPUState *cpu, target_ulong vaddr);
 void tb_flush_jmp_cache(CPUState *cpu, target_ulong addr);
 
 MemoryRegionSection *
-address_space_translate_for_iotlb(CPUState *cpu, hwaddr addr, hwaddr *xlat,
-                                  hwaddr *plen);
+address_space_translate_for_iotlb(CPUState *cpu, int asidx, hwaddr addr,
+                                  hwaddr *xlat, hwaddr *plen);
 hwaddr memory_region_section_get_iotlb(CPUState *cpu,
                                        MemoryRegionSection *section,
                                        target_ulong vaddr,
@@ -415,7 +465,4 @@ extern int singlestep;
 extern CPUState *tcg_current_cpu;
 extern bool exit_request;
 
-#if !defined(CONFIG_USER_ONLY)
-void migration_bitmap_extend(ram_addr_t old, ram_addr_t new);
-#endif
 #endif

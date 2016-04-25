@@ -129,6 +129,12 @@ typedef uint64_t TCGRegSet;
 # error "Missing unsigned widening multiply"
 #endif
 
+#ifndef TARGET_INSN_START_EXTRA_WORDS
+# define TARGET_INSN_START_WORDS 1
+#else
+# define TARGET_INSN_START_WORDS (1 + TARGET_INSN_START_EXTRA_WORDS)
+#endif
+
 typedef enum TCGOpcode {
 #define DEF(name, oargs, iargs, cargs, flags) INDEX_op_ ## name,
 #include "tcg-opc.h"
@@ -188,6 +194,7 @@ typedef struct TCGPool {
 #define TCG_POOL_CHUNK_SIZE 32768
 
 #define TCG_MAX_TEMPS 512
+#define TCG_MAX_INSNS 512
 
 /* when the size of the arguments of a called function is smaller than
    this value, they are statically allocated in the TB stack frame */
@@ -301,6 +308,14 @@ typedef tcg_target_ulong TCGArg;
 typedef struct TCGv_i32_d *TCGv_i32;
 typedef struct TCGv_i64_d *TCGv_i64;
 typedef struct TCGv_ptr_d *TCGv_ptr;
+typedef TCGv_ptr TCGv_env;
+#if TARGET_LONG_BITS == 32
+#define TCGv TCGv_i32
+#elif TARGET_LONG_BITS == 64
+#define TCGv TCGv_i64
+#else
+#error Unhandled TARGET_LONG_BITS value
+#endif
 
 static inline TCGv_i32 QEMU_ARTIFICIAL MAKE_TCGV_I32(intptr_t i)
 {
@@ -441,12 +456,13 @@ typedef enum TCGTempVal {
 } TCGTempVal;
 
 typedef struct TCGTemp {
-    unsigned int reg:8;
-    unsigned int mem_reg:8;
+    TCGReg reg:8;
     TCGTempVal val_type:8;
     TCGType base_type:8;
     TCGType type:8;
     unsigned int fixed_reg:1;
+    unsigned int indirect_reg:1;
+    unsigned int indirect_base:1;
     unsigned int mem_coherent:1;
     unsigned int mem_allocated:1;
     unsigned int temp_local:1; /* If true, the temp is saved across
@@ -455,6 +471,7 @@ typedef struct TCGTemp {
     unsigned int temp_allocated:1; /* never used for code gen */
 
     tcg_target_long val;
+    struct TCGTemp *mem_base;
     intptr_t mem_offset;
     const char *name;
 } TCGTemp;
@@ -508,7 +525,7 @@ struct TCGContext {
     intptr_t current_frame_offset;
     intptr_t frame_start;
     intptr_t frame_end;
-    int frame_reg;
+    TCGTemp *frame_temp;
 
     tcg_insn_unit *code_ptr;
 
@@ -525,6 +542,7 @@ struct TCGContext {
     int64_t del_op_count;
     int64_t code_in_len;
     int64_t code_out_len;
+    int64_t search_out_len;
     int64_t interm_time;
     int64_t code_time;
     int64_t la_time;
@@ -551,28 +569,28 @@ struct TCGContext {
     void *code_gen_prologue;
     void *code_gen_buffer;
     size_t code_gen_buffer_size;
-    /* threshold to flush the translated code buffer */
-    size_t code_gen_buffer_max_size;
     void *code_gen_ptr;
+
+    /* Threshold to flush the translated code buffer.  */
+    void *code_gen_highwater;
 
     TBContext tb_ctx;
 
-    /* The TCGBackendData structure is private to tcg-target.c.  */
+    /* The TCGBackendData structure is private to tcg-target.inc.c.  */
     struct TCGBackendData *be;
 
     TCGTempSet free_temps[TCG_TYPE_COUNT * 2];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */
 
-    /* tells in which temporary a given register is. It does not take
-       into account fixed registers */
-    int reg_to_temp[TCG_TARGET_NB_REGS];
+    /* Tells which temporary holds a given register.
+       It does not take into account fixed registers */
+    TCGTemp *reg_to_temp[TCG_TARGET_NB_REGS];
 
     TCGOp gen_op_buf[OPC_BUF_SIZE];
     TCGArg gen_opparam_buf[OPPARAM_BUF_SIZE];
 
-    target_ulong gen_opc_pc[OPC_BUF_SIZE];
-    uint16_t gen_opc_icount[OPC_BUF_SIZE];
-    uint8_t gen_opc_instr_start[OPC_BUF_SIZE];
+    uint16_t gen_insn_end_off[TCG_MAX_INSNS];
+    target_ulong gen_insn_data[TCG_MAX_INSNS][TARGET_INSN_START_WORDS];
 };
 
 extern TCGContext tcg_ctx;
@@ -618,39 +636,54 @@ void tcg_context_init(TCGContext *s);
 void tcg_prologue_init(TCGContext *s);
 void tcg_func_start(TCGContext *s);
 
-int tcg_gen_code(TCGContext *s, tcg_insn_unit *gen_code_buf);
-int tcg_gen_code_search_pc(TCGContext *s, tcg_insn_unit *gen_code_buf,
-                           long offset);
+int tcg_gen_code(TCGContext *s, TranslationBlock *tb);
 
-void tcg_set_frame(TCGContext *s, int reg, intptr_t start, intptr_t size);
+void tcg_set_frame(TCGContext *s, TCGReg reg, intptr_t start, intptr_t size);
 
-TCGv_i32 tcg_global_reg_new_i32(int reg, const char *name);
-TCGv_i32 tcg_global_mem_new_i32(int reg, intptr_t offset, const char *name);
+int tcg_global_mem_new_internal(TCGType, TCGv_ptr, intptr_t, const char *);
+
+TCGv_i32 tcg_global_reg_new_i32(TCGReg reg, const char *name);
+TCGv_i64 tcg_global_reg_new_i64(TCGReg reg, const char *name);
+
 TCGv_i32 tcg_temp_new_internal_i32(int temp_local);
+TCGv_i64 tcg_temp_new_internal_i64(int temp_local);
+
+void tcg_temp_free_i32(TCGv_i32 arg);
+void tcg_temp_free_i64(TCGv_i64 arg);
+
+static inline TCGv_i32 tcg_global_mem_new_i32(TCGv_ptr reg, intptr_t offset,
+                                              const char *name)
+{
+    int idx = tcg_global_mem_new_internal(TCG_TYPE_I32, reg, offset, name);
+    return MAKE_TCGV_I32(idx);
+}
+
 static inline TCGv_i32 tcg_temp_new_i32(void)
 {
     return tcg_temp_new_internal_i32(0);
 }
+
 static inline TCGv_i32 tcg_temp_local_new_i32(void)
 {
     return tcg_temp_new_internal_i32(1);
 }
-void tcg_temp_free_i32(TCGv_i32 arg);
-char *tcg_get_arg_str_i32(TCGContext *s, char *buf, int buf_size, TCGv_i32 arg);
 
-TCGv_i64 tcg_global_reg_new_i64(int reg, const char *name);
-TCGv_i64 tcg_global_mem_new_i64(int reg, intptr_t offset, const char *name);
-TCGv_i64 tcg_temp_new_internal_i64(int temp_local);
+static inline TCGv_i64 tcg_global_mem_new_i64(TCGv_ptr reg, intptr_t offset,
+                                              const char *name)
+{
+    int idx = tcg_global_mem_new_internal(TCG_TYPE_I64, reg, offset, name);
+    return MAKE_TCGV_I64(idx);
+}
+
 static inline TCGv_i64 tcg_temp_new_i64(void)
 {
     return tcg_temp_new_internal_i64(0);
 }
+
 static inline TCGv_i64 tcg_temp_local_new_i64(void)
 {
     return tcg_temp_new_internal_i64(1);
 }
-void tcg_temp_free_i64(TCGv_i64 arg);
-char *tcg_get_arg_str_i64(TCGContext *s, char *buf, int buf_size, TCGv_i64 arg);
 
 #if defined(CONFIG_DEBUG_TCG)
 /* If you call tcg_clear_temp_count() at the start of a section of

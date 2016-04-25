@@ -22,20 +22,23 @@
  * THE SOFTWARE.
  */
 
-#include "config-host.h"
+#include "qemu/osdep.h"
 
 #include <poll.h>
 #include "qemu-common.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
+#include "qapi/error.h"
 #include "block/block_int.h"
 #include "trace.h"
 #include "qemu/iov.h"
 #include "qemu/uri.h"
+#include "qemu/cutils.h"
 #include "sysemu/sysemu.h"
 #include <nfsc/libnfs.h>
 
 #define QEMU_NFS_MAX_READAHEAD_SIZE 1048576
+#define QEMU_NFS_MAX_DEBUG_LEVEL 2
 
 typedef struct NFSClient {
     struct nfs_context *context;
@@ -63,11 +66,10 @@ static void nfs_set_events(NFSClient *client)
 {
     int ev = nfs_which_events(client->context);
     if (ev != client->events) {
-        aio_set_fd_handler(client->aio_context,
-                           nfs_get_fd(client->context),
+        aio_set_fd_handler(client->aio_context, nfs_get_fd(client->context),
+                           false,
                            (ev & POLLIN) ? nfs_process_read : NULL,
-                           (ev & POLLOUT) ? nfs_process_write : NULL,
-                           client);
+                           (ev & POLLOUT) ? nfs_process_write : NULL, client);
 
     }
     client->events = ev;
@@ -242,9 +244,8 @@ static void nfs_detach_aio_context(BlockDriverState *bs)
 {
     NFSClient *client = bs->opaque;
 
-    aio_set_fd_handler(client->aio_context,
-                       nfs_get_fd(client->context),
-                       NULL, NULL, NULL);
+    aio_set_fd_handler(client->aio_context, nfs_get_fd(client->context),
+                       false, NULL, NULL, NULL);
     client->events = 0;
 }
 
@@ -263,9 +264,8 @@ static void nfs_client_close(NFSClient *client)
         if (client->fh) {
             nfs_close(client->context, client->fh);
         }
-        aio_set_fd_handler(client->aio_context,
-                           nfs_get_fd(client->context),
-                           NULL, NULL, NULL);
+        aio_set_fd_handler(client->aio_context, nfs_get_fd(client->context),
+                           false, NULL, NULL, NULL);
         nfs_destroy_context(client->context);
     }
     memset(client, 0, sizeof(NFSClient));
@@ -336,6 +336,17 @@ static int64_t nfs_client_open(NFSClient *client, const char *filename,
                 val = QEMU_NFS_MAX_READAHEAD_SIZE;
             }
             nfs_set_readahead(client->context, val);
+#endif
+#ifdef LIBNFS_FEATURE_DEBUG
+        } else if (!strcmp(qp->p[i].name, "debug")) {
+            /* limit the maximum debug level to avoid potential flooding
+             * of our log files. */
+            if (val > QEMU_NFS_MAX_DEBUG_LEVEL) {
+                error_report("NFS Warning: Limiting NFS debug level"
+                             " to %d", QEMU_NFS_MAX_DEBUG_LEVEL);
+                val = QEMU_NFS_MAX_DEBUG_LEVEL;
+            }
+            nfs_set_debug(client->context, val);
 #endif
         } else {
             error_setg(errp, "Unknown NFS parameter name: %s",

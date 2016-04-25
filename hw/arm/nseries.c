@@ -18,7 +18,9 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "qemu-common.h"
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu/cutils.h"
 #include "sysemu/sysemu.h"
 #include "hw/arm/omap.h"
 #include "hw/arm/arm.h"
@@ -172,8 +174,8 @@ static void n8x0_nand_setup(struct n800_s *s)
     qdev_prop_set_int32(s->nand, "shift", 1);
     dinfo = drive_get(IF_MTD, 0, 0);
     if (dinfo) {
-        qdev_prop_set_drive_nofail(s->nand, "drive",
-                                   blk_by_legacy_dinfo(dinfo));
+        qdev_prop_set_drive(s->nand, "drive", blk_by_legacy_dinfo(dinfo),
+                            &error_fatal);
     }
     qdev_init_nofail(s->nand);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->nand), 0,
@@ -1275,7 +1277,7 @@ static int n8x0_atag_setup(void *p, int model)
     strcpy((void *) w, "hw-build");		/* char component[12] */
     w += 6;
     strcpy((void *) w, "QEMU ");
-    pstrcat((void *) w, 12, qemu_get_version()); /* char version[12] */
+    pstrcat((void *) w, 12, qemu_hw_version()); /* char version[12] */
     w += 6;
 
     tag = (model == 810) ? "1.1.10-qemu" : "1.1.6-qemu";
@@ -1449,4 +1451,4 @@ static void nseries_machine_init(void)
     type_register_static(&n810_type);
 }
 
-machine_init(nseries_machine_init)
+type_init(nseries_machine_init)

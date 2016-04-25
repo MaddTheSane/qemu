@@ -118,6 +118,7 @@ qemu-img: kilobytes, megabytes, gigabytes, terabytes, petabytes and exabytes.
 
 qemu-img create -f qcow2 -o size=foobar TEST_DIR/t.qcow2
 qemu-img: Parameter 'size' expects a size
+You may use k, M, G or T suffixes for kilobytes, megabytes, gigabytes and terabytes.
 qemu-img: TEST_DIR/t.qcow2: Invalid options for file format 'qcow2'
 
 == Check correct interpretation of suffixes for cluster size ==
@@ -186,12 +187,6 @@ qemu-img create -f qcow2 -o encryption=off TEST_DIR/t.qcow2 64M
 Formatting 'TEST_DIR/t.qcow2', fmt=qcow2 size=67108864 encryption=off cluster_size=65536 lazy_refcounts=off refcount_bits=16
 
 qemu-img create -f qcow2 -o encryption=on TEST_DIR/t.qcow2 64M
-qemu-img: Encrypted images are deprecated
-Support for them will be removed in a future release.
-You can use 'qemu-img convert' to convert your image to an unencrypted one.
-qemu-img: Encrypted images are deprecated
-Support for them will be removed in a future release.
-You can use 'qemu-img convert' to convert your image to an unencrypted one.
 Formatting 'TEST_DIR/t.qcow2', fmt=qcow2 size=67108864 encryption=on cluster_size=65536 lazy_refcounts=off refcount_bits=16
 
 == Check lazy_refcounts option (only with v3) ==

@@ -1,7 +1,6 @@
 #ifndef CPU_SPARC_H
 #define CPU_SPARC_H
 
-#include "config.h"
 #include "qemu-common.h"
 #include "qemu/bswap.h"
 
@@ -230,6 +229,7 @@ typedef struct trap_state {
     uint32_t tt;
 } trap_state;
 #endif
+#define TARGET_INSN_START_EXTRA_WORDS 1
 
 typedef struct sparc_def_t {
     const char *name;
@@ -365,15 +365,13 @@ struct CPUTimer
     uint32_t    frequency;
     uint32_t    disabled;
     uint64_t    disabled_mask;
+    uint32_t    npt;
+    uint64_t    npt_mask;
     int64_t     clock_offset;
     QEMUTimer  *qtimer;
 };
 
 typedef struct CPUTimer CPUTimer;
-
-struct QEMUFile;
-void cpu_put_timer(struct QEMUFile *f, CPUTimer *s);
-void cpu_get_timer(struct QEMUFile *f, CPUTimer *s);
 
 typedef struct CPUSPARCState CPUSPARCState;
 
@@ -536,6 +534,7 @@ int cpu_sparc_exec(CPUState *cpu);
 /* win_helper.c */
 target_ulong cpu_get_psr(CPUSPARCState *env1);
 void cpu_put_psr(CPUSPARCState *env1, target_ulong val);
+void cpu_put_psr_raw(CPUSPARCState *env1, target_ulong val);
 #ifdef TARGET_SPARC64
 target_ulong cpu_get_ccr(CPUSPARCState *env1);
 void cpu_put_ccr(CPUSPARCState *env1, target_ulong val);
@@ -592,11 +591,8 @@ int cpu_sparc_signal_handler(int host_signum, void *pinfo, void *puc);
 #endif
 
 #define cpu_exec cpu_sparc_exec
-#define cpu_gen_code cpu_sparc_gen_code
 #define cpu_signal_handler cpu_sparc_signal_handler
 #define cpu_list sparc_cpu_list
-
-#define CPU_SAVE_VERSION 7
 
 /* MMU modes definitions */
 #if defined (TARGET_SPARC64)

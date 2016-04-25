@@ -2,7 +2,7 @@
 # QAPI event generator
 #
 # Copyright (c) 2014 Wenchao Xia
-# Copyright (c) 2015 Red Hat Inc.
+# Copyright (c) 2015-2016 Red Hat Inc.
 #
 # Authors:
 #  Wenchao Xia <wenchaoqemu@gmail.com>
@@ -28,13 +28,43 @@ def gen_event_send_decl(name, arg_type):
                  proto=gen_event_send_proto(name, arg_type))
 
 
+# Declare and initialize an object 'qapi' using parameters from gen_params()
+def gen_param_var(typ):
+    assert not typ.variants
+    ret = mcgen('''
+    %(c_name)s param = {
+''',
+                c_name=typ.c_name())
+    sep = '        '
+    for memb in typ.members:
+        ret += sep
+        sep = ', '
+        if memb.optional:
+            ret += 'has_' + c_name(memb.name) + sep
+        if memb.type.name == 'str':
+            # Cast away const added in gen_params()
+            ret += '(char *)'
+        ret += c_name(memb.name)
+    ret += mcgen('''
+
+    };
+''')
+    return ret
+
+
 def gen_event_send(name, arg_type):
+    # FIXME: Our declaration of local variables (and of 'errp' in the
+    # parameter list) can collide with exploded members of the event's
+    # data type passed in as parameters.  If this collision ever hits in
+    # practice, we can rename our local variables with a leading _ prefix,
+    # or split the code into a wrapper function that creates a boxed
+    # 'param' object then calls another to do the real work.
     ret = mcgen('''
 
 %(proto)s
 {
     QDict *qmp;
-    Error *local_err = NULL;
+    Error *err = NULL;
     QMPEventFuncEmit emit;
 ''',
                 proto=gen_event_send_proto(name, arg_type))
@@ -43,11 +73,11 @@ def gen_event_send(name, arg_type):
         ret += mcgen('''
     QmpOutputVisitor *qov;
     Visitor *v;
-    QObject *obj;
-
 ''')
+        ret += gen_param_var(arg_type)
 
     ret += mcgen('''
+
     emit = qmp_event_get_func_emit();
     if (!emit) {
         return;
@@ -61,77 +91,35 @@ def gen_event_send(name, arg_type):
     if arg_type and arg_type.members:
         ret += mcgen('''
     qov = qmp_output_visitor_new();
-    g_assert(qov);
-
     v = qmp_output_get_visitor(qov);
-    g_assert(v);
 
-    /* Fake visit, as if all members are under a structure */
-    visit_start_struct(v, NULL, "", "%(name)s", 0, &local_err);
-    if (local_err) {
-        goto clean;
+    visit_start_struct(v, "%(name)s", NULL, 0, &err);
+    if (err) {
+        goto out;
+    }
+    visit_type_%(c_name)s_members(v, &param, &err);
+    visit_end_struct(v, err ? NULL : &err);
+    if (err) {
+        goto out;
     }
 
+    qdict_put_obj(qmp, "data", qmp_output_get_qobject(qov));
 ''',
-                     name=name)
-
-        for memb in arg_type.members:
-            if memb.optional:
-                ret += mcgen('''
-    if (has_%(c_name)s) {
-''',
-                             c_name=c_name(memb.name))
-                push_indent()
-
-            # Ugly: need to cast away the const
-            if memb.type.name == "str":
-                cast = '(char **)'
-            else:
-                cast = ''
-
-            ret += mcgen('''
-    visit_type_%(c_type)s(v, %(cast)s&%(c_name)s, "%(name)s", &local_err);
-    if (local_err) {
-        goto clean;
-    }
-''',
-                         cast=cast,
-                         c_name=c_name(memb.name),
-                         c_type=memb.type.c_name(),
-                         name=memb.name)
-
-            if memb.optional:
-                pop_indent()
-                ret += mcgen('''
-    }
-''')
-
-        ret += mcgen('''
-
-    visit_end_struct(v, &local_err);
-    if (local_err) {
-        goto clean;
-    }
-
-    obj = qmp_output_get_qobject(qov);
-    g_assert(obj != NULL);
-
-    qdict_put_obj(qmp, "data", obj);
-''')
+                     name=name, c_name=arg_type.c_name())
 
     ret += mcgen('''
-    emit(%(c_enum)s, qmp, &local_err);
+    emit(%(c_enum)s, qmp, &err);
 
 ''',
                  c_enum=c_enum_const(event_enum_name, name))
 
     if arg_type and arg_type.members:
         ret += mcgen('''
- clean:
+out:
     qmp_output_visitor_cleanup(qov);
 ''')
     ret += mcgen('''
-    error_propagate(errp, local_err);
+    error_propagate(errp, err);
     QDECREF(qmp);
 }
 ''')
@@ -196,6 +184,7 @@ h_comment = '''
                             c_comment, h_comment)
 
 fdef.write(mcgen('''
+#include "qemu/osdep.h"
 #include "qemu-common.h"
 #include "%(prefix)sqapi-event.h"
 #include "%(prefix)sqapi-visit.h"
