@@ -35,6 +35,7 @@
 #include "sysemu/blockdev.h"
 #include "qemu-version.h"
 #include <Carbon/Carbon.h>
+#include "qom/cpu.h"
 
 #ifndef MAC_OS_X_VERSION_10_5
 #define MAC_OS_X_VERSION_10_5 1050
@@ -56,6 +57,9 @@
 #endif
 
 #define cgrect(nsrect) (*(CGRect *)&(nsrect))
+#define USB_DISK_ID "USB_DISK"
+#define EJECT_IMAGE_FILE_TAG 2099
+#define MAX_DEVICE_NAME_SIZE 10
 
 typedef struct {
     int width;
@@ -177,7 +181,7 @@ const int mac_to_qkeycode_map[] = {
      * F1. Don't forget to disable the real key binding.
      */
     /* [kVK_F1] = Q_KEY_CODE_POWER, */
-
+    [0x7f7f] = Q_KEY_CODE_POWER,
     [kVK_F1] = Q_KEY_CODE_F1,
     [kVK_F2] = Q_KEY_CODE_F2,
     [kVK_F3] = Q_KEY_CODE_F3,
@@ -218,6 +222,43 @@ static void QEMU_Alert(NSString *message)
     [alert runModal];
 }
 
+/* Sends a command to the monitor console */
+static void sendMonitorCommand(const char *commandString)
+{
+    int index;
+    char * consoleName;
+    static QemuConsole *monitor;
+
+    /* If the monitor console hasn't been found yet */
+    if(!monitor) {
+        index = 0;
+        /* Find the monitor console */
+        while (qemu_console_lookup_by_index(index) != NULL) {
+            consoleName = qemu_console_get_label(qemu_console_lookup_by_index(index));
+            if(strstr(consoleName, "monitor")) {
+                monitor = qemu_console_lookup_by_index(index);
+                break;
+            }
+            index++;
+        }
+    }
+
+    /* If the monitor console was not found */
+    if(!monitor) {
+        NSBeep();
+        QEMU_Alert(@"Failed to find the monitor console!");
+        return;
+    }
+
+    /* send each letter in the commandString to the monitor */
+    for (index = 0; index < strlen(commandString); index++) {
+        kbd_put_keysym_console(monitor, commandString[index]);
+    }
+
+    /* simulate the user pushing the return key */
+    kbd_put_keysym_console(monitor, '\n');
+}
+
 /* Handles any errors that happen with a device transaction */
 static void handleAnyDeviceErrors(Error * err)
 {
@@ -226,6 +267,89 @@ static void handleAnyDeviceErrors(Error * err)
                                       encoding: NSASCIIStringEncoding]);
         error_free(err);
     }
+}
+
+/*
+ Determine if the current emulator has the specified device.
+ device_name: the name of the device you want: floppy, cd
+ official_name: QEMU's name for the device: floppy0, ide-cd0
+*/
+static bool emulatorHasDevice(const char * device_name, char * official_name)
+{
+    BlockInfoList * block_device_data;
+    block_device_data = qmp_query_block(false);
+    if(block_device_data == NULL) {
+        return false;
+    }
+    while(block_device_data->next != NULL) {
+        /* If we found the device */
+        if (strstr(block_device_data->value->device, device_name)) {
+            strncpy(official_name, block_device_data->value->device, MAX_DEVICE_NAME_SIZE);
+            qapi_free_BlockInfoList(block_device_data);
+            return true;
+        }
+        block_device_data = block_device_data->next;
+    }
+    return false;
+}
+
+/* Translate an ascii character to sendkey compatible input */
+static char *ascii_to_sendkey(int c)
+{
+    /* For lowercase letters and numbers */
+    if (isalnum(c) && !isupper(c)) {
+        return g_strdup_printf("%c", c);
+    }
+
+    /* For uppercase letters */
+    if (isupper(c)) {
+        return g_strdup_printf("shift-%c", tolower(c));
+    }
+
+    const char *translation_matrix[] = {
+    [' '] = "spc",
+    [','] = "comma",
+    ['<'] = "shift-comma",
+    ['.'] = "dot",
+    ['>'] = "shift-dot",
+    ['/'] = "slash",
+    ['?'] = "shift-slash",
+    [';'] = "semicolon",
+    [':'] = "shift-semicolon",
+    ['\''] = "apostrophe",
+    ['\"'] = "shift-apostrophe",
+    ['\n'] = "ret",
+    ['['] = "bracket_left",
+    ['{'] = "shift-bracket_left",
+    [']'] = "bracket_right",
+    ['}'] = "shift-bracket_right",
+    ['\\'] = "backslash",
+    ['|'] = "shift-backslash",
+    ['\t'] = "tab",
+    ['`'] = "grave_accent",
+    ['~'] = "shift-grave_accent",
+    ['!'] = "shift-1",
+    ['@'] = "shift-2",
+    ['#'] = "shift-3",
+    ['$'] = "shift-4",
+    ['%'] = "shift-5",
+    ['^'] = "shift-6",
+    ['&'] = "shift-7",
+    ['*'] = "shift-8",
+    ['('] = "shift-9",
+    [')'] = "shift-0",
+    ['-'] = "minus",
+    ['_'] = "shift-minus",
+    ['='] = "equal",
+    ['+'] = "shift-equal"
+    };
+
+    /* If an unicode character is encounted display a question mark */
+    if (c >= ARRAY_SIZE(translation_matrix) || c < 0) {
+        return g_strdup_printf("shift-slash");
+    }
+
+    return g_strdup_printf("%s", translation_matrix[c]);
 }
 
 /*
@@ -701,7 +825,7 @@ QemuCocoaView *cocoaView;
          * call below. We definitely don't want to pass that click through
          * to the guest.
          */
-        if ((isMouseGrabbed || [[self window] isKeyWindow]) &&
+        if (isMouseGrabbed && ([[self window] isKeyWindow] || isFullscreen) &&
             (last_buttons != buttons)) {
             static uint32_t bmap[INPUT_BUTTON__MAX] = {
                 [INPUT_BUTTON_LEFT]       = MOUSE_EVENT_LBUTTON,
@@ -828,6 +952,13 @@ QemuCocoaView *cocoaView;
 - (void)openDocumentation:(NSString *)filename;
 - (IBAction) do_about_menu_item: (id) sender;
 - (void)make_about_window;
+- (void)mountImageFile:(id)sender;
+- (void)ejectImageFile:(id)sender;
+- (void)updateEjectImageMenuItems;
+- (IBAction)do_send_key_menu_item:(id)sender;
+- (void)adjustSpeed:(id)sender;
+- (void)useRealCdrom:(id)sender;
+- (void)doPaste:(id)sender;
 @end
 
 @implementation QemuCocoaAppController
@@ -879,7 +1010,7 @@ QemuCocoaView *cocoaView;
         // set the supported image file types that can be opened
         supportedImageFileTypes = [NSArray arrayWithObjects: @"img", @"iso", @"dmg",
                                  @"qcow", @"qcow2", @"cloop", @"vmdk", @"cdr",
-                                  nil];
+                                 @"toast", nil];
         [self make_about_window];
     }
     return self;
@@ -1234,8 +1365,327 @@ QemuCocoaView *cocoaView;
     [superView addSubview: copyright_label];
 }
 
+/* Displays a dialog box asking the user for an image file to mount */
+- (void)mountImageFile:(id)sender
+{
+    /* Display the file open dialog */
+    NSOpenPanel * openPanel;
+    openPanel = [NSOpenPanel openPanel];
+    [openPanel setCanChooseFiles: YES];
+    [openPanel setAllowsMultipleSelection: NO];
+    [openPanel setAllowedFileTypes: supportedImageFileTypes];
+    if([openPanel runModal] == NSFileHandlingPanelOKButton) {
+        NSString * file = [[[openPanel URLs] objectAtIndex: 0] path];
+        if(file == nil) {
+            NSBeep();
+            QEMU_Alert(@"Failed to convert URL to file path!");
+            return;
+        }
+
+        static int usbDiskCount;  // used for the ID
+        char *commandBuffer, *fileName, *idString, *fileNameHint;
+        NSString *buffer;
+        const int fileNameHintSize = 10;
+
+        fileName = g_strdup_printf("%s",
+                            [file cStringUsingEncoding: NSASCIIStringEncoding]);
+        buffer = [file lastPathComponent];
+        buffer = [buffer stringByDeletingPathExtension];
+        if([buffer length] > fileNameHintSize) {
+            buffer = [buffer substringToIndex: fileNameHintSize];
+        }
+        fileNameHint = g_strdup_printf("%s",
+                        [buffer cStringUsingEncoding: NSASCIIStringEncoding]);
+        idString = g_strdup_printf("%s_%s_%d", USB_DISK_ID, fileNameHint, usbDiskCount);
+        commandBuffer = g_strdup_printf("drive_add 0 if=none,id=%s,file=%s",
+                                                            idString, fileName);
+        sendMonitorCommand(commandBuffer);
+        commandBuffer = g_strdup_printf("device_add usb-storage,"
+                                         "id=%s,drive=%s", idString, idString);
+        sendMonitorCommand(commandBuffer);
+        [self updateEjectImageMenuItems];
+        usbDiskCount++;
+        g_free(fileName);
+        g_free(fileNameHint);
+        g_free(idString);
+        g_free(commandBuffer);
+    }
+}
+
+/* Removes an image file from QEMU */
+- (void)ejectImageFile:(id) sender
+{
+    char *commandBuffer;
+    NSString *imageFileID;
+
+    imageFileID = [sender representedObject];
+    if (imageFileID == nil) {
+        NSBeep();
+        QEMU_Alert(@"Could not find image file's ID!");
+        return;
+    }
+
+    commandBuffer = g_strdup_printf("drive_del %s",
+                    [imageFileID cStringUsingEncoding: NSASCIIStringEncoding]);
+    sendMonitorCommand(commandBuffer);
+    g_free(commandBuffer);
+
+    commandBuffer = g_strdup_printf("device_del %s",
+                        [imageFileID cStringUsingEncoding: NSASCIIStringEncoding]);
+    sendMonitorCommand(commandBuffer);
+    g_free(commandBuffer);
+
+    [self updateEjectImageMenuItems];
+}
+
+/* Gives each mounted image file an eject menu item */
+- (void) updateEjectImageMenuItems
+{
+    NSMenu *machineMenu;
+    machineMenu = [[[NSApp mainMenu] itemWithTitle:@"Machine"] submenu];
+
+    /* Remove old menu items*/
+    NSMenu * ejectSubmenu;
+    ejectSubmenu = [[machineMenu itemWithTag: EJECT_IMAGE_FILE_TAG] submenu];
+    if(!ejectSubmenu) {
+        NSBeep();
+        QEMU_Alert(@"Failed to find eject submenu!");
+        return;
+    }
+    int index;
+    for (index = 0; index < [ejectSubmenu numberOfItems]; index++) {
+        [ejectSubmenu removeItemAtIndex: 0];
+    }
+     /* Needed probably because of a bug with cocoa */
+    if ([ejectSubmenu numberOfItems] > 0) {
+        [ejectSubmenu removeItemAtIndex: 0];
+    }
+
+    BlockInfoList *currentDevice;
+    currentDevice = qmp_query_block(NULL);
+
+    NSString *fileName, *deviceName;
+    NSMenuItem *ejectFileMenuItem;  /* Used with each mounted image file */
+
+    /* Look for mounted image files */
+    while(currentDevice) {
+        if (!currentDevice->value || !currentDevice->value->inserted
+                                  || !currentDevice->value->inserted->file) {
+            currentDevice = currentDevice->next;
+            continue;
+        }
+
+        /* if the device's name is the generated ID */
+        if (!strstr(currentDevice->value->device, USB_DISK_ID)) {
+            currentDevice = currentDevice->next;
+            continue;
+        }
+
+        fileName = [NSString stringWithFormat: @"%s", currentDevice->value->inserted->file];
+        fileName = [fileName lastPathComponent]; /* To obtain only the file name */
+
+        ejectFileMenuItem = [[NSMenuItem alloc] initWithTitle: [NSString stringWithFormat: @"Eject %@", fileName]
+                                                  action: @selector(ejectImageFile:)
+                                           keyEquivalent: @""];
+        [ejectSubmenu addItem: ejectFileMenuItem];
+        deviceName = [NSString stringWithFormat: @"%s", currentDevice->value->device];
+        [ejectFileMenuItem setRepresentedObject: deviceName];
+        [ejectFileMenuItem autorelease];
+        currentDevice = currentDevice->next;
+    }
+
+    /* Add default menu item if submenu is empty */
+    if ([ejectSubmenu numberOfItems] == 0) {
+
+        /* Create the default menu item */
+        NSMenuItem *emptyMenuItem;
+        emptyMenuItem = [NSMenuItem new];
+        [emptyMenuItem setTitle: @"No items available"];
+        [emptyMenuItem setEnabled: NO];
+
+        /* Add the default menu item to the submenu */
+        [ejectSubmenu addItem: emptyMenuItem];
+        [emptyMenuItem release];
+    }
+}
+
+/* The action method to the items in the Send Keys menu */
+- (IBAction)do_send_key_menu_item:(id)sender {
+    NSString *keys = [sender representedObject];
+    NSArray *key_array = [keys componentsSeparatedByString: @","];
+    #define array_size 0xff
+    int keydown_array[array_size] = {0};
+    int index, keycode;
+    NSString *hex_string;
+
+    for (index = 0; index < [key_array count]; index++) {
+        hex_string = [key_array objectAtIndex: index];
+        sscanf([hex_string cStringUsingEncoding: NSASCIIStringEncoding], "%x",
+               &keycode);
+        keycode = cocoa_keycode_to_qemu(keycode);
+        qemu_input_event_send_key_qcode(dcl->con, keycode, true);
+        keydown_array[keycode] = 1;
+    }
+
+    /* Send keyup event for all keys that were sent */
+    for (index = 0; index < array_size; index++) {
+        if (keydown_array[index] != 0) {
+            qemu_input_event_send_key_qcode(dcl->con, index, false);
+        }
+    }
+}
+
+/* Used by the Speed menu items */
+- (void)adjustSpeed:(id)sender
+{
+    int speed, menu_number, count, item;
+    NSMenu *menu;
+    NSArray *itemArray;
+
+    // uncheck all the menu items in the Speed menu
+    menu = [sender menu];
+    if (menu != nil)
+    {
+        count = [[menu itemArray] count];
+        itemArray = [menu itemArray];
+        for (item = 0; item < count; item++)  // unselect each item
+            [[itemArray objectAtIndex: item] setState: NSOffState];
+    }
+
+    // check the menu item
+    [sender setState: NSOnState];
+
+    // get the menu number
+    menu_number = [sender tag];
+
+    /* Calculate the speed */
+    speed = -1 * menu_number + 100;
+    cpu_throttle_set(speed);
+    COCOA_DEBUG("cpu throttling at %d%c\n", cpu_throttle_get_percentage(), '%');
+}
+
+/* Have QEMU use a real CD/DVD disc */
+- (void)useRealCdrom:(id)sender
+{
+    char cdrom_drive_name[MAX_DEVICE_NAME_SIZE];
+    if (emulatorHasDevice("cd", cdrom_drive_name)) {
+        Error *err = NULL;
+        qmp_blockdev_change_medium(true,
+                           [[sender representedObject] cStringUsingEncoding:
+                           NSASCIIStringEncoding],
+                           false, NULL,
+                           "/dev/cdrom",
+                           true, "raw",
+                           false, 0,
+                           &err);
+        handleAnyDeviceErrors(err);
+    } else {
+        NSBeep();
+        NSRunAlertPanel(@"Alert", @"No real optical media found.", @"OK", nil, nil);
+    }
+}
+
+/* Used by the Edit -> Paste menu item to paste text into the guest */
+- (void)doPaste:(id)sender
+{
+    NSPasteboard *pboard = [NSPasteboard generalPasteboard];
+    NSString *text = [pboard stringForType: NSStringPboardType];
+    char *command_buffer, *buffer;
+    int index;
+    
+    /*
+     * Delay in milliseconds - slows input down - without it input reaches the
+     * guest too fast for it to process.
+     */
+    const int delay = 20;
+    
+    for (index = 0; index < [text length]; index++) {
+        buffer = ascii_to_sendkey([text characterAtIndex: index]);
+        command_buffer = g_strdup_printf("sendkey %s %d", buffer, delay);
+        sendMonitorCommand(command_buffer);
+        g_free(buffer);
+        g_free(command_buffer);
+    }
+}
+
 @end
 
+/* Determines if '-sendkeymenu' is in the arguments sent to QEMU */
+static int send_key_support(void) {
+    int index;
+    for (index = 0; index < gArgc; index++) {
+        if (strcmp("-sendkeymenu", gArgv[index]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Remove one of the options from the global variable gArgv */
+static void remove_option(int index)
+{
+    if (index < 0) {
+        printf("Error: remove_option(): index less than zero: %d\n", index);
+        return;
+    } else if (index >= gArgc) {
+        printf("Error: remove_option(): index too big: %d\n", index);
+        return;
+    }
+    gArgc--;
+    /* copy everything from index + 1 to the end */
+    for (; index < gArgc; index++) {
+        gArgv[index] = gArgv[index+1];
+    }
+}
+
+/* Creates the Send Key menu and populates it */
+static void create_send_key_menu(void) {
+    NSMenu *menu;
+    menu = [[NSMenu alloc] initWithTitle:@"Send Key"];
+
+    /* Find the index of the sendkeymenu and its items */
+    int send_key_index = -1;
+    int index;
+    for (index = 0; index < gArgc; index++) {
+        if (strcmp("-sendkeymenu", gArgv[index]) == 0) {
+            send_key_index = index;
+            break;
+        }
+    }
+
+    /* if failed to find the -sendkeymenu argument */
+    if (send_key_index == -1) {
+        printf("Failed to find 'sendkeymenu' arguments\n");
+        exit(EXIT_FAILURE);
+    }
+
+    NSMenuItem *menu_item;
+    char *token;
+    token = strtok(gArgv[send_key_index+1], ":");
+
+    /* loop thru each set of keys */
+    while (token) {
+        menu_item = [[[NSMenuItem alloc] initWithTitle: [NSString stringWithCString: token encoding:NSASCIIStringEncoding]
+                                                action: @selector(do_send_key_menu_item:)
+                                         keyEquivalent: @""] autorelease];
+        [menu addItem: menu_item];
+        token = strtok(NULL, ":");
+
+        [menu_item setRepresentedObject: [NSString stringWithCString: token encoding: NSASCIIStringEncoding]];
+        token = strtok(NULL, ":");
+    }
+
+    /* Add the menu to QEMU's menubar */
+    menu_item = [[[NSMenuItem alloc] initWithTitle: @"Send Key"
+                                            action:nil
+                                     keyEquivalent:@""] autorelease];
+    [menu_item setSubmenu:menu];
+    [[NSApp mainMenu] addItem:menu_item];
+
+    /* Remove the -sendkeymenu and related options from the global variable */
+    remove_option(send_key_index);
+    remove_option(send_key_index);
+}
 
 int main (int argc, const char * argv[]) {
 
@@ -1294,6 +1744,13 @@ int main (int argc, const char * argv[]) {
     [[NSApp mainMenu] addItem:menuItem];
     [NSApp performSelector:@selector(setAppleMenu:) withObject:menu]; // Workaround (this method is private since 10.4+)
 
+    // Edit menu
+    menu = [[NSMenu alloc] initWithTitle: @"Edit"];
+    [menu addItem: [[[NSMenuItem alloc] initWithTitle:@"Paste" action:@selector(doPaste:) keyEquivalent:@""] autorelease]];
+    menuItem = [[[NSMenuItem alloc] initWithTitle: @"Edit" action:nil keyEquivalent:@""] autorelease];
+    [menuItem setSubmenu:menu];
+    [[NSApp mainMenu] addItem:menuItem];
+
     // Machine menu
     menu = [[NSMenu alloc] initWithTitle: @"Machine"];
     [menu setAutoenablesItems: NO];
@@ -1308,11 +1765,39 @@ int main (int argc, const char * argv[]) {
     [menuItem setSubmenu:menu];
     [[NSApp mainMenu] addItem:menuItem];
 
+    // Send Key menu
+    if (send_key_support()) {
+        create_send_key_menu();
+    }
+
     // View menu
     menu = [[NSMenu alloc] initWithTitle:@"View"];
     [menu addItem: [[[NSMenuItem alloc] initWithTitle:@"Enter Fullscreen" action:@selector(doToggleFullScreen:) keyEquivalent:@"f"] autorelease]]; // Fullscreen
     [menu addItem: [[[NSMenuItem alloc] initWithTitle:@"Zoom To Fit" action:@selector(zoomToFit:) keyEquivalent:@""] autorelease]];
     menuItem = [[[NSMenuItem alloc] initWithTitle:@"View" action:nil keyEquivalent:@""] autorelease];
+    [menuItem setSubmenu:menu];
+    [[NSApp mainMenu] addItem:menuItem];
+
+    // Speed menu
+    menu = [[NSMenu alloc] initWithTitle:@"Speed"];
+
+    // The 100% menu item has to be checked at the start
+    menuItem = [[[NSMenuItem alloc] initWithTitle:@"100%" action:@selector(adjustSpeed:) keyEquivalent:@""] autorelease];
+    [menuItem setTag: 100];
+    [menuItem setState: NSOnState];
+    [menu addItem: menuItem];
+
+    // Add the rest of the menu items
+    int p, percentage;
+    for (p = 9; p >= 0; p--)
+    {
+        percentage = p * 10 > 1 ? p * 10 : 1; // prevent a 0% menu item
+        menuItem = [[[NSMenuItem alloc]
+                   initWithTitle: [NSString stringWithFormat: @"%d%c", percentage, '%'] action:@selector(adjustSpeed:) keyEquivalent:@""] autorelease];
+        [menuItem setTag: percentage];
+        [menu addItem: menuItem];
+    }
+    menuItem = [[[NSMenuItem alloc] initWithTitle:@"Speed" action:nil keyEquivalent:@""] autorelease];
     [menuItem setSubmenu:menu];
     [[NSApp mainMenu] addItem:menuItem];
 
@@ -1492,8 +1977,17 @@ static void addRemovableDevicesMenuItems(void)
     /* Loop through all the block devices in the emulator */
     while (currentDevice) {
         deviceName = [[NSString stringWithFormat: @"%s", currentDevice->value->device] retain];
-
         if(currentDevice->value->removable) {
+            /* If CD-ROM drive found, add menu item for using real drive */
+            if (strstr(currentDevice->value->device, "cd") != NULL) {
+                menuItem = [[NSMenuItem alloc] initWithTitle: @"Use Real Optical Media"
+                                                      action: @selector(useRealCdrom:)
+                                               keyEquivalent: @""];
+                [menu addItem: menuItem];
+                [menuItem setRepresentedObject: deviceName];
+                [menuItem autorelease];
+            }
+
             menuItem = [[NSMenuItem alloc] initWithTitle: [NSString stringWithFormat: @"Change %s...", currentDevice->value->device]
                                                   action: @selector(changeDeviceMedia:)
                                            keyEquivalent: @""];
@@ -1511,6 +2005,29 @@ static void addRemovableDevicesMenuItems(void)
         currentDevice = currentDevice->next;
     }
     qapi_free_BlockInfoList(pointerToFree);
+    [menu addItem: [[[NSMenuItem alloc] initWithTitle: @"Mount Image File..." action: @selector(mountImageFile:) keyEquivalent: @""] autorelease]];
+
+    /* Create the eject menu item */
+    NSMenuItem *ejectMenuItem;
+    ejectMenuItem = [NSMenuItem new];
+    [ejectMenuItem setTitle: @"Eject Image File"];
+    [ejectMenuItem setTag: EJECT_IMAGE_FILE_TAG];
+    [menu addItem: ejectMenuItem];
+    [ejectMenuItem autorelease];
+
+    /* Create the default menu item for the eject menu item's submenu*/
+    NSMenuItem *emptyMenuItem;
+    emptyMenuItem = [NSMenuItem new];
+    [emptyMenuItem setTitle: @"No items available"];
+    [emptyMenuItem setEnabled: NO];
+    [emptyMenuItem autorelease];
+
+    /* Add the default menu item to the submenu */
+    NSMenu *submenu;
+    submenu = [NSMenu new];
+    [ejectMenuItem setSubmenu: submenu];
+    [submenu addItem: emptyMenuItem];
+    [submenu autorelease];
 }
 
 void cocoa_display_init(DisplayState *ds, int full_screen)
