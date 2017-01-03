@@ -47,6 +47,39 @@
 #define MAC_OS_X_VERSION_10_10 101000
 #endif
 
+/* These are defined to quiet deprecation warnings */
+#ifdef __MAC_10_12
+#define NSAnyEventMask NSEventMaskAny
+
+#define NSAlternateKeyMask NSEventModifierFlagOption
+#define NSCommandKeyMask NSEventModifierFlagCommand
+#define NSControlKeyMask NSEventModifierFlagControl
+
+#define NSCenterTextAlignment NSTextAlignmentCenter
+
+//NSWindowStyle flags
+#define NSMiniaturizableWindowMask NSWindowStyleMaskMiniaturizable
+#define NSClosableWindowMask NSWindowStyleMaskClosable
+#define NSTitledWindowMask NSWindowStyleMaskTitled
+#define NSBorderlessWindowMask NSWindowStyleMaskBorderless
+
+// NSEvent flags
+#define NSScrollWheel NSEventTypeScrollWheel
+#define NSFlagsChanged NSEventTypeFlagsChanged
+#define NSKeyDown NSEventTypeKeyDown
+#define NSKeyUp NSEventTypeKeyUp
+#define NSMouseMoved NSEventTypeMouseMoved
+#define NSLeftMouseDown NSEventTypeLeftMouseDown
+#define NSRightMouseDown NSEventTypeRightMouseDown
+#define NSOtherMouseDown NSEventTypeOtherMouseDown
+#define NSLeftMouseDragged NSEventTypeLeftMouseDragged
+#define NSRightMouseDragged NSEventTypeRightMouseDragged
+#define NSOtherMouseDragged NSEventTypeOtherMouseDragged
+#define NSLeftMouseUp NSEventTypeLeftMouseUp
+#define NSRightMouseUp NSEventTypeRightMouseUp
+#define NSOtherMouseUp NSEventTypeOtherMouseUp
+#endif
+
 
 //#define DEBUG
 
@@ -68,15 +101,15 @@ typedef struct {
     int bitsPerPixel;
 } QEMUScreen;
 
-NSWindow *normalWindow, *about_window;
+static NSWindow *normalWindow, *about_window;
 static DisplayChangeListener *dcl;
 static int last_buttons;
 
 int gArgc;
 char **gArgv;
 bool stretch_video;
-NSTextField *pauseLabel;
-NSArray * supportedImageFileTypes;
+static NSTextField *pauseLabel;
+static NSArray * supportedImageFileTypes;
 
 // Mac to QKeyCode conversion
 const int mac_to_qkeycode_map[] = {
@@ -361,7 +394,7 @@ static char *ascii_to_sendkey(int c)
 {
     QEMUScreen screen;
     NSWindow *fullScreenWindow;
-    float cx,cy,cw,ch,cdx,cdy;
+    CGFloat cx,cy,cw,ch,cdx,cdy;
     CGDataProviderRef dataProviderRef;
     int modifiers_state[256];
     BOOL isMouseGrabbed;
@@ -374,7 +407,6 @@ static char *ascii_to_sendkey(int c)
 - (void) ungrabMouse;
 - (void) toggleFullScreen:(id)sender;
 - (void) handleEvent:(NSEvent *)event;
-- (void) setAbsoluteEnabled:(BOOL)tIsAbsoluteEnabled;
 /* The state surrounding mouse grabbing is potentially confusing.
  * isAbsoluteEnabled tracks qemu_input_is_absolute() [ie "is the emulated
  *   pointing device an absolute-position one?"], but is only updated on
@@ -387,18 +419,25 @@ static char *ascii_to_sendkey(int c)
  *   CGAssociateMouseAndMouseCursorPosition(FALSE)
  *   (which basically happens if we grab in non-absolute mode).
  */
-- (BOOL) isMouseGrabbed;
-- (BOOL) isAbsoluteEnabled;
-- (BOOL) isMouseDeassociated;
-- (float) cdx;
-- (float) cdy;
-- (QEMUScreen) gscreen;
+@property (readonly, getter=isMouseGrabbed) BOOL mouseGrabbed;
+@property (getter=isAbsoluteEnabled) BOOL absoluteEnabled;
+@property (readonly, getter=isMouseDeassociated) BOOL mouseDeassociated;
+@property (readonly) CGFloat cdx;
+@property (readonly) CGFloat cdy;
+@property (readonly) QEMUScreen gscreen;
 - (void) raiseAllKeys;
 @end
 
 QemuCocoaView *cocoaView;
 
 @implementation QemuCocoaView
+@synthesize mouseGrabbed = isMouseGrabbed;
+@synthesize absoluteEnabled = isAbsoluteEnabled;
+@synthesize mouseDeassociated = isMouseDeassociated;
+@synthesize cdx;
+@synthesize cdy;
+@synthesize gscreen = screen;
+
 - (id)initWithFrame:(NSRect)frameRect
 {
     COCOA_DEBUG("QemuCocoaView: initWithFrame\n");
@@ -467,24 +506,27 @@ QemuCocoaView *cocoaView;
         CGContextSetRGBFillColor(viewContextRef, 0, 0, 0, 1.0);
         CGContextFillRect(viewContextRef, NSRectToCGRect(rect));
     } else {
+        CGColorSpaceRef col =
+        #ifdef __LITTLE_ENDIAN__
+            CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB); //colorspace for OS X >= 10.4
+        #else
+            CGColorSpaceCreateDeviceRGB(); //colorspace for OS X < 10.4 (actually ppc)
+        #endif
+        
         CGImageRef imageRef = CGImageCreate(
             screen.width, //width
             screen.height, //height
             screen.bitsPerComponent, //bitsPerComponent
             screen.bitsPerPixel, //bitsPerPixel
             (screen.width * (screen.bitsPerComponent/2)), //bytesPerRow
-#ifdef __LITTLE_ENDIAN__
-            CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB), //colorspace for OS X >= 10.4
-            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
-#else
-            CGColorSpaceCreateDeviceRGB(), //colorspace for OS X < 10.4 (actually ppc)
-            kCGImageAlphaNoneSkipFirst, //bitmapInfo
-#endif
+            col,
+            kCGBitmapByteOrder32Host | kCGImageAlphaNoneSkipFirst,
             dataProviderRef, //provider
             NULL, //decode
             0, //interpolate
             kCGRenderingIntentDefault //intent
         );
+        CGColorSpaceRelease(col);
         // selective drawing code (draws only dirty rectangles) (OS X >= 10.4)
         const NSRect *rectList;
         NSInteger rectCount;
@@ -495,7 +537,7 @@ QemuCocoaView *cocoaView;
         [self getRectsBeingDrawn:&rectList count:&rectCount];
         for (i = 0; i < rectCount; i++) {
             clipRect.origin.x = rectList[i].origin.x / cdx;
-            clipRect.origin.y = (float)screen.height - (rectList[i].origin.y + rectList[i].size.height) / cdy;
+            clipRect.origin.y = (CGFloat)screen.height - (rectList[i].origin.y + rectList[i].size.height) / cdy;
             clipRect.size.width = rectList[i].size.width / cdx;
             clipRect.size.height = rectList[i].size.height / cdy;
             clipImageRef = CGImageCreateWithImageInRect(
@@ -514,8 +556,8 @@ QemuCocoaView *cocoaView;
     COCOA_DEBUG("QemuCocoaView: setContentDimensions\n");
 
     if (isFullscreen) {
-        cdx = [[NSScreen mainScreen] frame].size.width / (float)screen.width;
-        cdy = [[NSScreen mainScreen] frame].size.height / (float)screen.height;
+        cdx = [[NSScreen mainScreen] frame].size.width / (CGFloat)screen.width;
+        cdy = [[NSScreen mainScreen] frame].size.height / (CGFloat)screen.height;
 
         /* stretches video, but keeps same aspect ratio */
         if (stretch_video == true) {
@@ -894,14 +936,6 @@ QemuCocoaView *cocoaView;
     isMouseGrabbed = FALSE;
 }
 
-- (void) setAbsoluteEnabled:(BOOL)tIsAbsoluteEnabled {isAbsoluteEnabled = tIsAbsoluteEnabled;}
-- (BOOL) isMouseGrabbed {return isMouseGrabbed;}
-- (BOOL) isAbsoluteEnabled {return isAbsoluteEnabled;}
-- (BOOL) isMouseDeassociated {return isMouseDeassociated;}
-- (float) cdx {return cdx;}
-- (float) cdy {return cdy;}
-- (QEMUScreen) gscreen {return screen;}
-
 /*
  * Makes the target think all down keys are being released.
  * This prevents a stuck key problem, since we will not see
@@ -936,29 +970,29 @@ QemuCocoaView *cocoaView;
 }
 - (void)startEmulationWithArgc:(int)argc argv:(char**)argv;
 - (void)doToggleFullScreen:(id)sender;
-- (void)toggleFullScreen:(id)sender;
-- (void)showQEMUDoc:(id)sender;
-- (void)zoomToFit:(id) sender;
-- (void)displayConsole:(id)sender;
-- (void)pauseQEMU:(id)sender;
-- (void)resumeQEMU:(id)sender;
+- (IBAction)toggleFullScreen:(id)sender;
+- (IBAction)showQEMUDoc:(id)sender;
+- (IBAction)zoomToFit:(id) sender;
+- (IBAction)displayConsole:(id)sender;
+- (IBAction)pauseQEMU:(id)sender;
+- (IBAction)resumeQEMU:(id)sender;
 - (void)displayPause;
 - (void)removePause;
-- (void)restartQEMU:(id)sender;
-- (void)powerDownQEMU:(id)sender;
-- (void)ejectDeviceMedia:(id)sender;
-- (void)changeDeviceMedia:(id)sender;
+- (IBAction)restartQEMU:(id)sender;
+- (IBAction)powerDownQEMU:(id)sender;
+- (IBAction)ejectDeviceMedia:(id)sender;
+- (IBAction)changeDeviceMedia:(id)sender;
 - (BOOL)verifyQuit;
 - (void)openDocumentation:(NSString *)filename;
 - (IBAction) do_about_menu_item: (id) sender;
 - (void)make_about_window;
-- (void)mountImageFile:(id)sender;
-- (void)ejectImageFile:(id)sender;
+- (IBAction)mountImageFile:(id)sender;
+- (IBAction)ejectImageFile:(id)sender;
 - (void)updateEjectImageMenuItems;
 - (IBAction)do_send_key_menu_item:(id)sender;
-- (void)adjustSpeed:(id)sender;
-- (void)useRealCdrom:(id)sender;
-- (void)doPaste:(id)sender;
+- (IBAction)adjustSpeed:(id)sender;
+- (IBAction)useRealCdrom:(id)sender;
+- (IBAction)doPaste:(id)sender;
 @end
 
 @implementation QemuCocoaAppController
@@ -1008,9 +1042,11 @@ QemuCocoaView *cocoaView;
         [pauseLabel sizeToFit];
 
         // set the supported image file types that can be opened
-        supportedImageFileTypes = [NSArray arrayWithObjects: @"img", @"iso", @"dmg",
+        if (!supportedImageFileTypes) {
+        supportedImageFileTypes = [[NSArray arrayWithObjects: @"img", @"iso", @"dmg",
                                  @"qcow", @"qcow2", @"cloop", @"vmdk", @"cdr",
-                                 @"toast", nil];
+                                 @"toast", nil] copy];
+        }
         [self make_about_window];
     }
     return self;
@@ -1234,7 +1270,7 @@ QemuCocoaView *cocoaView;
     [openPanel setAllowsMultipleSelection: NO];
     [openPanel setAllowedFileTypes: supportedImageFileTypes];
     if([openPanel runModal] == NSFileHandlingPanelOKButton) {
-        NSString * file = [[[openPanel URLs] objectAtIndex: 0] path];
+        NSURL * file = [[openPanel URLs] objectAtIndex: 0];
         if(file == nil) {
             NSBeep();
             QEMU_Alert(@"Failed to convert URL to file path!");
@@ -1246,8 +1282,7 @@ QemuCocoaView *cocoaView;
                                    [drive cStringUsingEncoding:
                                           NSASCIIStringEncoding],
                                    false, NULL,
-                                   [file cStringUsingEncoding:
-                                         NSASCIIStringEncoding],
+                                   [file fileSystemRepresentation],
                                    true, "raw",
                                    false, 0,
                                    &err);
@@ -1388,14 +1423,14 @@ QemuCocoaView *cocoaView;
         const int fileNameHintSize = 10;
 
         fileName = g_strdup_printf("%s",
-                            [file cStringUsingEncoding: NSASCIIStringEncoding]);
+                            [file fileSystemRepresentation]);
         buffer = [file lastPathComponent];
         buffer = [buffer stringByDeletingPathExtension];
         if([buffer length] > fileNameHintSize) {
             buffer = [buffer substringToIndex: fileNameHintSize];
         }
         fileNameHint = g_strdup_printf("%s",
-                        [buffer cStringUsingEncoding: NSASCIIStringEncoding]);
+                        [buffer UTF8String]);
         idString = g_strdup_printf("%s_%s_%d", USB_DISK_ID, fileNameHint, usbDiskCount);
         commandBuffer = g_strdup_printf("drive_add 0 if=none,id=%s,file=%s",
                                                             idString, fileName);
@@ -1581,7 +1616,11 @@ QemuCocoaView *cocoaView;
         handleAnyDeviceErrors(err);
     } else {
         NSBeep();
-        NSRunAlertPanel(@"Alert", @"No real optical media found.", @"OK", nil, nil);
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Alert";
+        alert.informativeText = @"No real optical media found.";
+        [alert runModal];
+        [alert release];
     }
 }
 
