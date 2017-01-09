@@ -101,7 +101,7 @@ typedef struct {
     int bitsPerPixel;
 } QEMUScreen;
 
-static NSWindow *normalWindow, *about_window;
+static NSWindow *normalWindow, *about_window, *stop_window;
 static DisplayChangeListener *dcl;
 static int last_buttons;
 
@@ -383,6 +383,28 @@ static char *ascii_to_sendkey(int c)
     }
 
     return g_strdup_printf("%s", translation_matrix[c]);
+}
+
+/* 
+ * Determines if the current event is caused by a key being pushed.
+ * The modifier keys (i.e. Command) don't sent a keydown or keyup event.
+ */
+static bool isKeyDownEvent(NSEvent *event)
+{
+    /* Translate a key to a key mask */
+    const int key_translation[] = {
+    [kVK_Command] = NSCommandKeyMask,
+    [54] = NSCommandKeyMask,    /* There is no kVK_RightCommand */
+    [kVK_Option] = NSAlternateKeyMask,
+    [kVK_RightOption] = NSAlternateKeyMask,
+    [kVK_Control] = NSControlKeyMask,
+    [kVK_RightControl] = NSControlKeyMask,
+    [kVK_Shift] = NSShiftKeyMask,
+    [kVK_RightShift] = NSShiftKeyMask
+    };
+    
+    /* See if the key that caused the event is currently down */
+    return [event modifierFlags] & key_translation[[event keyCode]];
 }
 
 /*
@@ -699,7 +721,7 @@ QemuCocoaView *cocoaView;
                     qemu_input_event_send_key_qcode(dcl->con, keycode, true);
                     qemu_input_event_send_key_qcode(dcl->con, keycode, false);
                 } else if (qemu_console_is_graphic(NULL)) {
-                    if (modifiers_state[keycode] == 0) { // keydown
+                    if (isKeyDownEvent(event)) { //keydown
                         qemu_input_event_send_key_qcode(dcl->con, keycode, true);
                         modifiers_state[keycode] = 1;
                     } else { // keyup
@@ -964,9 +986,12 @@ QemuCocoaView *cocoaView;
 */
 @interface QemuCocoaAppController : NSObject
 #if (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_6)
-                                       <NSWindowDelegate, NSApplicationDelegate>
+                      <NSMenuDelegate, NSWindowDelegate, NSApplicationDelegate>
+#else
+                      <NSMenuDelegate>
 #endif
 {
+    NSTimer *paste_timer;
 }
 - (void)startEmulationWithArgc:(int)argc argv:(char**)argv;
 - (void)doToggleFullScreen:(id)sender;
@@ -993,6 +1018,8 @@ QemuCocoaView *cocoaView;
 - (IBAction)adjustSpeed:(id)sender;
 - (IBAction)useRealCdrom:(id)sender;
 - (IBAction)doPaste:(id)sender;
+- (void)make_stop_window;
+- (void)do_stop_button:(id)sender;
 @end
 
 @implementation QemuCocoaAppController
@@ -1048,6 +1075,7 @@ QemuCocoaView *cocoaView;
                                  @"toast", nil] copy];
         }
         [self make_about_window];
+        [self make_stop_window];
     }
     return self;
 }
@@ -1624,27 +1652,88 @@ QemuCocoaView *cocoaView;
     }
 }
 
-/* Used by the Edit -> Paste menu item to paste text into the guest */
+/* The action method to the Edit->Paste menu item */
 - (void)doPaste:(id)sender
+{
+    const float speed = 1.0/7.0; // The smaller the number the faster the speed
+    NSMutableString *counter_string = [[NSMutableString alloc] initWithCapacity: 10];
+    [counter_string setString: @"0"];
+    paste_timer = [NSTimer scheduledTimerWithTimeInterval: speed target: self selector:@selector(doPasteWorker:) userInfo:counter_string repeats:YES];
+    [stop_window makeKeyAndOrderFront: nil];
+    [counter_string autorelease];
+}
+
+/* Does the pasting work - called by a timer */
+- (void)doPasteWorker:(NSTimer*) timer
 {
     NSPasteboard *pboard = [NSPasteboard generalPasteboard];
     NSString *text = [pboard stringForType: NSStringPboardType];
+    NSMutableString *counter_string;
     char *command_buffer, *buffer;
     int index;
+    const int delay = 0;
     
-    /*
-     * Delay in milliseconds - slows input down - without it input reaches the
-     * guest too fast for it to process.
-     */
-    const int delay = 20;
+    counter_string = [timer userInfo];
+    index = [counter_string intValue];
+    buffer = ascii_to_sendkey([text characterAtIndex: index]);
+    command_buffer = g_strdup_printf("sendkey %s %d", buffer, delay);
+    sendMonitorCommand(command_buffer);
+    g_free(buffer);
+    g_free(command_buffer);
+    index++;
     
-    for (index = 0; index < [text length]; index++) {
-        buffer = ascii_to_sendkey([text characterAtIndex: index]);
-        command_buffer = g_strdup_printf("sendkey %s %d", buffer, delay);
-        sendMonitorCommand(command_buffer);
-        g_free(buffer);
-        g_free(command_buffer);
+    /* If all the text has been pasted */
+    if (index >= [text length]) {
+        [timer invalidate];
+        [stop_window orderOut: self];
     }
+    [counter_string setString: [[NSNumber numberWithInt: index] stringValue]];
+}
+
+/*
+ * If the user holds down a button and clicks on one of QEMU's menus, then
+ * releases the button, a stuck key situation will take place after the menu is
+ * closed.
+ */
+- (void)menuDidClose:(NSMenu *)menu
+{
+    [cocoaView raiseAllKeys];
+}
+
+/* Display a window with a stop button on it. For the pasting feature. */
+- (void)make_stop_window
+{
+    /* Make the window */
+    int window_width, window_height;
+    window_width = 250;
+    window_height = 90;
+    NSRect contentRect = NSMakeRect(0, 0, window_width, window_height);
+    stop_window = [[NSWindow alloc] initWithContentRect:contentRect
+            styleMask:NSTitledWindowMask|NSMiniaturizableWindowMask
+            backing:NSBackingStoreBuffered defer:NO];
+    [stop_window setTitle: @"Pasting from clipboard..."];
+    [stop_window center];
+
+    /* Make the stop button */
+    int button_width = 96;
+    int button_height = 32;
+    int button_x = window_width/2 - button_width/2;
+    int button_y = 35;
+    contentRect = NSMakeRect(button_x, button_y, button_width, button_height);
+    NSButton *stop_button = [[[NSButton alloc] initWithFrame:contentRect] autorelease];
+    [[stop_window contentView] addSubview: stop_button];
+    [stop_button setTitle: @"Stop"];
+    [stop_button setButtonType:NSMomentaryLightButton];
+    [stop_button setBezelStyle:NSRoundedBezelStyle];
+    [stop_button setTarget:self];
+    [stop_button setAction:@selector(do_stop_button:)];
+}
+
+/* The stop button for the stop_window - stops pasting text into guest */
+- (void)do_stop_button:(id)sender
+{
+    [stop_window orderOut: self];
+    [paste_timer invalidate];
 }
 
 @end
@@ -1681,6 +1770,7 @@ static void remove_option(int index)
 static void create_send_key_menu(void) {
     NSMenu *menu;
     menu = [[NSMenu alloc] initWithTitle:@"Send Key"];
+    [menu setDelegate: [NSApp delegate]];
 
     /* Find the index of the sendkeymenu and its items */
     int send_key_index = -1;
@@ -1762,6 +1852,10 @@ int main (int argc, const char * argv[]) {
 
     [NSApplication sharedApplication];
 
+    // Create an Application controller
+    QemuCocoaAppController *appController = [[QemuCocoaAppController alloc] init];
+    [NSApp setDelegate:appController];
+
     // Add menus
     NSMenu      *menu;
     NSMenuItem  *menuItem;
@@ -1770,6 +1864,7 @@ int main (int argc, const char * argv[]) {
 
     // Application menu
     menu = [[NSMenu alloc] initWithTitle:@""];
+    [menu setDelegate: appController];
     [menu addItemWithTitle:@"About QEMU" action:@selector(do_about_menu_item:) keyEquivalent:@""]; // About QEMU
     [menu addItem:[NSMenuItem separatorItem]]; //Separator
     [menu addItemWithTitle:@"Hide QEMU" action:@selector(hide:) keyEquivalent:@"h"]; //Hide QEMU
@@ -1785,6 +1880,7 @@ int main (int argc, const char * argv[]) {
 
     // Edit menu
     menu = [[NSMenu alloc] initWithTitle: @"Edit"];
+    [menu setDelegate: appController];
     [menu addItem: [[[NSMenuItem alloc] initWithTitle:@"Paste" action:@selector(doPaste:) keyEquivalent:@""] autorelease]];
     menuItem = [[[NSMenuItem alloc] initWithTitle: @"Edit" action:nil keyEquivalent:@""] autorelease];
     [menuItem setSubmenu:menu];
@@ -1792,6 +1888,7 @@ int main (int argc, const char * argv[]) {
 
     // Machine menu
     menu = [[NSMenu alloc] initWithTitle: @"Machine"];
+    [menu setDelegate: appController];
     [menu setAutoenablesItems: NO];
     [menu addItem: [[[NSMenuItem alloc] initWithTitle: @"Pause" action: @selector(pauseQEMU:) keyEquivalent: @""] autorelease]];
     menuItem = [[[NSMenuItem alloc] initWithTitle: @"Resume" action: @selector(resumeQEMU:) keyEquivalent: @""] autorelease];
@@ -1811,6 +1908,7 @@ int main (int argc, const char * argv[]) {
 
     // View menu
     menu = [[NSMenu alloc] initWithTitle:@"View"];
+    [menu setDelegate: appController];
     [menu addItem: [[[NSMenuItem alloc] initWithTitle:@"Enter Fullscreen" action:@selector(doToggleFullScreen:) keyEquivalent:@"f"] autorelease]]; // Fullscreen
     [menu addItem: [[[NSMenuItem alloc] initWithTitle:@"Zoom To Fit" action:@selector(zoomToFit:) keyEquivalent:@""] autorelease]];
     menuItem = [[[NSMenuItem alloc] initWithTitle:@"View" action:nil keyEquivalent:@""] autorelease];
@@ -1819,6 +1917,7 @@ int main (int argc, const char * argv[]) {
 
     // Speed menu
     menu = [[NSMenu alloc] initWithTitle:@"Speed"];
+    [menu setDelegate: appController];
 
     // The 100% menu item has to be checked at the start
     menuItem = [[[NSMenuItem alloc] initWithTitle:@"100%" action:@selector(adjustSpeed:) keyEquivalent:@""] autorelease];
@@ -1842,6 +1941,7 @@ int main (int argc, const char * argv[]) {
 
     // Window menu
     menu = [[NSMenu alloc] initWithTitle:@"Window"];
+    [menu setDelegate: appController];
     [menu addItem: [[[NSMenuItem alloc] initWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"] autorelease]]; // Miniaturize
     menuItem = [[[NSMenuItem alloc] initWithTitle:@"Window" action:nil keyEquivalent:@""] autorelease];
     [menuItem setSubmenu:menu];
@@ -1850,14 +1950,11 @@ int main (int argc, const char * argv[]) {
 
     // Help menu
     menu = [[NSMenu alloc] initWithTitle:@"Help"];
+    [menu setDelegate: appController];
     [menu addItem: [[[NSMenuItem alloc] initWithTitle:@"QEMU Documentation" action:@selector(showQEMUDoc:) keyEquivalent:@"?"] autorelease]]; // QEMU Help
     menuItem = [[[NSMenuItem alloc] initWithTitle:@"Window" action:nil keyEquivalent:@""] autorelease];
     [menuItem setSubmenu:menu];
     [[NSApp mainMenu] addItem:menuItem];
-
-    // Create an Application controller
-    QemuCocoaAppController *appController = [[QemuCocoaAppController alloc] init];
-    [NSApp setDelegate:appController];
 
     // Start the main event loop
     [NSApp run];
