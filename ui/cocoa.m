@@ -54,6 +54,7 @@
 #define NSAlternateKeyMask NSEventModifierFlagOption
 #define NSCommandKeyMask NSEventModifierFlagCommand
 #define NSControlKeyMask NSEventModifierFlagControl
+#define NSShiftKeyMask NSEventModifierFlagShift
 
 #define NSCenterTextAlignment NSTextAlignmentCenter
 
@@ -253,6 +254,7 @@ static void QEMU_Alert(NSString *message)
     alert = [NSAlert new];
     [alert setMessageText: message];
     [alert runModal];
+    [alert release];
 }
 
 /* Sends a command to the monitor console */
@@ -1770,7 +1772,7 @@ static void remove_option(int index)
 static void create_send_key_menu(void) {
     NSMenu *menu;
     menu = [[NSMenu alloc] initWithTitle:@"Send Key"];
-    [menu setDelegate: [NSApp delegate]];
+    [menu setDelegate: (QemuCocoaAppController*)[NSApp delegate]];
 
     /* Find the index of the sendkeymenu and its items */
     int send_key_index = -1;
