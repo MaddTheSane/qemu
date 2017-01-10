@@ -29,11 +29,10 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu-common.h"
-#include "hw/arm/virt-acpi-build.h"
 #include "qemu/bitmap.h"
 #include "trace.h"
 #include "qom/cpu.h"
-#include "target-arm/cpu.h"
+#include "target/arm/cpu.h"
 #include "hw/acpi/acpi-defs.h"
 #include "hw/acpi/acpi.h"
 #include "hw/nvram/fw_cfg.h"
@@ -43,6 +42,9 @@
 #include "hw/acpi/aml-build.h"
 #include "hw/pci/pcie_host.h"
 #include "hw/pci/pci.h"
+#include "hw/arm/virt.h"
+#include "sysemu/numa.h"
+#include "kvm_arm.h"
 
 #define ARM_SPI_BASE 32
 #define ACPI_POWER_BUTTON_DEVICE "PWRB"
@@ -52,7 +54,7 @@ static void acpi_dsdt_add_cpus(Aml *scope, int smp_cpus)
     uint16_t i;
 
     for (i = 0; i < smp_cpus; i++) {
-        Aml *dev = aml_device("C%03x", i);
+        Aml *dev = aml_device("C%.03X", i);
         aml_append(dev, aml_name_decl("_HID", aml_string("ACPI0007")));
         aml_append(dev, aml_name_decl("_UID", aml_int(i)));
         aml_append(scope, dev);
@@ -230,7 +232,8 @@ static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
         aml_append(rbuf,
             aml_qword_memory(AML_POS_DECODE, AML_MIN_FIXED, AML_MAX_FIXED,
                              AML_NON_CACHEABLE, AML_READ_WRITE, 0x0000,
-                             base_mmio_high, base_mmio_high, 0x0000,
+                             base_mmio_high,
+                             base_mmio_high + size_mmio_high - 1, 0x0000,
                              size_mmio_high));
     }
 
@@ -352,11 +355,14 @@ static void acpi_dsdt_add_power_button(Aml *scope)
 
 /* RSDP */
 static GArray *
-build_rsdp(GArray *rsdp_table, GArray *linker, unsigned rsdt)
+build_rsdp(GArray *rsdp_table, BIOSLinker *linker, unsigned rsdt_tbl_offset)
 {
     AcpiRsdpDescriptor *rsdp = acpi_data_push(rsdp_table, sizeof *rsdp);
+    unsigned rsdt_pa_size = sizeof(rsdp->rsdt_physical_address);
+    unsigned rsdt_pa_offset =
+        (char *)&rsdp->rsdt_physical_address - rsdp_table->data;
 
-    bios_linker_loader_alloc(linker, ACPI_BUILD_RSDP_FILE, 16,
+    bios_linker_loader_alloc(linker, ACPI_BUILD_RSDP_FILE, rsdp_table, 16,
                              true /* fseg memory */);
 
     memcpy(&rsdp->signature, "RSD PTR ", sizeof(rsdp->signature));
@@ -364,28 +370,80 @@ build_rsdp(GArray *rsdp_table, GArray *linker, unsigned rsdt)
     rsdp->length = cpu_to_le32(sizeof(*rsdp));
     rsdp->revision = 0x02;
 
-    /* Point to RSDT */
-    rsdp->rsdt_physical_address = cpu_to_le32(rsdt);
     /* Address to be filled by Guest linker */
-    bios_linker_loader_add_pointer(linker, ACPI_BUILD_RSDP_FILE,
-                                   ACPI_BUILD_TABLE_FILE,
-                                   rsdp_table, &rsdp->rsdt_physical_address,
-                                   sizeof rsdp->rsdt_physical_address);
-    rsdp->checksum = 0;
+    bios_linker_loader_add_pointer(linker,
+        ACPI_BUILD_RSDP_FILE, rsdt_pa_offset, rsdt_pa_size,
+        ACPI_BUILD_TABLE_FILE, rsdt_tbl_offset);
+
     /* Checksum to be filled by Guest linker */
     bios_linker_loader_add_checksum(linker, ACPI_BUILD_RSDP_FILE,
-                                    rsdp_table, rsdp, sizeof *rsdp,
-                                    &rsdp->checksum);
+        (char *)rsdp - rsdp_table->data, sizeof *rsdp,
+        (char *)&rsdp->checksum - rsdp_table->data);
 
     return rsdp_table;
 }
 
 static void
-build_spcr(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
+build_iort(GArray *table_data, BIOSLinker *linker)
+{
+    int iort_start = table_data->len;
+    AcpiIortIdMapping *idmap;
+    AcpiIortItsGroup *its;
+    AcpiIortTable *iort;
+    size_t node_size, iort_length;
+    AcpiIortRC *rc;
+
+    iort = acpi_data_push(table_data, sizeof(*iort));
+
+    iort_length = sizeof(*iort);
+    iort->node_count = cpu_to_le32(2); /* RC and ITS nodes */
+    iort->node_offset = cpu_to_le32(sizeof(*iort));
+
+    /* ITS group node */
+    node_size =  sizeof(*its) + sizeof(uint32_t);
+    iort_length += node_size;
+    its = acpi_data_push(table_data, node_size);
+
+    its->type = ACPI_IORT_NODE_ITS_GROUP;
+    its->length = cpu_to_le16(node_size);
+    its->its_count = cpu_to_le32(1);
+    its->identifiers[0] = 0; /* MADT translation_id */
+
+    /* Root Complex Node */
+    node_size = sizeof(*rc) + sizeof(*idmap);
+    iort_length += node_size;
+    rc = acpi_data_push(table_data, node_size);
+
+    rc->type = ACPI_IORT_NODE_PCI_ROOT_COMPLEX;
+    rc->length = cpu_to_le16(node_size);
+    rc->mapping_count = cpu_to_le32(1);
+    rc->mapping_offset = cpu_to_le32(sizeof(*rc));
+
+    /* fully coherent device */
+    rc->memory_properties.cache_coherency = cpu_to_le32(1);
+    rc->memory_properties.memory_flags = 0x3; /* CCA = CPM = DCAS = 1 */
+    rc->pci_segment_number = 0; /* MCFG pci_segment */
+
+    /* Identity RID mapping covering the whole input RID range */
+    idmap = &rc->id_mapping_array[0];
+    idmap->input_base = 0;
+    idmap->id_count = cpu_to_le32(0xFFFF);
+    idmap->output_base = 0;
+    /* output IORT node is the ITS group node (the first node) */
+    idmap->output_reference = cpu_to_le32(iort->node_offset);
+
+    iort->length = cpu_to_le32(iort_length);
+
+    build_header(linker, table_data, (void *)(table_data->data + iort_start),
+                 "IORT", table_data->len - iort_start, 0, NULL, NULL);
+}
+
+static void
+build_spcr(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
 {
     AcpiSerialPortConsoleRedirection *spcr;
-    const MemMapEntry *uart_memmap = &guest_info->memmap[VIRT_UART];
-    int irq = guest_info->irqmap[VIRT_UART] + ARM_SPI_BASE;
+    const MemMapEntry *uart_memmap = &vms->memmap[VIRT_UART];
+    int irq = vms->irqmap[VIRT_UART] + ARM_SPI_BASE;
 
     spcr = acpi_data_push(table_data, sizeof(*spcr));
 
@@ -414,10 +472,53 @@ build_spcr(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
 }
 
 static void
-build_mcfg(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
+build_srat(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
+{
+    AcpiSystemResourceAffinityTable *srat;
+    AcpiSratProcessorGiccAffinity *core;
+    AcpiSratMemoryAffinity *numamem;
+    int i, j, srat_start;
+    uint64_t mem_base;
+    uint32_t *cpu_node = g_malloc0(vms->smp_cpus * sizeof(uint32_t));
+
+    for (i = 0; i < vms->smp_cpus; i++) {
+        j = numa_get_node_for_cpu(i);
+        if (j < nb_numa_nodes) {
+                cpu_node[i] = j;
+        }
+    }
+
+    srat_start = table_data->len;
+    srat = acpi_data_push(table_data, sizeof(*srat));
+    srat->reserved1 = cpu_to_le32(1);
+
+    for (i = 0; i < vms->smp_cpus; ++i) {
+        core = acpi_data_push(table_data, sizeof(*core));
+        core->type = ACPI_SRAT_PROCESSOR_GICC;
+        core->length = sizeof(*core);
+        core->proximity = cpu_to_le32(cpu_node[i]);
+        core->acpi_processor_uid = cpu_to_le32(i);
+        core->flags = cpu_to_le32(1);
+    }
+    g_free(cpu_node);
+
+    mem_base = vms->memmap[VIRT_MEM].base;
+    for (i = 0; i < nb_numa_nodes; ++i) {
+        numamem = acpi_data_push(table_data, sizeof(*numamem));
+        build_srat_memory(numamem, mem_base, numa_info[i].node_mem, i,
+                          MEM_AFFINITY_ENABLED);
+        mem_base += numa_info[i].node_mem;
+    }
+
+    build_header(linker, table_data, (void *)srat, "SRAT",
+                 table_data->len - srat_start, 3, NULL, NULL);
+}
+
+static void
+build_mcfg(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
 {
     AcpiTableMcfg *mcfg;
-    const MemMapEntry *memmap = guest_info->memmap;
+    const MemMapEntry *memmap = vms->memmap;
     int len = sizeof(*mcfg) + sizeof(mcfg->allocation[0]);
 
     mcfg = acpi_data_push(table_data, len);
@@ -434,24 +535,33 @@ build_mcfg(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
 
 /* GTDT */
 static void
-build_gtdt(GArray *table_data, GArray *linker)
+build_gtdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
 {
+    VirtMachineClass *vmc = VIRT_MACHINE_GET_CLASS(vms);
     int gtdt_start = table_data->len;
     AcpiGenericTimerTable *gtdt;
+    uint32_t irqflags;
+
+    if (vmc->claim_edge_triggered_timers) {
+        irqflags = ACPI_GTDT_INTERRUPT_MODE_EDGE;
+    } else {
+        irqflags = ACPI_GTDT_INTERRUPT_MODE_LEVEL;
+    }
 
     gtdt = acpi_data_push(table_data, sizeof *gtdt);
     /* The interrupt values are the same with the device tree when adding 16 */
-    gtdt->secure_el1_interrupt = ARCH_TIMER_S_EL1_IRQ + 16;
-    gtdt->secure_el1_flags = ACPI_EDGE_SENSITIVE;
+    gtdt->secure_el1_interrupt = cpu_to_le32(ARCH_TIMER_S_EL1_IRQ + 16);
+    gtdt->secure_el1_flags = cpu_to_le32(irqflags);
 
-    gtdt->non_secure_el1_interrupt = ARCH_TIMER_NS_EL1_IRQ + 16;
-    gtdt->non_secure_el1_flags = ACPI_EDGE_SENSITIVE | ACPI_GTDT_ALWAYS_ON;
+    gtdt->non_secure_el1_interrupt = cpu_to_le32(ARCH_TIMER_NS_EL1_IRQ + 16);
+    gtdt->non_secure_el1_flags = cpu_to_le32(irqflags |
+                                             ACPI_GTDT_CAP_ALWAYS_ON);
 
-    gtdt->virtual_timer_interrupt = ARCH_TIMER_VIRT_IRQ + 16;
-    gtdt->virtual_timer_flags = ACPI_EDGE_SENSITIVE;
+    gtdt->virtual_timer_interrupt = cpu_to_le32(ARCH_TIMER_VIRT_IRQ + 16);
+    gtdt->virtual_timer_flags = cpu_to_le32(irqflags);
 
-    gtdt->non_secure_el2_interrupt = ARCH_TIMER_NS_EL2_IRQ + 16;
-    gtdt->non_secure_el2_flags = ACPI_EDGE_SENSITIVE;
+    gtdt->non_secure_el2_interrupt = cpu_to_le32(ARCH_TIMER_NS_EL2_IRQ + 16);
+    gtdt->non_secure_el2_flags = cpu_to_le32(irqflags);
 
     build_header(linker, table_data,
                  (void *)(table_data->data + gtdt_start), "GTDT",
@@ -460,11 +570,12 @@ build_gtdt(GArray *table_data, GArray *linker)
 
 /* MADT */
 static void
-build_madt(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
+build_madt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
 {
+    VirtMachineClass *vmc = VIRT_MACHINE_GET_CLASS(vms);
     int madt_start = table_data->len;
-    const MemMapEntry *memmap = guest_info->memmap;
-    const int *irqmap = guest_info->irqmap;
+    const MemMapEntry *memmap = vms->memmap;
+    const int *irqmap = vms->irqmap;
     AcpiMultipleApicTable *madt;
     AcpiMadtGenericDistributor *gicd;
     AcpiMadtGenericMsiFrame *gic_msi;
@@ -475,25 +586,31 @@ build_madt(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
     gicd = acpi_data_push(table_data, sizeof *gicd);
     gicd->type = ACPI_APIC_GENERIC_DISTRIBUTOR;
     gicd->length = sizeof(*gicd);
-    gicd->base_address = memmap[VIRT_GIC_DIST].base;
+    gicd->base_address = cpu_to_le64(memmap[VIRT_GIC_DIST].base);
+    gicd->version = vms->gic_version;
 
-    for (i = 0; i < guest_info->smp_cpus; i++) {
-        AcpiMadtGenericInterrupt *gicc = acpi_data_push(table_data,
-                                                     sizeof *gicc);
+    for (i = 0; i < vms->smp_cpus; i++) {
+        AcpiMadtGenericCpuInterface *gicc = acpi_data_push(table_data,
+                                                           sizeof(*gicc));
         ARMCPU *armcpu = ARM_CPU(qemu_get_cpu(i));
 
-        gicc->type = ACPI_APIC_GENERIC_INTERRUPT;
+        gicc->type = ACPI_APIC_GENERIC_CPU_INTERFACE;
         gicc->length = sizeof(*gicc);
-        if (guest_info->gic_version == 2) {
-            gicc->base_address = memmap[VIRT_GIC_CPU].base;
+        if (vms->gic_version == 2) {
+            gicc->base_address = cpu_to_le64(memmap[VIRT_GIC_CPU].base);
         }
-        gicc->cpu_interface_number = i;
-        gicc->arm_mpidr = armcpu->mp_affinity;
-        gicc->uid = i;
-        gicc->flags = cpu_to_le32(ACPI_GICC_ENABLED);
+        gicc->cpu_interface_number = cpu_to_le32(i);
+        gicc->arm_mpidr = cpu_to_le64(armcpu->mp_affinity);
+        gicc->uid = cpu_to_le32(i);
+        gicc->flags = cpu_to_le32(ACPI_MADT_GICC_ENABLED);
+
+        if (arm_feature(&armcpu->env, ARM_FEATURE_PMU)) {
+            gicc->performance_interrupt = cpu_to_le32(PPI(VIRTUAL_PMU_IRQ));
+        }
     }
 
-    if (guest_info->gic_version == 3) {
+    if (vms->gic_version == 3) {
+        AcpiMadtGenericTranslator *gic_its;
         AcpiMadtGenericRedistributor *gicr = acpi_data_push(table_data,
                                                          sizeof *gicr);
 
@@ -501,6 +618,14 @@ build_madt(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
         gicr->length = sizeof(*gicr);
         gicr->base_address = cpu_to_le64(memmap[VIRT_GIC_REDIST].base);
         gicr->range_length = cpu_to_le32(memmap[VIRT_GIC_REDIST].size);
+
+        if (its_class_name() && !vmc->no_its) {
+            gic_its = acpi_data_push(table_data, sizeof *gic_its);
+            gic_its->type = ACPI_APIC_GENERIC_TRANSLATOR;
+            gic_its->length = sizeof(*gic_its);
+            gic_its->translation_id = 0;
+            gic_its->base_address = cpu_to_le64(memmap[VIRT_GIC_ITS].base);
+        }
     } else {
         gic_msi = acpi_data_push(table_data, sizeof *gic_msi);
         gic_msi->type = ACPI_APIC_GENERIC_MSI_FRAME;
@@ -519,24 +644,23 @@ build_madt(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
 
 /* FADT */
 static void
-build_fadt(GArray *table_data, GArray *linker, unsigned dsdt)
+build_fadt(GArray *table_data, BIOSLinker *linker, unsigned dsdt_tbl_offset)
 {
     AcpiFadtDescriptorRev5_1 *fadt = acpi_data_push(table_data, sizeof(*fadt));
+    unsigned dsdt_entry_offset = (char *)&fadt->dsdt - table_data->data;
 
     /* Hardware Reduced = 1 and use PSCI 0.2+ and with HVC */
     fadt->flags = cpu_to_le32(1 << ACPI_FADT_F_HW_REDUCED_ACPI);
-    fadt->arm_boot_flags = cpu_to_le16((1 << ACPI_FADT_ARM_USE_PSCI_G_0_2) |
-                                       (1 << ACPI_FADT_ARM_PSCI_USE_HVC));
+    fadt->arm_boot_flags = cpu_to_le16(ACPI_FADT_ARM_PSCI_COMPLIANT |
+                                       ACPI_FADT_ARM_PSCI_USE_HVC);
 
     /* ACPI v5.1 (fadt->revision.fadt->minor_revision) */
     fadt->minor_revision = 0x1;
 
-    fadt->dsdt = cpu_to_le32(dsdt);
     /* DSDT address to be filled by Guest linker */
-    bios_linker_loader_add_pointer(linker, ACPI_BUILD_TABLE_FILE,
-                                   ACPI_BUILD_TABLE_FILE,
-                                   table_data, &fadt->dsdt,
-                                   sizeof fadt->dsdt);
+    bios_linker_loader_add_pointer(linker,
+        ACPI_BUILD_TABLE_FILE, dsdt_entry_offset, sizeof(fadt->dsdt),
+        ACPI_BUILD_TABLE_FILE, dsdt_tbl_offset);
 
     build_header(linker, table_data,
                  (void *)fadt, "FACP", sizeof(*fadt), 5, NULL, NULL);
@@ -544,11 +668,11 @@ build_fadt(GArray *table_data, GArray *linker, unsigned dsdt)
 
 /* DSDT */
 static void
-build_dsdt(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
+build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
 {
     Aml *scope, *dsdt;
-    const MemMapEntry *memmap = guest_info->memmap;
-    const int *irqmap = guest_info->irqmap;
+    const MemMapEntry *memmap = vms->memmap;
+    const int *irqmap = vms->irqmap;
 
     dsdt = init_aml_allocator();
     /* Reserve space for header */
@@ -560,7 +684,7 @@ build_dsdt(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
      * the RTC ACPI device at all when using UEFI.
      */
     scope = aml_scope("\\_SB");
-    acpi_dsdt_add_cpus(scope, guest_info->smp_cpus);
+    acpi_dsdt_add_cpus(scope, vms->smp_cpus);
     acpi_dsdt_add_uart(scope, &memmap[VIRT_UART],
                        (irqmap[VIRT_UART] + ARM_SPI_BASE));
     acpi_dsdt_add_flash(scope, &memmap[VIRT_FLASH]);
@@ -568,7 +692,7 @@ build_dsdt(GArray *table_data, GArray *linker, VirtGuestInfo *guest_info)
     acpi_dsdt_add_virtio(scope, &memmap[VIRT_MMIO],
                     (irqmap[VIRT_MMIO] + ARM_SPI_BASE), NUM_VIRTIO_TRANSPORTS);
     acpi_dsdt_add_pci(scope, memmap, (irqmap[VIRT_PCIE] + ARM_SPI_BASE),
-                      guest_info->use_highmem);
+                      vms->highmem);
     acpi_dsdt_add_gpio(scope, &memmap[VIRT_GPIO],
                        (irqmap[VIRT_GPIO] + ARM_SPI_BASE));
     acpi_dsdt_add_power_button(scope);
@@ -591,12 +715,12 @@ struct AcpiBuildState {
     MemoryRegion *linker_mr;
     /* Is table patched? */
     bool patched;
-    VirtGuestInfo *guest_info;
 } AcpiBuildState;
 
 static
-void virt_acpi_build(VirtGuestInfo *guest_info, AcpiBuildTables *tables)
+void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
 {
+    VirtMachineClass *vmc = VIRT_MACHINE_GET_CLASS(vms);
     GArray *table_offsets;
     unsigned dsdt, rsdt;
     GArray *tables_blob = tables->table_data;
@@ -604,39 +728,39 @@ void virt_acpi_build(VirtGuestInfo *guest_info, AcpiBuildTables *tables)
     table_offsets = g_array_new(false, true /* clear */,
                                         sizeof(uint32_t));
 
-    bios_linker_loader_alloc(tables->linker, ACPI_BUILD_TABLE_FILE,
+    bios_linker_loader_alloc(tables->linker,
+                             ACPI_BUILD_TABLE_FILE, tables_blob,
                              64, false /* high memory */);
-
-    /*
-     * The ACPI v5.1 tables for Hardware-reduced ACPI platform are:
-     * RSDP
-     * RSDT
-     * FADT
-     * GTDT
-     * MADT
-     * MCFG
-     * DSDT
-     */
 
     /* DSDT is pointed to by FADT */
     dsdt = tables_blob->len;
-    build_dsdt(tables_blob, tables->linker, guest_info);
+    build_dsdt(tables_blob, tables->linker, vms);
 
     /* FADT MADT GTDT MCFG SPCR pointed to by RSDT */
     acpi_add_table(table_offsets, tables_blob);
     build_fadt(tables_blob, tables->linker, dsdt);
 
     acpi_add_table(table_offsets, tables_blob);
-    build_madt(tables_blob, tables->linker, guest_info);
+    build_madt(tables_blob, tables->linker, vms);
 
     acpi_add_table(table_offsets, tables_blob);
-    build_gtdt(tables_blob, tables->linker);
+    build_gtdt(tables_blob, tables->linker, vms);
 
     acpi_add_table(table_offsets, tables_blob);
-    build_mcfg(tables_blob, tables->linker, guest_info);
+    build_mcfg(tables_blob, tables->linker, vms);
 
     acpi_add_table(table_offsets, tables_blob);
-    build_spcr(tables_blob, tables->linker, guest_info);
+    build_spcr(tables_blob, tables->linker, vms);
+
+    if (nb_numa_nodes > 0) {
+        acpi_add_table(table_offsets, tables_blob);
+        build_srat(tables_blob, tables->linker, vms);
+    }
+
+    if (its_class_name() && !vmc->no_its) {
+        acpi_add_table(table_offsets, tables_blob);
+        build_iort(tables_blob, tables->linker);
+    }
 
     /* RSDT is pointed to by RSDP */
     rsdt = tables_blob->len;
@@ -674,12 +798,11 @@ static void virt_acpi_build_update(void *build_opaque)
 
     acpi_build_tables_init(&tables);
 
-    virt_acpi_build(build_state->guest_info, &tables);
+    virt_acpi_build(VIRT_MACHINE(qdev_get_machine()), &tables);
 
     acpi_ram_update(build_state->table_mr, tables.table_data);
     acpi_ram_update(build_state->rsdp_mr, tables.rsdp);
-    acpi_ram_update(build_state->linker_mr, tables.linker);
-
+    acpi_ram_update(build_state->linker_mr, tables.linker->cmd_blob);
 
     acpi_build_tables_cleanup(&tables, true);
 }
@@ -695,7 +818,7 @@ static MemoryRegion *acpi_add_rom_blob(AcpiBuildState *build_state,
                                        uint64_t max_size)
 {
     return rom_add_blob(name, blob->data, acpi_data_len(blob), max_size, -1,
-                        name, virt_acpi_build_update, build_state);
+                        name, virt_acpi_build_update, build_state, NULL);
 }
 
 static const VMStateDescription vmstate_virt_acpi_build = {
@@ -708,12 +831,12 @@ static const VMStateDescription vmstate_virt_acpi_build = {
     },
 };
 
-void virt_acpi_setup(VirtGuestInfo *guest_info)
+void virt_acpi_setup(VirtMachineState *vms)
 {
     AcpiBuildTables tables;
     AcpiBuildState *build_state;
 
-    if (!guest_info->fw_cfg) {
+    if (!vms->fw_cfg) {
         trace_virt_acpi_setup();
         return;
     }
@@ -724,10 +847,9 @@ void virt_acpi_setup(VirtGuestInfo *guest_info)
     }
 
     build_state = g_malloc0(sizeof *build_state);
-    build_state->guest_info = guest_info;
 
     acpi_build_tables_init(&tables);
-    virt_acpi_build(build_state->guest_info, &tables);
+    virt_acpi_build(vms, &tables);
 
     /* Now expose it all to Guest */
     build_state->table_mr = acpi_add_rom_blob(build_state, tables.table_data,
@@ -736,10 +858,11 @@ void virt_acpi_setup(VirtGuestInfo *guest_info)
     assert(build_state->table_mr != NULL);
 
     build_state->linker_mr =
-        acpi_add_rom_blob(build_state, tables.linker, "etc/table-loader", 0);
+        acpi_add_rom_blob(build_state, tables.linker->cmd_blob,
+                          "etc/table-loader", 0);
 
-    fw_cfg_add_file(guest_info->fw_cfg, ACPI_BUILD_TPMLOG_FILE,
-                    tables.tcpalog->data, acpi_data_len(tables.tcpalog));
+    fw_cfg_add_file(vms->fw_cfg, ACPI_BUILD_TPMLOG_FILE, tables.tcpalog->data,
+                    acpi_data_len(tables.tcpalog));
 
     build_state->rsdp_mr = acpi_add_rom_blob(build_state, tables.rsdp,
                                               ACPI_BUILD_RSDP_FILE, 0);

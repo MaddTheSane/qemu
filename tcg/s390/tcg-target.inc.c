@@ -219,6 +219,8 @@ typedef enum S390Opcode {
     RX_ST       = 0x50,
     RX_STC      = 0x42,
     RX_STH      = 0x40,
+
+    NOP         = 0x0707,
 } S390Opcode;
 
 #ifdef CONFIG_DEBUG_TCG
@@ -341,6 +343,7 @@ static tcg_insn_unit *tb_ret_addr;
 #define FACILITY_EXT_IMM	(1ULL << (63 - 21))
 #define FACILITY_GEN_INST_EXT	(1ULL << (63 - 34))
 #define FACILITY_LOAD_ON_COND   (1ULL << (63 - 45))
+#define FACILITY_FAST_BCR_SER   FACILITY_LOAD_ON_COND
 
 static uint64_t facilities;
 
@@ -374,11 +377,6 @@ static int target_parse_constraint(TCGArgConstraint *ct, const char **pct_str)
     case 'r':                  /* all registers */
         ct->ct |= TCG_CT_REG;
         tcg_regset_set32(ct->u.regs, 0, 0xffff);
-        break;
-    case 'R':                  /* not R0 */
-        ct->ct |= TCG_CT_REG;
-        tcg_regset_set32(ct->u.regs, 0, 0xffff);
-        tcg_regset_reset_reg(ct->u.regs, TCG_REG_R0);
         break;
     case 'L':                  /* qemu_ld/st constraint */
         ct->ct |= TCG_CT_REG;
@@ -796,6 +794,12 @@ static inline void tcg_out_st(TCGContext *s, TCGType type, TCGReg data,
     }
 }
 
+static inline bool tcg_out_sti(TCGContext *s, TCGType type, TCGArg val,
+                               TCGReg base, intptr_t ofs)
+{
+    return false;
+}
+
 /* load data from an absolute host address */
 static void tcg_out_ld_abs(TCGContext *s, TCGType type, TCGReg dest, void *abs)
 {
@@ -1084,33 +1088,43 @@ static void tgen64_xori(TCGContext *s, TCGReg dest, tcg_target_ulong val)
 }
 
 static int tgen_cmp(TCGContext *s, TCGType type, TCGCond c, TCGReg r1,
-                    TCGArg c2, int c2const)
+                    TCGArg c2, bool c2const, bool need_carry)
 {
     bool is_unsigned = is_unsigned_cond(c);
     if (c2const) {
         if (c2 == 0) {
-            if (type == TCG_TYPE_I32) {
-                tcg_out_insn(s, RR, LTR, r1, r1);
-            } else {
-                tcg_out_insn(s, RRE, LTGR, r1, r1);
+            if (!(is_unsigned && need_carry)) {
+                if (type == TCG_TYPE_I32) {
+                    tcg_out_insn(s, RR, LTR, r1, r1);
+                } else {
+                    tcg_out_insn(s, RRE, LTGR, r1, r1);
+                }
+                return tcg_cond_to_ltr_cond[c];
             }
-            return tcg_cond_to_ltr_cond[c];
-        } else {
-            if (is_unsigned) {
-                if (type == TCG_TYPE_I32) {
-                    tcg_out_insn(s, RIL, CLFI, r1, c2);
-                } else {
-                    tcg_out_insn(s, RIL, CLGFI, r1, c2);
-                }
+            /* If we only got here because of load-and-test,
+               and we couldn't use that, then we need to load
+               the constant into a register.  */
+            if (!(facilities & FACILITY_EXT_IMM)) {
+                c2 = TCG_TMP0;
+                tcg_out_movi(s, type, c2, 0);
+                goto do_reg;
+            }
+        }
+        if (is_unsigned) {
+            if (type == TCG_TYPE_I32) {
+                tcg_out_insn(s, RIL, CLFI, r1, c2);
             } else {
-                if (type == TCG_TYPE_I32) {
-                    tcg_out_insn(s, RIL, CFI, r1, c2);
-                } else {
-                    tcg_out_insn(s, RIL, CGFI, r1, c2);
-                }
+                tcg_out_insn(s, RIL, CLGFI, r1, c2);
+            }
+        } else {
+            if (type == TCG_TYPE_I32) {
+                tcg_out_insn(s, RIL, CFI, r1, c2);
+            } else {
+                tcg_out_insn(s, RIL, CGFI, r1, c2);
             }
         }
     } else {
+    do_reg:
         if (is_unsigned) {
             if (type == TCG_TYPE_I32) {
                 tcg_out_insn(s, RR, CLR, r1, c2);
@@ -1139,7 +1153,7 @@ static void tgen_setcond(TCGContext *s, TCGType type, TCGCond cond,
     do_greater:
         /* The result of a compare has CC=2 for GT and CC=3 unused.
            ADD LOGICAL WITH CARRY considers (CC & 2) the carry bit.  */
-        tgen_cmp(s, type, cond, c1, c2, c2const);
+        tgen_cmp(s, type, cond, c1, c2, c2const, true);
         tcg_out_movi(s, type, dest, 0);
         tcg_out_insn(s, RRE, ALCGR, dest, dest);
         return;
@@ -1210,7 +1224,7 @@ static void tgen_setcond(TCGContext *s, TCGType type, TCGCond cond,
         break;
     }
 
-    cc = tgen_cmp(s, type, cond, c1, c2, c2const);
+    cc = tgen_cmp(s, type, cond, c1, c2, c2const, false);
     if (facilities & FACILITY_LOAD_ON_COND) {
         /* Emit: d = 0, t = 1, d = (cc ? t : d).  */
         tcg_out_movi(s, TCG_TYPE_I64, dest, 0);
@@ -1229,11 +1243,11 @@ static void tgen_movcond(TCGContext *s, TCGType type, TCGCond c, TCGReg dest,
 {
     int cc;
     if (facilities & FACILITY_LOAD_ON_COND) {
-        cc = tgen_cmp(s, type, c, c1, c2, c2const);
+        cc = tgen_cmp(s, type, c, c1, c2, c2const, false);
         tcg_out_insn(s, RRF, LOCGR, dest, r3, cc);
     } else {
         c = tcg_invert_cond(c);
-        cc = tgen_cmp(s, type, c, c1, c2, c2const);
+        cc = tgen_cmp(s, type, c, c1, c2, c2const, false);
 
         /* Emit: if (cc) goto over; dest = r3; over:  */
         tcg_out_insn(s, RI, BRC, cc, (4 + 4) >> 1);
@@ -1365,7 +1379,7 @@ static void tgen_brcond(TCGContext *s, TCGType type, TCGCond c,
         }
     }
 
-    cc = tgen_cmp(s, type, c, r1, c2, c2const);
+    cc = tgen_cmp(s, type, c, r1, c2, c2const, false);
     tgen_branch(s, cc, l);
 }
 
@@ -1497,20 +1511,18 @@ QEMU_BUILD_BUG_ON(offsetof(CPUArchState, tlb_table[NB_MMU_MODES - 1][1])
 static TCGReg tcg_out_tlb_read(TCGContext* s, TCGReg addr_reg, TCGMemOp opc,
                                int mem_index, bool is_ld)
 {
-    int s_mask = (1 << (opc & MO_SIZE)) - 1;
+    unsigned s_bits = opc & MO_SIZE;
+    unsigned a_bits = get_alignment_bits(opc);
+    unsigned s_mask = (1 << s_bits) - 1;
+    unsigned a_mask = (1 << a_bits) - 1;
     int ofs, a_off;
     uint64_t tlb_mask;
 
     /* For aligned accesses, we check the first byte and include the alignment
        bits within the address.  For unaligned access, we check that we don't
        cross pages using the address of the last byte of the access.  */
-    if ((opc & MO_AMASK) == MO_ALIGN || s_mask == 0) {
-        a_off = 0;
-        tlb_mask = TARGET_PAGE_MASK | s_mask;
-    } else {
-        a_off = s_mask;
-        tlb_mask = TARGET_PAGE_MASK;
-    }
+    a_off = (a_bits >= s_bits ? 0 : s_mask - a_mask);
+    tlb_mask = (uint64_t)TARGET_PAGE_MASK | a_mask;
 
     if (facilities & FACILITY_GEN_INST_EXT) {
         tcg_out_risbg(s, TCG_REG_R2, addr_reg,
@@ -1715,17 +1727,24 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc,
         break;
 
     case INDEX_op_goto_tb:
-        if (s->tb_jmp_offset) {
+        if (s->tb_jmp_insn_offset) {
+            /* branch displacement must be aligned for atomic patching;
+             * see if we need to add extra nop before branch
+             */
+            if (!QEMU_PTR_IS_ALIGNED(s->code_ptr + 1, 4)) {
+                tcg_out16(s, NOP);
+            }
             tcg_out16(s, RIL_BRCL | (S390_CC_ALWAYS << 4));
-            s->tb_jmp_offset[args[0]] = tcg_current_code_size(s);
+            s->tb_jmp_insn_offset[args[0]] = tcg_current_code_size(s);
             s->code_ptr += 2;
         } else {
-            /* load address stored at s->tb_next + args[0] */
-            tcg_out_ld_abs(s, TCG_TYPE_PTR, TCG_TMP0, s->tb_next + args[0]);
+            /* load address stored at s->tb_jmp_target_addr + args[0] */
+            tcg_out_ld_abs(s, TCG_TYPE_PTR, TCG_TMP0,
+                           s->tb_jmp_target_addr + args[0]);
             /* and go there */
             tcg_out_insn(s, RR, BCR, S390_CC_ALWAYS, TCG_TMP0);
         }
-        s->tb_next_offset[args[0]] = tcg_current_code_size(s);
+        s->tb_jmp_reset_offset[args[0]] = tcg_current_code_size(s);
         break;
 
     OP_32_64(ld8u):
@@ -2156,6 +2175,15 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc,
         tgen_deposit(s, args[0], args[2], args[3], args[4]);
         break;
 
+    case INDEX_op_mb:
+        /* The host memory model is quite strong, we simply need to
+           serialize the instruction stream.  */
+        if (args[0] & TCG_MO_ST_LD) {
+            tcg_out_insn(s, RR, BCR,
+                         facilities & FACILITY_FAST_BCR_SER ? 14 : 15, 0);
+        }
+        break;
+
     case INDEX_op_mov_i32:  /* Always emitted via tcg_out_mov.  */
     case INDEX_op_mov_i64:
     case INDEX_op_movi_i32: /* Always emitted via tcg_out_movi.  */
@@ -2193,12 +2221,12 @@ static const TCGTargetOpDef s390_op_defs[] = {
 
     { INDEX_op_neg_i32, { "r", "r" } },
 
-    { INDEX_op_shl_i32, { "r", "0", "Ri" } },
-    { INDEX_op_shr_i32, { "r", "0", "Ri" } },
-    { INDEX_op_sar_i32, { "r", "0", "Ri" } },
+    { INDEX_op_shl_i32, { "r", "0", "ri" } },
+    { INDEX_op_shr_i32, { "r", "0", "ri" } },
+    { INDEX_op_sar_i32, { "r", "0", "ri" } },
 
-    { INDEX_op_rotl_i32, { "r", "r", "Ri" } },
-    { INDEX_op_rotr_i32, { "r", "r", "Ri" } },
+    { INDEX_op_rotl_i32, { "r", "r", "ri" } },
+    { INDEX_op_rotr_i32, { "r", "r", "ri" } },
 
     { INDEX_op_ext8s_i32, { "r", "r" } },
     { INDEX_op_ext8u_i32, { "r", "r" } },
@@ -2248,12 +2276,12 @@ static const TCGTargetOpDef s390_op_defs[] = {
 
     { INDEX_op_neg_i64, { "r", "r" } },
 
-    { INDEX_op_shl_i64, { "r", "r", "Ri" } },
-    { INDEX_op_shr_i64, { "r", "r", "Ri" } },
-    { INDEX_op_sar_i64, { "r", "r", "Ri" } },
+    { INDEX_op_shl_i64, { "r", "r", "ri" } },
+    { INDEX_op_shr_i64, { "r", "r", "ri" } },
+    { INDEX_op_sar_i64, { "r", "r", "ri" } },
 
-    { INDEX_op_rotl_i64, { "r", "r", "Ri" } },
-    { INDEX_op_rotr_i64, { "r", "r", "Ri" } },
+    { INDEX_op_rotl_i64, { "r", "r", "ri" } },
+    { INDEX_op_rotr_i64, { "r", "r", "ri" } },
 
     { INDEX_op_ext8s_i64, { "r", "r" } },
     { INDEX_op_ext8u_i64, { "r", "r" } },
@@ -2277,6 +2305,7 @@ static const TCGTargetOpDef s390_op_defs[] = {
     { INDEX_op_movcond_i64, { "r", "r", "rC", "r", "0" } },
     { INDEX_op_deposit_i64, { "r", "0", "r" } },
 
+    { INDEX_op_mb, { } },
     { -1 },
 };
 
