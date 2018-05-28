@@ -686,23 +686,36 @@ static void net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
         if (vhostfdname) {
             vhostfd = monitor_fd_param(cur_mon, vhostfdname, &err);
             if (vhostfd == -1) {
-                error_propagate(errp, err);
+                if (tap->has_vhostforce && tap->vhostforce) {
+                    error_propagate(errp, err);
+                } else {
+                    warn_report_err(err);
+                }
                 return;
             }
         } else {
             vhostfd = open("/dev/vhost-net", O_RDWR);
             if (vhostfd < 0) {
-                error_setg_errno(errp, errno,
-                                 "tap: open vhost char device failed");
+                if (tap->has_vhostforce && tap->vhostforce) {
+                    error_setg_errno(errp, errno,
+                                     "tap: open vhost char device failed");
+                } else {
+                    warn_report("tap: open vhost char device failed: %s",
+                                strerror(errno));
+                }
                 return;
             }
+            fcntl(vhostfd, F_SETFL, O_NONBLOCK);
         }
         options.opaque = (void *)(uintptr_t)vhostfd;
 
         s->vhost_net = vhost_net_init(&options);
         if (!s->vhost_net) {
-            error_setg(errp,
-                       "vhost-net requested but could not be initialized");
+            if (tap->has_vhostforce && tap->vhostforce) {
+                error_setg(errp, VHOST_NET_INIT_FAILED);
+            } else {
+                warn_report(VHOST_NET_INIT_FAILED);
+            }
             return;
         }
     } else if (vhostfdname) {
@@ -753,10 +766,10 @@ int net_init_tap(const Netdev *netdev, const char *name,
     queues = tap->has_queues ? tap->queues : 1;
     vhostfdname = tap->has_vhostfd ? tap->vhostfd : NULL;
 
-    /* QEMU vlans does not support multiqueue tap, in this case peer is set.
+    /* QEMU hubs do not support multiqueue tap, in this case peer is set.
      * For -netdev, peer is always NULL. */
     if (peer && (tap->has_queues || tap->has_fds || tap->has_vhostfds)) {
-        error_setg(errp, "Multiqueue tap cannot be used with QEMU vlans");
+        error_setg(errp, "Multiqueue tap cannot be used with hubs");
         return -1;
     }
 
@@ -788,8 +801,8 @@ int net_init_tap(const Netdev *netdev, const char *name,
             return -1;
         }
     } else if (tap->has_fds) {
-        char **fds = g_new0(char *, MAX_TAP_QUEUES);
-        char **vhost_fds = g_new0(char *, MAX_TAP_QUEUES);
+        char **fds;
+        char **vhost_fds;
         int nfds, nvhosts;
 
         if (tap->has_ifname || tap->has_script || tap->has_downscript ||
@@ -800,6 +813,9 @@ int net_init_tap(const Netdev *netdev, const char *name,
                        "are invalid with fds=");
             return -1;
         }
+
+        fds = g_new0(char *, MAX_TAP_QUEUES);
+        vhost_fds = g_new0(char *, MAX_TAP_QUEUES);
 
         nfds = get_fds(tap->fds, fds, MAX_TAP_QUEUES);
         if (tap->has_vhostfds) {

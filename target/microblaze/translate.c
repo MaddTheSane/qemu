@@ -27,6 +27,7 @@
 #include "microblaze-decode.h"
 #include "exec/cpu_ldst.h"
 #include "exec/helper-gen.h"
+#include "exec/translator.h"
 
 #include "trace-tcg.h"
 #include "exec/log.h"
@@ -46,8 +47,12 @@
 #define EXTRACT_FIELD(src, start, end) \
             (((src) >> start) & ((1 << (end - start + 1)) - 1))
 
+/* is_jmp field values */
+#define DISAS_JUMP    DISAS_TARGET_0 /* only pc was modified dynamically */
+#define DISAS_UPDATE  DISAS_TARGET_1 /* cpu state was modified dynamically */
+#define DISAS_TB_JUMP DISAS_TARGET_2 /* only pc was modified statically */
+
 static TCGv env_debug;
-static TCGv_env cpu_env;
 static TCGv cpu_R[32];
 static TCGv cpu_SR[18];
 static TCGv env_imm;
@@ -326,7 +331,7 @@ static void dec_pattern(DisasContext *dc)
 
     if ((dc->tb_flags & MSR_EE_FLAG)
           && (dc->cpu->env.pvr.regs[2] & PVR2_ILL_OPCODE_EXC_MASK)
-          && !((dc->cpu->env.pvr.regs[2] & PVR2_USE_PCMP_INSTR))) {
+          && !dc->cpu->cfg.use_pcmp_instr) {
         tcg_gen_movi_tl(cpu_SR[SR_ESR], ESR_EC_ILLEGAL_OP);
         t_gen_raise_exception(dc, EXCP_HW_EXCP);
     }
@@ -419,7 +424,7 @@ static inline void msr_write(DisasContext *dc, TCGv v)
     /* PVR bit is not writable.  */
     tcg_gen_andi_tl(t, v, ~MSR_PVR);
     tcg_gen_andi_tl(cpu_SR[SR_MSR], cpu_SR[SR_MSR], MSR_PVR);
-    tcg_gen_or_tl(cpu_SR[SR_MSR], cpu_SR[SR_MSR], v);
+    tcg_gen_or_tl(cpu_SR[SR_MSR], cpu_SR[SR_MSR], t);
     tcg_temp_free(t);
 }
 
@@ -443,7 +448,7 @@ static void dec_msr(DisasContext *dc)
         LOG_DIS("msr%s r%d imm=%x\n", clr ? "clr" : "set",
                 dc->rd, dc->imm);
 
-        if (!(dc->cpu->env.pvr.regs[2] & PVR2_USE_MSR_INSTR)) {
+        if (!dc->cpu->cfg.use_msr_instr) {
             /* nop??? */
             return;
         }
@@ -589,7 +594,7 @@ static void dec_mul(DisasContext *dc)
 
     if ((dc->tb_flags & MSR_EE_FLAG)
          && (dc->cpu->env.pvr.regs[2] & PVR2_ILL_OPCODE_EXC_MASK)
-         && !(dc->cpu->env.pvr.regs[0] & PVR0_USE_HW_MUL_MASK)) {
+         && !dc->cpu->cfg.use_hw_mul) {
         tcg_gen_movi_tl(cpu_SR[SR_ESR], ESR_EC_ILLEGAL_OP);
         t_gen_raise_exception(dc, EXCP_HW_EXCP);
         return;
@@ -604,8 +609,7 @@ static void dec_mul(DisasContext *dc)
     }
 
     /* mulh, mulhsu and mulhu are not available if C_USE_HW_MUL is < 2.  */
-    if (subcode >= 1 && subcode <= 3
-        && !((dc->cpu->env.pvr.regs[2] & PVR2_USE_MUL64_MASK))) {
+    if (subcode >= 1 && subcode <= 3 && dc->cpu->cfg.use_hw_mul < 2) {
         /* nop??? */
     }
 
@@ -643,7 +647,7 @@ static void dec_div(DisasContext *dc)
     LOG_DIS("div\n");
 
     if ((dc->cpu->env.pvr.regs[2] & PVR2_ILL_OPCODE_EXC_MASK)
-          && !((dc->cpu->env.pvr.regs[0] & PVR0_USE_DIV_MASK))) {
+          && !dc->cpu->cfg.use_div) {
         tcg_gen_movi_tl(cpu_SR[SR_ESR], ESR_EC_ILLEGAL_OP);
         t_gen_raise_exception(dc, EXCP_HW_EXCP);
     }
@@ -661,34 +665,66 @@ static void dec_div(DisasContext *dc)
 static void dec_barrel(DisasContext *dc)
 {
     TCGv t0;
-    unsigned int s, t;
+    unsigned int imm_w, imm_s;
+    bool s, t, e = false, i = false;
 
     if ((dc->tb_flags & MSR_EE_FLAG)
           && (dc->cpu->env.pvr.regs[2] & PVR2_ILL_OPCODE_EXC_MASK)
-          && !(dc->cpu->env.pvr.regs[0] & PVR0_USE_BARREL_MASK)) {
+          && !dc->cpu->cfg.use_barrel) {
         tcg_gen_movi_tl(cpu_SR[SR_ESR], ESR_EC_ILLEGAL_OP);
         t_gen_raise_exception(dc, EXCP_HW_EXCP);
         return;
     }
 
-    s = dc->imm & (1 << 10);
-    t = dc->imm & (1 << 9);
+    if (dc->type_b) {
+        /* Insert and extract are only available in immediate mode.  */
+        i = extract32(dc->imm, 15, 1);
+        e = extract32(dc->imm, 14, 1);
+    }
+    s = extract32(dc->imm, 10, 1);
+    t = extract32(dc->imm, 9, 1);
+    imm_w = extract32(dc->imm, 6, 5);
+    imm_s = extract32(dc->imm, 0, 5);
 
-    LOG_DIS("bs%s%s r%d r%d r%d\n",
+    LOG_DIS("bs%s%s%s r%d r%d r%d\n",
+            e ? "e" : "",
             s ? "l" : "r", t ? "a" : "l", dc->rd, dc->ra, dc->rb);
 
-    t0 = tcg_temp_new();
+    if (e) {
+        if (imm_w + imm_s > 32 || imm_w == 0) {
+            /* These inputs have an undefined behavior.  */
+            qemu_log_mask(LOG_GUEST_ERROR, "bsefi: Bad input w=%d s=%d\n",
+                          imm_w, imm_s);
+        } else {
+            tcg_gen_extract_i32(cpu_R[dc->rd], cpu_R[dc->ra], imm_s, imm_w);
+        }
+    } else if (i) {
+        int width = imm_w - imm_s + 1;
 
-    tcg_gen_mov_tl(t0, *(dec_alu_op_b(dc)));
-    tcg_gen_andi_tl(t0, t0, 31);
+        if (imm_w < imm_s) {
+            /* These inputs have an undefined behavior.  */
+            qemu_log_mask(LOG_GUEST_ERROR, "bsifi: Bad input w=%d s=%d\n",
+                          imm_w, imm_s);
+        } else {
+            tcg_gen_deposit_i32(cpu_R[dc->rd], cpu_R[dc->rd], cpu_R[dc->ra],
+                                imm_s, width);
+        }
+    } else {
+        t0 = tcg_temp_new();
 
-    if (s)
-        tcg_gen_shl_tl(cpu_R[dc->rd], cpu_R[dc->ra], t0);
-    else {
-        if (t)
-            tcg_gen_sar_tl(cpu_R[dc->rd], cpu_R[dc->ra], t0);
-        else
-            tcg_gen_shr_tl(cpu_R[dc->rd], cpu_R[dc->ra], t0);
+        tcg_gen_mov_tl(t0, *(dec_alu_op_b(dc)));
+        tcg_gen_andi_tl(t0, t0, 31);
+
+        if (s) {
+            tcg_gen_shl_tl(cpu_R[dc->rd], cpu_R[dc->ra], t0);
+        } else {
+            if (t) {
+                tcg_gen_sar_tl(cpu_R[dc->rd], cpu_R[dc->ra], t0);
+            } else {
+                tcg_gen_shr_tl(cpu_R[dc->rd], cpu_R[dc->ra], t0);
+            }
+        }
+        tcg_temp_free(t0);
     }
 }
 
@@ -763,12 +799,12 @@ static void dec_bit(DisasContext *dc)
         case 0xe0:
             if ((dc->tb_flags & MSR_EE_FLAG)
                 && (dc->cpu->env.pvr.regs[2] & PVR2_ILL_OPCODE_EXC_MASK)
-                && !((dc->cpu->env.pvr.regs[2] & PVR2_USE_PCMP_INSTR))) {
+                && !dc->cpu->cfg.use_pcmp_instr) {
                 tcg_gen_movi_tl(cpu_SR[SR_ESR], ESR_EC_ILLEGAL_OP);
                 t_gen_raise_exception(dc, EXCP_HW_EXCP);
             }
-            if (dc->cpu->env.pvr.regs[2] & PVR2_USE_PCMP_INSTR) {
-                gen_helper_clz(cpu_R[dc->rd], cpu_R[dc->ra]);
+            if (dc->cpu->cfg.use_pcmp_instr) {
+                tcg_gen_clzi_i32(cpu_R[dc->rd], cpu_R[dc->ra], 32);
             }
             break;
         case 0x1e0:
@@ -916,7 +952,6 @@ static void dec_load(DisasContext *dc)
                 tcg_gen_sub_tl(low, tcg_const_tl(3), low);
                 tcg_gen_andi_tl(t, t, ~3);
                 tcg_gen_or_tl(t, t, low);
-                tcg_gen_mov_tl(env_imm, t);
                 tcg_temp_free(low);
                 break;
             }
@@ -1068,7 +1103,6 @@ static void dec_store(DisasContext *dc)
                 tcg_gen_sub_tl(low, tcg_const_tl(3), low);
                 tcg_gen_andi_tl(t, t, ~3);
                 tcg_gen_or_tl(t, t, low);
-                tcg_gen_mov_tl(env_imm, t);
                 tcg_temp_free(low);
                 break;
             }
@@ -1376,7 +1410,7 @@ static void dec_fpu(DisasContext *dc)
 
     if ((dc->tb_flags & MSR_EE_FLAG)
           && (dc->cpu->env.pvr.regs[2] & PVR2_ILL_OPCODE_EXC_MASK)
-          && (dc->cpu->cfg.use_fpu != 1)) {
+          && !dc->cpu->cfg.use_fpu) {
         tcg_gen_movi_tl(cpu_SR[SR_ESR], ESR_EC_ILLEGAL_OP);
         t_gen_raise_exception(dc, EXCP_HW_EXCP);
         return;
@@ -1594,14 +1628,14 @@ static inline void decode(DisasContext *dc, uint32_t ir)
 }
 
 /* generate intermediate code for basic block 'tb'.  */
-void gen_intermediate_code(CPUMBState *env, struct TranslationBlock *tb)
+void gen_intermediate_code(CPUState *cs, struct TranslationBlock *tb)
 {
+    CPUMBState *env = cs->env_ptr;
     MicroBlazeCPU *cpu = mb_env_get_cpu(env);
-    CPUState *cs = CPU(cpu);
     uint32_t pc_start;
     struct DisasContext ctx;
     struct DisasContext *dc = &ctx;
-    uint32_t next_page_start, org_flags;
+    uint32_t page_start, org_flags;
     target_ulong npc;
     int num_insns;
     int max_insns;
@@ -1627,9 +1661,9 @@ void gen_intermediate_code(CPUMBState *env, struct TranslationBlock *tb)
         cpu_abort(cs, "Microblaze: unaligned PC=%x\n", pc_start);
     }
 
-    next_page_start = (pc_start & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
+    page_start = pc_start & TARGET_PAGE_MASK;
     num_insns = 0;
-    max_insns = tb->cflags & CF_COUNT_MASK;
+    max_insns = tb_cflags(tb) & CF_COUNT_MASK;
     if (max_insns == 0) {
         max_insns = CF_COUNT_MASK;
     }
@@ -1664,7 +1698,7 @@ void gen_intermediate_code(CPUMBState *env, struct TranslationBlock *tb)
         /* Pretty disas.  */
         LOG_DIS("%8.8x:\t", dc->pc);
 
-        if (num_insns == max_insns && (tb->cflags & CF_LAST_IO)) {
+        if (num_insns == max_insns && (tb_cflags(tb) & CF_LAST_IO)) {
             gen_io_start();
         }
 
@@ -1713,7 +1747,7 @@ void gen_intermediate_code(CPUMBState *env, struct TranslationBlock *tb)
     } while (!dc->is_jmp && !dc->cpustate_changed
              && !tcg_op_buf_full()
              && !singlestep
-             && (dc->pc < next_page_start)
+             && (dc->pc - page_start < TARGET_PAGE_SIZE)
              && num_insns < max_insns);
 
     npc = dc->pc;
@@ -1726,7 +1760,7 @@ void gen_intermediate_code(CPUMBState *env, struct TranslationBlock *tb)
             npc = dc->jmp_pc;
     }
 
-    if (tb->cflags & CF_LAST_IO)
+    if (tb_cflags(tb) & CF_LAST_IO)
         gen_io_end();
     /* Force an update if the per-tb cpu state has changed.  */
     if (dc->is_jmp == DISAS_NEXT
@@ -1772,11 +1806,7 @@ void gen_intermediate_code(CPUMBState *env, struct TranslationBlock *tb)
         && qemu_log_in_addr_range(pc_start)) {
         qemu_log_lock();
         qemu_log("--------------\n");
-#if DISAS_GNU
-        log_target_disas(cs, pc_start, dc->pc - pc_start, 0);
-#endif
-        qemu_log("\nisize=%d osize=%d\n",
-                 dc->pc - pc_start, tcg_op_buf_count());
+        log_target_disas(cs, pc_start, dc->pc - pc_start);
         qemu_log_unlock();
     }
 #endif
@@ -1814,23 +1844,9 @@ void mb_cpu_dump_state(CPUState *cs, FILE *f, fprintf_function cpu_fprintf,
     cpu_fprintf(f, "\n\n");
 }
 
-MicroBlazeCPU *cpu_mb_init(const char *cpu_model)
-{
-    MicroBlazeCPU *cpu;
-
-    cpu = MICROBLAZE_CPU(object_new(TYPE_MICROBLAZE_CPU));
-
-    object_property_set_bool(OBJECT(cpu), true, "realized", NULL);
-
-    return cpu;
-}
-
 void mb_tcg_init(void)
 {
     int i;
-
-    cpu_env = tcg_global_reg_new_ptr(TCG_AREG0, "env");
-    tcg_ctx.tcg_env = cpu_env;
 
     env_debug = tcg_global_mem_new(cpu_env,
                     offsetof(CPUMBState, debug),

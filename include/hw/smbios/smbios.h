@@ -14,7 +14,6 @@
  *
  */
 
-#include "qemu/option.h"
 
 #define SMBIOS_MAX_TYPE 127
 
@@ -195,6 +194,12 @@ struct smbios_type_4 {
     uint16_t processor_family2;
 } QEMU_PACKED;
 
+/* SMBIOS type 11 - OEM strings */
+struct smbios_type_11 {
+    struct smbios_structure_header header;
+    uint8_t count;
+} QEMU_PACKED;
+
 /* SMBIOS type 16 - Physical Memory Array (v2.7) */
 struct smbios_type_16 {
     struct smbios_structure_header header;
@@ -257,7 +262,7 @@ struct smbios_type_127 {
     struct smbios_structure_header header;
 } QEMU_PACKED;
 
-void smbios_entry_add(QemuOpts *opts);
+void smbios_entry_add(QemuOpts *opts, Error **errp);
 void smbios_set_cpuid(uint32_t version, uint32_t features);
 void smbios_set_defaults(const char *manufacturer, const char *product,
                          const char *version, bool legacy_mode,

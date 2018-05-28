@@ -30,7 +30,7 @@
 #include "hw/pci/msi.h"
 #include "qemu/iov.h"
 #include "hw/scsi/scsi.h"
-#include "block/scsi.h"
+#include "scsi/constants.h"
 #include "trace.h"
 #include "qapi/error.h"
 #include "mptsas.h"
@@ -756,7 +756,7 @@ static void mptsas_fetch_request(MPTSASState *s)
 
     /* Read the message header from the guest first. */
     addr = s->host_mfa_high_addr | MPTSAS_FIFO_GET(s, request_post);
-    pci_dma_read(pci, addr, req, sizeof(hdr));
+    pci_dma_read(pci, addr, req, sizeof(*hdr));
 
     if (hdr->Function < ARRAY_SIZE(mpi_request_sizes) &&
         mpi_request_sizes[hdr->Function]) {
@@ -766,8 +766,8 @@ static void mptsas_fetch_request(MPTSASState *s)
          */
         size = mpi_request_sizes[hdr->Function];
         assert(size <= MPTSAS_MAX_REQUEST_SIZE);
-        pci_dma_read(pci, addr + sizeof(hdr), &req[sizeof(hdr)],
-                     size - sizeof(hdr));
+        pci_dma_read(pci, addr + sizeof(*hdr), &req[sizeof(*hdr)],
+                     size - sizeof(*hdr));
     }
 
     if (hdr->Function == MPI_FUNCTION_SCSI_IO_REQUEST) {
@@ -1236,11 +1236,9 @@ static void *mptsas_load_request(QEMUFile *f, SCSIRequest *sreq)
     n = qemu_get_be32(f);
     /* TODO: add a way for SCSIBusInfo's load_request to fail,
      * and fail migration instead of asserting here.
-     * When we do, we might be able to re-enable NDEBUG below.
+     * This is just one thing (there are probably more) that must be
+     * fixed before we can allow NDEBUG compilation.
      */
-#ifdef NDEBUG
-#error building with NDEBUG is not supported
-#endif
     assert(n >= 0);
 
     pci_dma_sglist_init(&req->qsg, pci, n);
@@ -1271,7 +1269,6 @@ static const struct SCSIBusInfo mptsas_scsi_info = {
 
 static void mptsas_scsi_realize(PCIDevice *dev, Error **errp)
 {
-    DeviceState *d = DEVICE(dev);
     MPTSASState *s = MPT_SAS(dev);
     Error *err = NULL;
     int ret;
@@ -1315,7 +1312,7 @@ static void mptsas_scsi_realize(PCIDevice *dev, Error **errp)
     if (!s->sas_addr) {
         s->sas_addr = ((NAA_LOCALLY_ASSIGNED_ID << 24) |
                        IEEE_COMPANY_LOCALLY_ASSIGNED) << 36;
-        s->sas_addr |= (pci_bus_num(dev->bus) << 16);
+        s->sas_addr |= (pci_dev_bus_num(dev) << 16);
         s->sas_addr |= (PCI_SLOT(dev->devfn) << 8);
         s->sas_addr |= PCI_FUNC(dev->devfn);
     }
@@ -1326,9 +1323,6 @@ static void mptsas_scsi_realize(PCIDevice *dev, Error **errp)
     QTAILQ_INIT(&s->pending);
 
     scsi_bus_new(&s->bus, sizeof(s->bus), &dev->qdev, &mptsas_scsi_info, NULL);
-    if (!d->hotplugged) {
-        scsi_bus_legacy_handle_cmdline(&s->bus, errp);
-    }
 }
 
 static void mptsas_scsi_uninit(PCIDevice *dev)
@@ -1445,6 +1439,10 @@ static const TypeInfo mptsas_info = {
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(MPTSASState),
     .class_init = mptsas1068_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
 };
 
 static void mptsas_register_types(void)

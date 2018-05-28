@@ -47,23 +47,18 @@ typedef void QEMUBHFunc(void *opaque);
 typedef bool AioPollFn(void *opaque);
 typedef void IOHandler(void *opaque);
 
+struct Coroutine;
 struct ThreadPool;
 struct LinuxAioState;
 
 struct AioContext {
     GSource source;
 
-    /* Protects all fields from multi-threaded access */
+    /* Used by AioContext users to protect from multi-threaded access.  */
     QemuRecMutex lock;
 
-    /* The list of registered AIO handlers */
+    /* The list of registered AIO handlers.  Protected by ctx->list_lock. */
     QLIST_HEAD(, AioHandler) aio_handlers;
-
-    /* This is a simple lock used to protect the aio_handlers list.
-     * Specifically, it's used to ensure that no callbacks are removed while
-     * we're walking and dispatching callbacks.
-     */
-    int walking_handlers;
 
     /* Used to avoid unnecessary event_notifier_set calls in aio_notify;
      * accessed with atomic primitives.  If this field is 0, everything
@@ -90,16 +85,14 @@ struct AioContext {
      */
     uint32_t notify_me;
 
-    /* lock to protect between bh's adders and deleter */
-    QemuMutex bh_lock;
+    /* A lock to protect between QEMUBH and AioHandler adders and deleter,
+     * and to ensure that no callbacks are removed while we're walking and
+     * dispatching them.
+     */
+    QemuLockCnt list_lock;
 
     /* Anchor of the list of Bottom Halves belonging to the context */
     struct QEMUBH *first_bh;
-
-    /* A simple lock used to protect the first_bh list, and ensure that
-     * no callbacks are removed while we're walking and dispatching callbacks.
-     */
-    int walking_bh;
 
     /* Used by aio_notify.
      *
@@ -116,7 +109,12 @@ struct AioContext {
     bool notified;
     EventNotifier notifier;
 
-    /* Thread pool for performing work and receiving completion callbacks */
+    QSLIST_HEAD(, Coroutine) scheduled_coroutines;
+    QEMUBH *co_schedule_bh;
+
+    /* Thread pool for performing work and receiving completion callbacks.
+     * Has its own locking.
+     */
     struct ThreadPool *thread_pool;
 
 #ifdef CONFIG_LINUX_AIO
@@ -126,7 +124,9 @@ struct AioContext {
     struct LinuxAioState *linux_aio;
 #endif
 
-    /* TimerLists for calling timers - one per clock type */
+    /* TimerLists for calling timers - one per clock type.  Has its own
+     * locking.
+     */
     QEMUTimerListGroup tlg;
 
     int external_disable_cnt;
@@ -180,9 +180,11 @@ void aio_context_unref(AioContext *ctx);
  * automatically takes care of calling aio_context_acquire and
  * aio_context_release.
  *
- * Access to timers and BHs from a thread that has not acquired AioContext
- * is possible.  Access to callbacks for now must be done while the AioContext
- * is owned by the thread (FIXME).
+ * Note that this is separate from bdrv_drained_begin/bdrv_drained_end.  A
+ * thread still has to call those to avoid being interrupted by the guest.
+ *
+ * Bottom halves, timers and callbacks can be created or removed without
+ * acquiring the AioContext.
  */
 void aio_context_acquire(AioContext *ctx);
 
@@ -308,12 +310,8 @@ bool aio_pending(AioContext *ctx);
 /* Dispatch any pending callbacks from the GSource attached to the AioContext.
  *
  * This is used internally in the implementation of the GSource.
- *
- * @dispatch_fds: true to process fds, false to skip them
- *                (can be used as an optimization by callers that know there
- *                are no fds ready)
  */
-bool aio_dispatch(AioContext *ctx, bool dispatch_fds);
+void aio_dispatch(AioContext *ctx);
 
 /* Progress in completing AIO work to occur.  This can issue new pending
  * aio as a result of executing I/O completion or bh callbacks.
@@ -456,8 +454,14 @@ static inline void aio_disable_external(AioContext *ctx)
  */
 static inline void aio_enable_external(AioContext *ctx)
 {
-    assert(ctx->external_disable_cnt > 0);
-    atomic_dec(&ctx->external_disable_cnt);
+    int old;
+
+    old = atomic_fetch_dec(&ctx->external_disable_cnt);
+    assert(old > 0);
+    if (old == 1) {
+        /* Kick event loop so it re-arms file descriptors */
+        aio_notify(ctx);
+    }
 }
 
 /**
@@ -485,6 +489,43 @@ static inline bool aio_node_check(AioContext *ctx, bool is_external)
 }
 
 /**
+ * aio_co_schedule:
+ * @ctx: the aio context
+ * @co: the coroutine
+ *
+ * Start a coroutine on a remote AioContext.
+ *
+ * The coroutine must not be entered by anyone else while aio_co_schedule()
+ * is active.  In addition the coroutine must have yielded unless ctx
+ * is the context in which the coroutine is running (i.e. the value of
+ * qemu_get_current_aio_context() from the coroutine itself).
+ */
+void aio_co_schedule(AioContext *ctx, struct Coroutine *co);
+
+/**
+ * aio_co_wake:
+ * @co: the coroutine
+ *
+ * Restart a coroutine on the AioContext where it was running last, thus
+ * preventing coroutines from jumping from one context to another when they
+ * go to sleep.
+ *
+ * aio_co_wake may be executed either in coroutine or non-coroutine
+ * context.  The coroutine must not be entered by anyone else while
+ * aio_co_wake() is active.
+ */
+void aio_co_wake(struct Coroutine *co);
+
+/**
+ * aio_co_enter:
+ * @ctx: the context to run the coroutine
+ * @co: the coroutine to run
+ *
+ * Enter a coroutine in the specified AioContext.
+ */
+void aio_co_enter(AioContext *ctx, struct Coroutine *co);
+
+/**
  * Return the AioContext whose event loop runs in the current thread.
  *
  * If called from an IOThread this will be the IOThread's AioContext.  If
@@ -493,11 +534,14 @@ static inline bool aio_node_check(AioContext *ctx, bool is_external)
 AioContext *qemu_get_current_aio_context(void);
 
 /**
+ * in_aio_context_home_thread:
  * @ctx: the aio context
  *
- * Return whether we are running in the I/O thread that manages @ctx.
+ * Return whether we are running in the thread that normally runs @ctx.  Note
+ * that acquiring/releasing ctx does not affect the outcome, each AioContext
+ * still only has one home thread that is responsible for running it.
  */
-static inline bool aio_context_in_iothread(AioContext *ctx)
+static inline bool in_aio_context_home_thread(AioContext *ctx)
 {
     return ctx == qemu_get_current_aio_context();
 }
@@ -509,6 +553,14 @@ static inline bool aio_context_in_iothread(AioContext *ctx)
  * Initialize the aio context.
  */
 void aio_context_setup(AioContext *ctx);
+
+/**
+ * aio_context_destroy:
+ * @ctx: the aio context
+ *
+ * Destroy the aio context.
+ */
+void aio_context_destroy(AioContext *ctx);
 
 /**
  * aio_context_set_poll_params:

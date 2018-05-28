@@ -34,7 +34,6 @@
 #define MOXIE_EX_BREAK      16
 
 #include "exec/cpu-defs.h"
-#include "fpu/softfloat.h"
 
 #define TARGET_PAGE_BITS 12     /* 4k */
 
@@ -55,6 +54,9 @@ typedef struct CPUMoxieState {
     uint32_t cc_b;                /* reg b for condition code calculation */
 
     void *irq[8];
+
+    /* Fields up to this point are cleared by a CPU reset */
+    struct {} end_reset_fields;
 
     CPU_COMMON
 
@@ -109,7 +111,6 @@ static inline MoxieCPU *moxie_env_get_cpu(CPUMoxieState *env)
 
 #define ENV_OFFSET offsetof(MoxieCPU, env)
 
-MoxieCPU *cpu_moxie_init(const char *cpu_model);
 void moxie_cpu_do_interrupt(CPUState *cs);
 void moxie_cpu_dump_state(CPUState *cpu, FILE *f,
                           fprintf_function cpu_fprintf, int flags);
@@ -118,7 +119,9 @@ void moxie_translate_init(void);
 int cpu_moxie_signal_handler(int host_signum, void *pinfo,
                              void *puc);
 
-#define cpu_init(cpu_model) CPU(cpu_moxie_init(cpu_model))
+#define MOXIE_CPU_TYPE_SUFFIX "-" TYPE_MOXIE_CPU
+#define MOXIE_CPU_TYPE_NAME(model) model MOXIE_CPU_TYPE_SUFFIX
+#define CPU_RESOLVING_TYPE TYPE_MOXIE_CPU
 
 #define cpu_signal_handler cpu_moxie_signal_handler
 
@@ -137,7 +140,7 @@ static inline void cpu_get_tb_cpu_state(CPUMoxieState *env, target_ulong *pc,
     *flags = 0;
 }
 
-int moxie_cpu_handle_mmu_fault(CPUState *cpu, vaddr address,
+int moxie_cpu_handle_mmu_fault(CPUState *cpu, vaddr address, int size,
                                int rw, int mmu_idx);
 
 #endif /* MOXIE_CPU_H */

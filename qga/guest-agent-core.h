@@ -12,13 +12,15 @@
  */
 #include "qapi/qmp/dispatch.h"
 #include "qemu-common.h"
-#include "qga-qmp-commands.h"
+#include "qga-qapi-types.h"
 
 #define QGA_READ_COUNT_DEFAULT 4096
 
 typedef struct GAState GAState;
 typedef struct GACommandState GACommandState;
+
 extern GAState *ga_state;
+extern QmpCommandList ga_commands;
 
 GList *ga_command_blacklist_init(GList *blacklist);
 void ga_command_state_init(GAState *s, GACommandState *cs);

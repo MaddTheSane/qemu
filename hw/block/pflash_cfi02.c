@@ -83,7 +83,6 @@ struct pflash_t {
     uint16_t ident3;
     uint16_t unlock_addr0;
     uint16_t unlock_addr1;
-    uint8_t cfi_len;
     uint8_t cfi_table[0x52];
     QEMUTimer *timer;
     /* The device replicates the flash memory across its memory space.  Emulate
@@ -235,10 +234,11 @@ static uint32_t pflash_read (pflash_t *pfl, hwaddr offset,
         break;
     case 0x98:
         /* CFI query mode */
-        if (boff > pfl->cfi_len)
-            ret = 0;
-        else
+        if (boff < sizeof(pfl->cfi_table)) {
             ret = pfl->cfi_table[boff];
+        } else {
+            ret = 0;
+        }
         break;
     }
 
@@ -629,9 +629,21 @@ static void pflash_cfi02_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    vmstate_register_ram(&pfl->orig_mem, DEVICE(pfl));
     pfl->storage = memory_region_get_ram_ptr(&pfl->orig_mem);
     pfl->chip_len = chip_len;
+
+    if (pfl->blk) {
+        uint64_t perm;
+        pfl->ro = blk_is_read_only(pfl->blk);
+        perm = BLK_PERM_CONSISTENT_READ | (pfl->ro ? 0 : BLK_PERM_WRITE);
+        ret = blk_set_perm(pfl->blk, perm, BLK_PERM_ALL, errp);
+        if (ret < 0) {
+            return;
+        }
+    } else {
+        pfl->ro = 0;
+    }
+
     if (pfl->blk) {
         /* read the initial flash content */
         ret = blk_pread(pfl->blk, 0, pfl->storage, chip_len);
@@ -646,18 +658,11 @@ static void pflash_cfi02_realize(DeviceState *dev, Error **errp)
     pfl->rom_mode = 1;
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &pfl->mem);
 
-    if (pfl->blk) {
-        pfl->ro = blk_is_read_only(pfl->blk);
-    } else {
-        pfl->ro = 0;
-    }
-
     pfl->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pflash_timer, pfl);
     pfl->wcycle = 0;
     pfl->cmd = 0;
     pfl->status = 0;
     /* Hardcoded CFI table (mostly from SG29 Spansion flash) */
-    pfl->cfi_len = 0x52;
     /* Standard "QRY" string */
     pfl->cfi_table[0x10] = 'Q';
     pfl->cfi_table[0x11] = 'R';

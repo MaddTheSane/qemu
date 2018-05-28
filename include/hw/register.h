@@ -13,6 +13,7 @@
 
 #include "hw/qdev-core.h"
 #include "exec/memory.h"
+#include "hw/registerfields.h"
 
 typedef struct RegisterInfo RegisterInfo;
 typedef struct RegisterAccessInfo RegisterAccessInfo;
@@ -33,7 +34,7 @@ typedef struct RegisterInfoArray RegisterInfoArray;
  * immediately before the actual write. The returned value is what is written,
  * giving the handler a chance to modify the written value.
  * @post_write: Post write callback. Passed the written value. Most write side
- * effects should be implemented here.
+ * effects should be implemented here. This is called during device reset.
  *
  * @post_read: Post read callback. Passes the value that is about to be returned
  * for a read. The return value from this function is what is ultimately read,
@@ -92,7 +93,7 @@ struct RegisterInfo {
  * This structure is used to group all of the individual registers which are
  * modeled using the RegisterInfo structure.
  *
- * @r is an aray containing of all the relevent RegisterInfo structures.
+ * @r is an array containing of all the relevant RegisterInfo structures.
  *
  * @num_elements is the number of elements in the array r
  *
@@ -134,8 +135,8 @@ uint64_t register_read(RegisterInfo *reg, uint64_t re, const char* prefix,
                        bool debug);
 
 /**
- * reset a register
- * @reg: register to reset
+ * Resets a register. This will also call the post_write hook if it exists.
+ * @reg: The register to reset.
  */
 
 void register_reset(RegisterInfo *reg);
@@ -205,51 +206,5 @@ RegisterInfoArray *register_init_block32(DeviceState *owner,
  */
 
 void register_finalize_block(RegisterInfoArray *r_array);
-
-/* Define constants for a 32 bit register */
-
-/* This macro will define A_FOO, for the byte address of a register
- * as well as R_FOO for the uint32_t[] register number (A_FOO / 4).
- */
-#define REG32(reg, addr)                                                  \
-    enum { A_ ## reg = (addr) };                                          \
-    enum { R_ ## reg = (addr) / 4 };
-
-/* Define SHIFT, LENGTH and MASK constants for a field within a register */
-
-/* This macro will define FOO_BAR_MASK, FOO_BAR_SHIFT and FOO_BAR_LENGTH 
- * constants for field BAR in register FOO.
- */
-#define FIELD(reg, field, shift, length)                                  \
-    enum { R_ ## reg ## _ ## field ## _SHIFT = (shift)};                  \
-    enum { R_ ## reg ## _ ## field ## _LENGTH = (length)};                \
-    enum { R_ ## reg ## _ ## field ## _MASK =                             \
-                                        MAKE_64BIT_MASK(shift, length)};
-
-/* Extract a field from a register */
-#define FIELD_EX32(storage, reg, field)                                   \
-    extract32((storage), R_ ## reg ## _ ## field ## _SHIFT,               \
-              R_ ## reg ## _ ## field ## _LENGTH)
-
-/* Extract a field from an array of registers */
-#define ARRAY_FIELD_EX32(regs, reg, field)                                \
-    FIELD_EX32((regs)[R_ ## reg], reg, field)
-
-/* Deposit a register field.
- * Assigning values larger then the target field will result in
- * compilation warnings.
- */
-#define FIELD_DP32(storage, reg, field, val) ({                           \
-    struct {                                                              \
-        unsigned int v:R_ ## reg ## _ ## field ## _LENGTH;                \
-    } v = { .v = val };                                                   \
-    uint32_t d;                                                           \
-    d = deposit32((storage), R_ ## reg ## _ ## field ## _SHIFT,           \
-                  R_ ## reg ## _ ## field ## _LENGTH, v.v);               \
-    d; })
-
-/* Deposit a field to array of registers.  */
-#define ARRAY_FIELD_DP32(regs, reg, field, val)                           \
-    (regs)[R_ ## reg] = FIELD_DP32((regs)[R_ ## reg], reg, field, val);
 
 #endif

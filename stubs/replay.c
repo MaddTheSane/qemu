@@ -30,11 +30,11 @@ void replay_finish(void)
 {
 }
 
-void replay_register_char_driver(CharDriverState *chr)
+void replay_register_char_driver(Chardev *chr)
 {
 }
 
-void replay_chr_be_write(CharDriverState *s, uint8_t *buf, int len)
+void replay_chr_be_write(Chardev *s, uint8_t *buf, int len)
 {
     abort();
 }
@@ -71,4 +71,12 @@ void replay_block_event(QEMUBH *bh, uint64_t id)
 uint64_t blkreplay_next_id(void)
 {
     return 0;
+}
+
+void replay_mutex_lock(void)
+{
+}
+
+void replay_mutex_unlock(void)
+{
 }

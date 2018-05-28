@@ -17,7 +17,9 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "cpu.h"
+#include "internal.h"
 #include "qemu/host-utils.h"
 #include "exec/helper-proto.h"
 #include "exec/exec-all.h"
@@ -66,6 +68,7 @@ static inline type do_##name(CPUMIPSState *env, target_ulong addr,      \
     case 1: return (type) cpu_##insn##_super_ra(env, addr, retaddr);    \
     default:                                                            \
     case 2: return (type) cpu_##insn##_user_ra(env, addr, retaddr);     \
+    case 3: return (type) cpu_##insn##_error_ra(env, addr, retaddr);    \
     }                                                                   \
 }
 #endif
@@ -93,6 +96,9 @@ static inline void do_##name(CPUMIPSState *env, target_ulong addr,      \
     case 1: cpu_##insn##_super_ra(env, addr, val, retaddr); break;      \
     default:                                                            \
     case 2: cpu_##insn##_user_ra(env, addr, val, retaddr); break;       \
+    case 3:                                                             \
+        cpu_##insn##_error_ra(env, addr, val, retaddr);                 \
+        break;                                                          \
     }                                                                   \
 }
 #endif
@@ -102,28 +108,6 @@ HELPER_ST(sw, stl, uint32_t)
 HELPER_ST(sd, stq, uint64_t)
 #endif
 #undef HELPER_ST
-
-target_ulong helper_clo (target_ulong arg1)
-{
-    return clo32(arg1);
-}
-
-target_ulong helper_clz (target_ulong arg1)
-{
-    return clz32(arg1);
-}
-
-#if defined(TARGET_MIPS64)
-target_ulong helper_dclo (target_ulong arg1)
-{
-    return clo64(arg1);
-}
-
-target_ulong helper_dclz (target_ulong arg1)
-{
-    return clz64(arg1);
-}
-#endif /* TARGET_MIPS64 */
 
 /* 64 bits arithmetic for 32 bits hosts */
 static inline uint64_t get_HILO(CPUMIPSState *env)
@@ -849,7 +833,11 @@ target_ulong helper_mftc0_tcschefback(CPUMIPSState *env)
 
 target_ulong helper_mfc0_count(CPUMIPSState *env)
 {
-    return (int32_t)cpu_mips_get_count(env);
+    int32_t count;
+    qemu_mutex_lock_iothread();
+    count = (int32_t) cpu_mips_get_count(env);
+    qemu_mutex_unlock_iothread();
+    return count;
 }
 
 target_ulong helper_mftc0_entryhi(CPUMIPSState *env)
@@ -1335,6 +1323,30 @@ void helper_mtc0_pagegrain(CPUMIPSState *env, target_ulong arg1)
     restore_pamask(env);
 }
 
+void helper_mtc0_segctl0(CPUMIPSState *env, target_ulong arg1)
+{
+    CPUState *cs = CPU(mips_env_get_cpu(env));
+
+    env->CP0_SegCtl0 = arg1 & CP0SC0_MASK;
+    tlb_flush(cs);
+}
+
+void helper_mtc0_segctl1(CPUMIPSState *env, target_ulong arg1)
+{
+    CPUState *cs = CPU(mips_env_get_cpu(env));
+
+    env->CP0_SegCtl1 = arg1 & CP0SC1_MASK;
+    tlb_flush(cs);
+}
+
+void helper_mtc0_segctl2(CPUMIPSState *env, target_ulong arg1)
+{
+    CPUState *cs = CPU(mips_env_get_cpu(env));
+
+    env->CP0_SegCtl2 = arg1 & CP0SC2_MASK;
+    tlb_flush(cs);
+}
+
 void helper_mtc0_wired(CPUMIPSState *env, target_ulong arg1)
 {
     if (env->insn_flags & ISA_MIPS32R6) {
@@ -1397,7 +1409,9 @@ void helper_mtc0_hwrena(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_count(CPUMIPSState *env, target_ulong arg1)
 {
+    qemu_mutex_lock_iothread();
     cpu_mips_store_count(env, arg1);
+    qemu_mutex_unlock_iothread();
 }
 
 void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
@@ -1431,7 +1445,7 @@ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
     /* If the ASID changes, flush qemu's TLB.  */
     if ((old & env->CP0_EntryHi_ASID_mask) !=
         (val & env->CP0_EntryHi_ASID_mask)) {
-        cpu_mips_tlb_flush(env, 1);
+        tlb_flush(CPU(mips_env_get_cpu(env)));
     }
 }
 
@@ -1446,7 +1460,9 @@ void helper_mttc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_compare(CPUMIPSState *env, target_ulong arg1)
 {
+    qemu_mutex_lock_iothread();
     cpu_mips_store_compare(env, arg1);
+    qemu_mutex_unlock_iothread();
 }
 
 void helper_mtc0_status(CPUMIPSState *env, target_ulong arg1)
@@ -1463,7 +1479,10 @@ void helper_mtc0_status(CPUMIPSState *env, target_ulong arg1)
                 old, old & env->CP0_Cause & CP0Ca_IP_mask,
                 val, val & env->CP0_Cause & CP0Ca_IP_mask,
                 env->CP0_Cause);
-        switch (env->hflags & MIPS_HFLAG_KSU) {
+        switch (cpu_mmu_index(env, false)) {
+        case 3:
+            qemu_log(", ERL\n");
+            break;
         case MIPS_HFLAG_UM: qemu_log(", UM\n"); break;
         case MIPS_HFLAG_SM: qemu_log(", SM\n"); break;
         case MIPS_HFLAG_KM: qemu_log("\n"); break;
@@ -1497,7 +1516,9 @@ void helper_mtc0_srsctl(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_cause(CPUMIPSState *env, target_ulong arg1)
 {
+    qemu_mutex_lock_iothread();
     cpu_mips_store_cause(env, arg1);
+    qemu_mutex_unlock_iothread();
 }
 
 void helper_mttc0_cause(CPUMIPSState *env, target_ulong arg1)
@@ -1526,14 +1547,22 @@ target_ulong helper_mftc0_ebase(CPUMIPSState *env)
 
 void helper_mtc0_ebase(CPUMIPSState *env, target_ulong arg1)
 {
-    env->CP0_EBase = (env->CP0_EBase & ~0x3FFFF000) | (arg1 & 0x3FFFF000);
+    target_ulong mask = 0x3FFFF000 | env->CP0_EBaseWG_rw_bitmask;
+    if (arg1 & env->CP0_EBaseWG_rw_bitmask) {
+        mask |= ~0x3FFFFFFF;
+    }
+    env->CP0_EBase = (env->CP0_EBase & ~mask) | (arg1 & mask);
 }
 
 void helper_mttc0_ebase(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
-    other->CP0_EBase = (other->CP0_EBase & ~0x3FFFF000) | (arg1 & 0x3FFFF000);
+    target_ulong mask = 0x3FFFF000 | env->CP0_EBaseWG_rw_bitmask;
+    if (arg1 & env->CP0_EBaseWG_rw_bitmask) {
+        mask |= ~0x3FFFFFFF;
+    }
+    other->CP0_EBase = (other->CP0_EBase & ~mask) | (arg1 & mask);
 }
 
 target_ulong helper_mftc0_configx(CPUMIPSState *env, target_ulong idx)
@@ -1980,6 +2009,7 @@ static inline uint64_t get_tlb_pfn_from_entrylo(uint64_t entrylo)
 static void r4k_fill_tlb(CPUMIPSState *env, int idx)
 {
     r4k_tlb_t *tlb;
+    uint64_t mask = env->CP0_PageMask >> (TARGET_PAGE_BITS + 1);
 
     /* XXX: detect conflicting TLBs and raise a MCHECK exception when needed */
     tlb = &env->tlb->mmu.r4k.tlb[idx];
@@ -2000,13 +2030,13 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
     tlb->C0 = (env->CP0_EntryLo0 >> 3) & 0x7;
     tlb->XI0 = (env->CP0_EntryLo0 >> CP0EnLo_XI) & 1;
     tlb->RI0 = (env->CP0_EntryLo0 >> CP0EnLo_RI) & 1;
-    tlb->PFN[0] = get_tlb_pfn_from_entrylo(env->CP0_EntryLo0) << 12;
+    tlb->PFN[0] = (get_tlb_pfn_from_entrylo(env->CP0_EntryLo0) & ~mask) << 12;
     tlb->V1 = (env->CP0_EntryLo1 & 2) != 0;
     tlb->D1 = (env->CP0_EntryLo1 & 4) != 0;
     tlb->C1 = (env->CP0_EntryLo1 >> 3) & 0x7;
     tlb->XI1 = (env->CP0_EntryLo1 >> CP0EnLo_XI) & 1;
     tlb->RI1 = (env->CP0_EntryLo1 >> CP0EnLo_RI) & 1;
-    tlb->PFN[1] = get_tlb_pfn_from_entrylo(env->CP0_EntryLo1) << 12;
+    tlb->PFN[1] = (get_tlb_pfn_from_entrylo(env->CP0_EntryLo1) & ~mask) << 12;
 }
 
 void r4k_helper_tlbinv(CPUMIPSState *env)
@@ -2021,7 +2051,7 @@ void r4k_helper_tlbinv(CPUMIPSState *env)
             tlb->EHINV = 1;
         }
     }
-    cpu_mips_tlb_flush(env, 1);
+    cpu_mips_tlb_flush(env);
 }
 
 void r4k_helper_tlbinvf(CPUMIPSState *env)
@@ -2031,7 +2061,7 @@ void r4k_helper_tlbinvf(CPUMIPSState *env)
     for (idx = 0; idx < env->tlb->nb_tlb; idx++) {
         env->tlb->mmu.r4k.tlb[idx].EHINV = 1;
     }
-    cpu_mips_tlb_flush(env, 1);
+    cpu_mips_tlb_flush(env);
 }
 
 void r4k_helper_tlbwi(CPUMIPSState *env)
@@ -2040,7 +2070,7 @@ void r4k_helper_tlbwi(CPUMIPSState *env)
     int idx;
     target_ulong VPN;
     uint16_t ASID;
-    bool G, V0, D0, V1, D1;
+    bool EHINV, G, V0, D0, V1, D1, XI0, XI1, RI0, RI1;
 
     idx = (env->CP0_Index & ~0x80000000) % env->tlb->nb_tlb;
     tlb = &env->tlb->mmu.r4k.tlb[idx];
@@ -2049,17 +2079,25 @@ void r4k_helper_tlbwi(CPUMIPSState *env)
     VPN &= env->SEGMask;
 #endif
     ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    EHINV = (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) != 0;
     G = env->CP0_EntryLo0 & env->CP0_EntryLo1 & 1;
     V0 = (env->CP0_EntryLo0 & 2) != 0;
     D0 = (env->CP0_EntryLo0 & 4) != 0;
+    XI0 = (env->CP0_EntryLo0 >> CP0EnLo_XI) &1;
+    RI0 = (env->CP0_EntryLo0 >> CP0EnLo_RI) &1;
     V1 = (env->CP0_EntryLo1 & 2) != 0;
     D1 = (env->CP0_EntryLo1 & 4) != 0;
+    XI1 = (env->CP0_EntryLo1 >> CP0EnLo_XI) &1;
+    RI1 = (env->CP0_EntryLo1 >> CP0EnLo_RI) &1;
 
     /* Discard cached TLB entries, unless tlbwi is just upgrading access
        permissions on the current entry. */
     if (tlb->VPN != VPN || tlb->ASID != ASID || tlb->G != G ||
+        (!tlb->EHINV && EHINV) ||
         (tlb->V0 && !V0) || (tlb->D0 && !D0) ||
-        (tlb->V1 && !V1) || (tlb->D1 && !D1)) {
+        (!tlb->XI0 && XI0) || (!tlb->RI0 && RI0) ||
+        (tlb->V1 && !V1) || (tlb->D1 && !D1) ||
+        (!tlb->XI1 && XI1) || (!tlb->RI1 && RI1)) {
         r4k_mips_tlb_flush_extra(env, env->tlb->nb_tlb);
     }
 
@@ -2145,7 +2183,7 @@ void r4k_helper_tlbr(CPUMIPSState *env)
 
     /* If this will change the current ASID, flush qemu's TLB.  */
     if (ASID != tlb->ASID)
-        cpu_mips_tlb_flush (env, 1);
+        cpu_mips_tlb_flush(env);
 
     r4k_mips_tlb_flush_extra(env, env->tlb->nb_tlb);
 
@@ -2239,7 +2277,10 @@ static void debug_post_eret(CPUMIPSState *env)
             qemu_log(" ErrorEPC " TARGET_FMT_lx, env->CP0_ErrorEPC);
         if (env->hflags & MIPS_HFLAG_DM)
             qemu_log(" DEPC " TARGET_FMT_lx, env->CP0_DEPC);
-        switch (env->hflags & MIPS_HFLAG_KSU) {
+        switch (cpu_mmu_index(env, false)) {
+        case 3:
+            qemu_log(", ERL\n");
+            break;
         case MIPS_HFLAG_UM: qemu_log(", UM\n"); break;
         case MIPS_HFLAG_SM: qemu_log(", SM\n"); break;
         case MIPS_HFLAG_KM: qemu_log("\n"); break;
@@ -2318,12 +2359,16 @@ target_ulong helper_rdhwr_synci_step(CPUMIPSState *env)
 
 target_ulong helper_rdhwr_cc(CPUMIPSState *env)
 {
+    int32_t count;
     check_hwrena(env, 2, GETPC());
 #ifdef CONFIG_USER_ONLY
-    return env->CP0_Count;
+    count = env->CP0_Count;
 #else
-    return (int32_t)cpu_mips_get_count(env);
+    qemu_mutex_lock_iothread();
+    count = (int32_t)cpu_mips_get_count(env);
+    qemu_mutex_unlock_iothread();
 #endif
+    return count;
 }
 
 target_ulong helper_rdhwr_ccres(CPUMIPSState *env)
@@ -2406,12 +2451,12 @@ void mips_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
     do_raise_exception_err(env, excp, error_code, retaddr);
 }
 
-void tlb_fill(CPUState *cs, target_ulong addr, MMUAccessType access_type,
-              int mmu_idx, uintptr_t retaddr)
+void tlb_fill(CPUState *cs, target_ulong addr, int size,
+              MMUAccessType access_type, int mmu_idx, uintptr_t retaddr)
 {
     int ret;
 
-    ret = mips_cpu_handle_mmu_fault(cs, addr, access_type, mmu_idx);
+    ret = mips_cpu_handle_mmu_fault(cs, addr, size, access_type, mmu_idx);
     if (ret) {
         MIPSCPU *cpu = MIPS_CPU(cs);
         CPUMIPSState *env = &cpu->env;
@@ -2655,7 +2700,6 @@ uint64_t helper_float_cvtd_s(CPUMIPSState *env, uint32_t fst0)
     uint64_t fdt2;
 
     fdt2 = float32_to_float64(fst0, &env->active_fpu.fp_status);
-    fdt2 = float64_maybe_silence_nan(fdt2, &env->active_fpu.fp_status);
     update_fcr31(env, GETPC());
     return fdt2;
 }
@@ -2745,7 +2789,6 @@ uint32_t helper_float_cvts_d(CPUMIPSState *env, uint64_t fdt0)
     uint32_t fst2;
 
     fst2 = float64_to_float32(fdt0, &env->active_fpu.fp_status);
-    fst2 = float32_maybe_silence_nan(fst2, &env->active_fpu.fp_status);
     update_fcr31(env, GETPC());
     return fst2;
 }
@@ -4145,10 +4188,10 @@ static inline void ensure_writable_pages(CPUMIPSState *env,
     target_ulong page_addr;
     if (unlikely(MSA_PAGESPAN(addr))) {
         /* first page */
-        probe_write(env, addr, mmu_idx, retaddr);
+        probe_write(env, addr, 0, mmu_idx, retaddr);
         /* second page */
         page_addr = (addr & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
-        probe_write(env, page_addr, mmu_idx, retaddr);
+        probe_write(env, page_addr, 0, mmu_idx, retaddr);
     }
 #endif
 }

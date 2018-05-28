@@ -44,7 +44,7 @@ uint64_t helper_load_pcc(CPUAlphaState *env)
 #ifndef CONFIG_USER_ONLY
 void helper_tbia(CPUAlphaState *env)
 {
-    tlb_flush(CPU(alpha_env_get_cpu(env)), 1);
+    tlb_flush(CPU(alpha_env_get_cpu(env)));
 }
 
 void helper_tbis(CPUAlphaState *env, uint64_t p)
@@ -60,9 +60,9 @@ void helper_tb_flush(CPUAlphaState *env)
 void helper_halt(uint64_t restart)
 {
     if (restart) {
-        qemu_system_reset_request();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     } else {
-        qemu_system_shutdown_request();
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
     }
 }
 

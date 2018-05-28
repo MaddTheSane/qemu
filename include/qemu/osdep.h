@@ -107,6 +107,22 @@ extern int daemon(int, int);
 #include "glib-compat.h"
 #include "qemu/typedefs.h"
 
+/*
+ * We have a lot of unaudited code that may fail in strange ways, or
+ * even be a security risk during migration, if you disable assertions
+ * at compile-time.  You may comment out these safety checks if you
+ * absolutely want to disable assertion overhead, but it is not
+ * supported upstream so the risk is all yours.  Meanwhile, please
+ * submit patches to remove any side-effects inside an assertion, or
+ * fixing error handling that should use Error instead of assert.
+ */
+#ifdef NDEBUG
+#error building with NDEBUG is not supported
+#endif
+#ifdef G_DISABLE_ASSERT
+#error building with G_DISABLE_ASSERT is not supported
+#endif
+
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
 #endif
@@ -131,8 +147,35 @@ extern int daemon(int, int);
 #if !defined(ESHUTDOWN)
 #define ESHUTDOWN 4099
 #endif
+
+/* time_t may be either 32 or 64 bits depending on the host OS, and
+ * can be either signed or unsigned, so we can't just hardcode a
+ * specific maximum value. This is not a C preprocessor constant,
+ * so you can't use TIME_MAX in an #ifdef, but for our purposes
+ * this isn't a problem.
+ */
+
+/* The macros TYPE_SIGNED, TYPE_WIDTH, and TYPE_MAXIMUM are from
+ * Gnulib, and are under the LGPL v2.1 or (at your option) any
+ * later version.
+ */
+
+/* True if the real type T is signed.  */
+#define TYPE_SIGNED(t) (!((t)0 < (t)-1))
+
+/* The width in bits of the integer type or expression T.
+ * Padding bits are not supported.
+ */
+#define TYPE_WIDTH(t) (sizeof(t) * CHAR_BIT)
+
+/* The maximum and minimum values for the integer type T.  */
+#define TYPE_MAXIMUM(t)                                                \
+  ((t) (!TYPE_SIGNED(t)                                                \
+        ? (t)-1                                                        \
+        : ((((t)1 << (TYPE_WIDTH(t) - 2)) - 1) * 2 + 1)))
+
 #ifndef TIME_MAX
-#define TIME_MAX LONG_MAX
+#define TIME_MAX TYPE_MAXIMUM(time_t)
 #endif
 
 /* HOST_LONG_BITS is the size of a native pointer in bits. */
@@ -189,23 +232,30 @@ extern int daemon(int, int);
 
 /* Round number up to multiple. Requires that d be a power of 2 (see
  * QEMU_ALIGN_UP for a safer but slower version on arbitrary
- * numbers) */
+ * numbers); works even if d is a smaller type than n.  */
 #ifndef ROUND_UP
-#define ROUND_UP(n,d) (((n) + (d) - 1) & -(d))
+#define ROUND_UP(n, d) (((n) + (d) - 1) & -(0 ? (n) : (d)))
 #endif
 
 #ifndef DIV_ROUND_UP
-#define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 #endif
 
+/*
+ * &(x)[0] is always a pointer - if it's same type as x then the argument is a
+ * pointer, not an array.
+ */
+#define QEMU_IS_ARRAY(x) (!__builtin_types_compatible_p(typeof(x), \
+                                                        typeof(&(x)[0])))
 #ifndef ARRAY_SIZE
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define ARRAY_SIZE(x) ((sizeof(x) / sizeof((x)[0])) + \
+                       QEMU_BUILD_BUG_ON_ZERO(!QEMU_IS_ARRAY(x)))
 #endif
 
 int qemu_daemon(int nochdir, int noclose);
 void *qemu_try_memalign(size_t alignment, size_t size);
 void *qemu_memalign(size_t alignment, size_t size);
-void *qemu_anon_ram_alloc(size_t size, uint64_t *align);
+void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared);
 void qemu_vfree(void *ptr);
 void qemu_anon_ram_free(void *ptr, size_t size);
 
@@ -250,6 +300,11 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 #else
 #define QEMU_MADV_NOHUGEPAGE QEMU_MADV_INVALID
 #endif
+#ifdef MADV_REMOVE
+#define QEMU_MADV_REMOVE MADV_REMOVE
+#else
+#define QEMU_MADV_REMOVE QEMU_MADV_INVALID
+#endif
 
 #elif defined(CONFIG_POSIX_MADVISE)
 
@@ -262,6 +317,7 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 #define QEMU_MADV_DONTDUMP QEMU_MADV_INVALID
 #define QEMU_MADV_HUGEPAGE  QEMU_MADV_INVALID
 #define QEMU_MADV_NOHUGEPAGE  QEMU_MADV_INVALID
+#define QEMU_MADV_REMOVE QEMU_MADV_INVALID
 
 #else /* no-op */
 
@@ -274,7 +330,30 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 #define QEMU_MADV_DONTDUMP QEMU_MADV_INVALID
 #define QEMU_MADV_HUGEPAGE  QEMU_MADV_INVALID
 #define QEMU_MADV_NOHUGEPAGE  QEMU_MADV_INVALID
+#define QEMU_MADV_REMOVE QEMU_MADV_INVALID
 
+#endif
+
+#ifdef _WIN32
+#define HAVE_CHARDEV_SERIAL 1
+#elif defined(__linux__) || defined(__sun__) || defined(__FreeBSD__)    \
+    || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__) \
+    || defined(__GLIBC__)
+#define HAVE_CHARDEV_SERIAL 1
+#endif
+
+#if defined(__linux__) || defined(__FreeBSD__) ||               \
+    defined(__FreeBSD_kernel__) || defined(__DragonFly__)
+#define HAVE_CHARDEV_PARPORT 1
+#endif
+
+#if defined(CONFIG_LINUX)
+#ifndef BUS_MCEERR_AR
+#define BUS_MCEERR_AR 4
+#endif
+#ifndef BUS_MCEERR_AO
+#define BUS_MCEERR_AO 5
+#endif
 #endif
 
 #if defined(__linux__) && \
@@ -286,17 +365,54 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 #elif defined(__linux__) && defined(__s390x__)
    /* Use 1 MiB (segment size) alignment so gmap can be used by KVM. */
 #  define QEMU_VMALLOC_ALIGN (256 * 4096)
+#elif defined(__linux__) && defined(__sparc__)
+#include <sys/shm.h>
+#  define QEMU_VMALLOC_ALIGN MAX(getpagesize(), SHMLBA)
 #else
 #  define QEMU_VMALLOC_ALIGN getpagesize()
 #endif
 
+#ifdef CONFIG_POSIX
+struct qemu_signalfd_siginfo {
+    uint32_t ssi_signo;   /* Signal number */
+    int32_t  ssi_errno;   /* Error number (unused) */
+    int32_t  ssi_code;    /* Signal code */
+    uint32_t ssi_pid;     /* PID of sender */
+    uint32_t ssi_uid;     /* Real UID of sender */
+    int32_t  ssi_fd;      /* File descriptor (SIGIO) */
+    uint32_t ssi_tid;     /* Kernel timer ID (POSIX timers) */
+    uint32_t ssi_band;    /* Band event (SIGIO) */
+    uint32_t ssi_overrun; /* POSIX timer overrun count */
+    uint32_t ssi_trapno;  /* Trap number that caused signal */
+    int32_t  ssi_status;  /* Exit status or signal (SIGCHLD) */
+    int32_t  ssi_int;     /* Integer sent by sigqueue(2) */
+    uint64_t ssi_ptr;     /* Pointer sent by sigqueue(2) */
+    uint64_t ssi_utime;   /* User CPU time consumed (SIGCHLD) */
+    uint64_t ssi_stime;   /* System CPU time consumed (SIGCHLD) */
+    uint64_t ssi_addr;    /* Address that generated signal
+                             (for hardware-generated signals) */
+    uint8_t  pad[48];     /* Pad size to 128 bytes (allow for
+                             additional fields in the future) */
+};
+
+int qemu_signalfd(const sigset_t *mask);
+void sigaction_invoke(struct sigaction *action,
+                      struct qemu_signalfd_siginfo *info);
+#endif
+
 int qemu_madvise(void *addr, size_t len, int advice);
+int qemu_mprotect_rwx(void *addr, size_t size);
+int qemu_mprotect_none(void *addr, size_t size);
 
 int qemu_open(const char *name, int flags, ...);
 int qemu_close(int fd);
 #ifndef _WIN32
 int qemu_dup(int fd);
 #endif
+int qemu_lock_fd(int fd, int64_t start, int64_t len, bool exclusive);
+int qemu_unlock_fd(int fd, int64_t start, int64_t len);
+int qemu_lock_fd_test(int fd, int64_t start, int64_t len, bool exclusive);
+bool qemu_has_ofd_lock(void);
 
 #if defined(__HAIKU__) && defined(__i386__)
 #define FMT_pid "%ld"
@@ -394,9 +510,8 @@ unsigned long qemu_getauxval(unsigned long type);
 
 void qemu_set_tty_echo(int fd, bool echo);
 
-void os_mem_prealloc(int fd, char *area, size_t sz, Error **errp);
-
-int qemu_read_password(char *buf, int buf_size);
+void os_mem_prealloc(int fd, char *area, size_t sz, int smp_cpus,
+                     Error **errp);
 
 /**
  * qemu_get_pid_name:
@@ -421,5 +536,14 @@ char *qemu_get_pid_name(pid_t pid);
  * or -1 on failure.
  */
 pid_t qemu_fork(Error **errp);
+
+/* Using intptr_t ensures that qemu_*_page_mask is sign-extended even
+ * when intptr_t is 32-bit and we are aligning a long long.
+ */
+extern uintptr_t qemu_real_host_page_size;
+extern intptr_t qemu_real_host_page_mask;
+
+extern int qemu_icache_linesize;
+extern int qemu_dcache_linesize;
 
 #endif

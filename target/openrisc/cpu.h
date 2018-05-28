@@ -29,10 +29,9 @@ struct OpenRISCCPU;
 
 #include "qemu-common.h"
 #include "exec/cpu-defs.h"
-#include "fpu/softfloat.h"
 #include "qom/cpu.h"
 
-#define TYPE_OPENRISC_CPU "or32-cpu"
+#define TYPE_OPENRISC_CPU "or1k-cpu"
 
 #define OPENRISC_CPU_CLASS(klass) \
     OBJECT_CLASS_CHECK(OpenRISCCPUClass, (klass), TYPE_OPENRISC_CPU)
@@ -58,6 +57,7 @@ typedef struct OpenRISCCPUClass {
 } OpenRISCCPUClass;
 
 #define NB_MMU_MODES    3
+#define TARGET_INSN_START_EXTRA_WORDS 1
 
 enum {
     MMU_NOMMU_IDX = 0,
@@ -81,9 +81,6 @@ enum {
 
 /* Version Register */
 #define SPR_VR 0xFFFF003F
-
-/* Internal flags, delay slot flag */
-#define D_FLAG    1
 
 /* Interrupt */
 #define NR_IRQS  32
@@ -113,6 +110,11 @@ enum {
     CPUCFGR_OF32S = (1 << 7),
     CPUCFGR_OF64S = (1 << 8),
     CPUCFGR_OV64S = (1 << 9),
+    /* CPUCFGR_ND = (1 << 10), */
+    /* CPUCFGR_AVRP = (1 << 11), */
+    CPUCFGR_EVBARP = (1 << 12),
+    /* CPUCFGR_ISRP = (1 << 13), */
+    /* CPUCFGR_AECSRP = (1 << 14), */
 };
 
 /* DMMU configure register */
@@ -135,6 +137,15 @@ enum {
     IMMUCFGR_PRI = (1 << 9),
     IMMUCFGR_TEIRI = (1 << 10),
     IMMUCFGR_HTR = (1 << 11),
+};
+
+/* Power management register */
+enum {
+    PMR_SDF = (15 << 0),
+    PMR_DME = (1 << 4),
+    PMR_SME = (1 << 5),
+    PMR_DCGE = (1 << 6),
+    PMR_SUME = (1 << 7),
 };
 
 /* Float point control status register */
@@ -191,17 +202,6 @@ enum {
     SR_FO  = (1 << 15),
     SR_SUMRA = (1 << 16),
     SR_SCE = (1 << 17),
-};
-
-/* OpenRISC Hardware Capabilities */
-enum {
-    OPENRISC_FEATURE_NSGF = (15 << 0),
-    OPENRISC_FEATURE_CGF = (1 << 4),
-    OPENRISC_FEATURE_OB32S = (1 << 5),
-    OPENRISC_FEATURE_OB64S = (1 << 6),
-    OPENRISC_FEATURE_OF32S = (1 << 7),
-    OPENRISC_FEATURE_OF64S = (1 << 8),
-    OPENRISC_FEATURE_OV64S = (1 << 9),
 };
 
 /* Tick Timer Mode Register */
@@ -271,44 +271,50 @@ typedef struct CPUOpenRISCTLBContext {
 #endif
 
 typedef struct CPUOpenRISCState {
-    target_ulong gpr[32];     /* General registers */
+    target_ulong shadow_gpr[16][32]; /* Shadow registers */
+
     target_ulong pc;          /* Program counter */
-    target_ulong npc;         /* Next PC */
     target_ulong ppc;         /* Prev PC */
     target_ulong jmp_pc;      /* Jump PC */
 
-    target_ulong machi;       /* Multiply register MACHI */
-    target_ulong maclo;       /* Multiply register MACLO */
-
-    target_ulong fpmaddhi;    /* Multiply and add float register FPMADDHI */
-    target_ulong fpmaddlo;    /* Multiply and add float register FPMADDLO */
+    uint64_t mac;             /* Multiply registers MACHI:MACLO */
 
     target_ulong epcr;        /* Exception PC register */
     target_ulong eear;        /* Exception EA register */
 
-    uint32_t sr;              /* Supervisor register */
+    target_ulong sr_f;        /* the SR_F bit, values 0, 1.  */
+    target_ulong sr_cy;       /* the SR_CY bit, values 0, 1.  */
+    target_long  sr_ov;       /* the SR_OV bit (in the sign bit only) */
+    uint32_t sr;              /* Supervisor register, without SR_{F,CY,OV} */
     uint32_t vr;              /* Version register */
     uint32_t upr;             /* Unit presence register */
-    uint32_t cpucfgr;         /* CPU configure register */
     uint32_t dmmucfgr;        /* DMMU configure register */
     uint32_t immucfgr;        /* IMMU configure register */
     uint32_t esr;             /* Exception supervisor register */
+    uint32_t evbar;           /* Exception vector base address register */
+    uint32_t pmr;             /* Power Management Register */
     uint32_t fpcsr;           /* Float register */
     float_status fp_status;
 
-    uint32_t flags;           /* cpu_flags, we only use it for exception
-                                 in solt so far.  */
-    uint32_t btaken;          /* the SR_F bit */
+    target_ulong lock_addr;
+    target_ulong lock_value;
+
+    uint32_t dflag;           /* In delay slot (boolean) */
+
+    /* Fields up to this point are cleared by a CPU reset */
+    struct {} end_reset_fields;
 
     CPU_COMMON
 
     /* Fields from here on are preserved across CPU reset. */
+    uint32_t cpucfgr;         /* CPU configure register */
+
 #ifndef CONFIG_USER_ONLY
     CPUOpenRISCTLBContext * tlb;
 
     QEMUTimer *timer;
     uint32_t ttmr;          /* Timer tick mode register */
-    uint32_t ttcr;          /* Timer tick count register */
+    int is_counting;
 
     uint32_t picmr;         /* Interrupt mask register */
     uint32_t picsr;         /* Interrupt contrl register*/
@@ -329,7 +335,6 @@ typedef struct OpenRISCCPU {
 
     CPUOpenRISCState env;
 
-    uint32_t feature;       /* CPU Capabilities */
 } OpenRISCCPU;
 
 static inline OpenRISCCPU *openrisc_env_get_cpu(CPUOpenRISCState *env)
@@ -341,8 +346,6 @@ static inline OpenRISCCPU *openrisc_env_get_cpu(CPUOpenRISCState *env)
 
 #define ENV_OFFSET offsetof(OpenRISCCPU, env)
 
-OpenRISCCPU *cpu_openrisc_init(const char *cpu_model);
-
 void cpu_openrisc_list(FILE *f, fprintf_function cpu_fprintf);
 void openrisc_cpu_do_interrupt(CPUState *cpu);
 bool openrisc_cpu_exec_interrupt(CPUState *cpu, int int_req);
@@ -352,7 +355,7 @@ hwaddr openrisc_cpu_get_phys_page_debug(CPUState *cpu, vaddr addr);
 int openrisc_cpu_gdb_read_register(CPUState *cpu, uint8_t *buf, int reg);
 int openrisc_cpu_gdb_write_register(CPUState *cpu, uint8_t *buf, int reg);
 void openrisc_translate_init(void);
-int openrisc_cpu_handle_mmu_fault(CPUState *cpu, vaddr address,
+int openrisc_cpu_handle_mmu_fault(CPUState *cpu, vaddr address, int size,
                                   int rw, int mmu_idx);
 int cpu_openrisc_signal_handler(int host_signum, void *pinfo, void *puc);
 
@@ -367,6 +370,8 @@ void cpu_openrisc_pic_init(OpenRISCCPU *cpu);
 
 /* hw/openrisc_timer.c */
 void cpu_openrisc_clock_init(OpenRISCCPU *cpu);
+uint32_t cpu_openrisc_count_get(OpenRISCCPU *cpu);
+void cpu_openrisc_count_set(OpenRISCCPU *cpu, uint32_t val);
 void cpu_openrisc_count_update(OpenRISCCPU *cpu);
 void cpu_openrisc_timer_update(OpenRISCCPU *cpu);
 void cpu_openrisc_count_start(OpenRISCCPU *cpu);
@@ -384,9 +389,25 @@ int cpu_openrisc_get_phys_data(OpenRISCCPU *cpu,
                                int *prot, target_ulong address, int rw);
 #endif
 
-#define cpu_init(cpu_model) CPU(cpu_openrisc_init(cpu_model))
+#define OPENRISC_CPU_TYPE_SUFFIX "-" TYPE_OPENRISC_CPU
+#define OPENRISC_CPU_TYPE_NAME(model) model OPENRISC_CPU_TYPE_SUFFIX
+#define CPU_RESOLVING_TYPE TYPE_OPENRISC_CPU
 
 #include "exec/cpu-all.h"
+
+#define TB_FLAGS_DFLAG 1
+#define TB_FLAGS_R0_0  2
+#define TB_FLAGS_OVE   SR_OVE
+
+static inline uint32_t cpu_get_gpr(const CPUOpenRISCState *env, int i)
+{
+    return env->shadow_gpr[0][i];
+}
+
+static inline void cpu_set_gpr(CPUOpenRISCState *env, int i, uint32_t val)
+{
+    env->shadow_gpr[0][i] = val;
+}
 
 static inline void cpu_get_tb_cpu_state(CPUOpenRISCState *env,
                                         target_ulong *pc,
@@ -394,8 +415,9 @@ static inline void cpu_get_tb_cpu_state(CPUOpenRISCState *env,
 {
     *pc = env->pc;
     *cs_base = 0;
-    /* D_FLAG -- branch instruction exception */
-    *flags = (env->flags & D_FLAG);
+    *flags = (env->dflag
+              | (cpu_get_gpr(env, 0) == 0 ? TB_FLAGS_R0_0 : 0)
+              | (env->sr & SR_OVE));
 }
 
 static inline int cpu_mmu_index(CPUOpenRISCState *env, bool ifetch)
@@ -404,6 +426,22 @@ static inline int cpu_mmu_index(CPUOpenRISCState *env, bool ifetch)
         return MMU_NOMMU_IDX;
     }
     return (env->sr & SR_SM) == 0 ? MMU_USER_IDX : MMU_SUPERVISOR_IDX;
+}
+
+static inline uint32_t cpu_get_sr(const CPUOpenRISCState *env)
+{
+    return (env->sr
+            + env->sr_f * SR_F
+            + env->sr_cy * SR_CY
+            + (env->sr_ov < 0) * SR_OV);
+}
+
+static inline void cpu_set_sr(CPUOpenRISCState *env, uint32_t val)
+{
+    env->sr_f = (val & SR_F) != 0;
+    env->sr_cy = (val & SR_CY) != 0;
+    env->sr_ov = (val & SR_OV ? -1 : 0);
+    env->sr = (val & ~(SR_F | SR_CY | SR_OV)) | SR_FO;
 }
 
 #define CPU_INTERRUPT_TIMER   CPU_INTERRUPT_TGT_INT_0

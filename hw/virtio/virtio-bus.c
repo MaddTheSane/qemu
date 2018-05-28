@@ -25,9 +25,11 @@
 #include "qemu/osdep.h"
 #include "hw/hw.h"
 #include "qemu/error-report.h"
+#include "qapi/error.h"
 #include "hw/qdev.h"
 #include "hw/virtio/virtio-bus.h"
 #include "hw/virtio/virtio.h"
+#include "exec/address-spaces.h"
 
 /* #define DEBUG_VIRTIO_BUS */
 
@@ -46,20 +48,41 @@ void virtio_bus_device_plugged(VirtIODevice *vdev, Error **errp)
     VirtioBusState *bus = VIRTIO_BUS(qbus);
     VirtioBusClass *klass = VIRTIO_BUS_GET_CLASS(bus);
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_GET_CLASS(vdev);
+    bool has_iommu = virtio_host_has_feature(vdev, VIRTIO_F_IOMMU_PLATFORM);
+    Error *local_err = NULL;
 
     DPRINTF("%s: plug device.\n", qbus->name);
 
     if (klass->pre_plugged != NULL) {
-        klass->pre_plugged(qbus->parent, errp);
+        klass->pre_plugged(qbus->parent, &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            return;
+        }
     }
 
     /* Get the features of the plugged device. */
     assert(vdc->get_features != NULL);
     vdev->host_features = vdc->get_features(vdev, vdev->host_features,
-                                            errp);
+                                            &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
 
     if (klass->device_plugged != NULL) {
-        klass->device_plugged(qbus->parent, errp);
+        klass->device_plugged(qbus->parent, &local_err);
+    }
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+
+    if (klass->get_dma_as != NULL && has_iommu) {
+        virtio_add_feature(&vdev->host_features, VIRTIO_F_IOMMU_PLATFORM);
+        vdev->dma_as = klass->get_dma_as(qbus->parent);
+    } else {
+        vdev->dma_as = &address_space_memory;
     }
 }
 
@@ -260,20 +283,26 @@ int virtio_bus_set_host_notifier(VirtioBusState *bus, int n, bool assign)
         r = k->ioeventfd_assign(proxy, notifier, n, true);
         if (r < 0) {
             error_report("%s: unable to assign ioeventfd: %d", __func__, r);
-            goto cleanup_event_notifier;
+            virtio_bus_cleanup_host_notifier(bus, n);
         }
-        return 0;
     } else {
         k->ioeventfd_assign(proxy, notifier, n, false);
     }
 
-cleanup_event_notifier:
+    return r;
+}
+
+void virtio_bus_cleanup_host_notifier(VirtioBusState *bus, int n)
+{
+    VirtIODevice *vdev = virtio_bus_get_device(bus);
+    VirtQueue *vq = virtio_get_queue(vdev, n);
+    EventNotifier *notifier = virtio_queue_get_host_notifier(vq);
+
     /* Test and clear notifier after disabling event,
      * in case poll callback didn't have time to run.
      */
     virtio_queue_host_notifier_read(notifier);
     event_notifier_cleanup(notifier);
-    return r;
 }
 
 static char *virtio_bus_get_dev_path(DeviceState *dev)

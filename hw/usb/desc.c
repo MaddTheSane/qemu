@@ -688,7 +688,7 @@ int usb_desc_get_descriptor(USBDevice *dev, USBPacket *p,
         break;
 
     default:
-        fprintf(stderr, "%s: %d unknown type %d (len %zd)\n", __FUNCTION__,
+        fprintf(stderr, "%s: %d unknown type %d (len %zd)\n", __func__,
                 dev->addr, type, len);
         break;
     }
@@ -772,6 +772,13 @@ int usb_desc_handle_control(USBDevice *dev, USBPacket *p,
             ret = 0;
         }
         trace_usb_set_device_feature(dev->addr, value, ret);
+        break;
+
+    case DeviceOutRequest | USB_REQ_SET_SEL:
+    case DeviceOutRequest | USB_REQ_SET_ISOCH_DELAY:
+        if (dev->speed == USB_SPEED_SUPER) {
+            ret = 0;
+        }
         break;
 
     case InterfaceRequest | USB_REQ_GET_INTERFACE:

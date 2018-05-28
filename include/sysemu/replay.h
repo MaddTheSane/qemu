@@ -12,7 +12,9 @@
  *
  */
 
-#include "qapi-types.h"
+#include "sysemu.h"
+#include "qapi/qapi-types-misc.h"
+#include "qapi/qapi-types-ui.h"
 
 /* replay clock kinds */
 enum ReplayClockKind {
@@ -42,6 +44,22 @@ typedef enum ReplayCheckpoint ReplayCheckpoint;
 typedef struct ReplayNetState ReplayNetState;
 
 extern ReplayMode replay_mode;
+
+/* Name of the initial VM snapshot */
+extern char *replay_snapshot;
+
+/* Replay locking
+ *
+ * The locks are needed to protect the shared structures and log file
+ * when doing record/replay. They also are the main sync-point between
+ * the main-loop thread and the vCPU thread. This was a role
+ * previously filled by the BQL which has been busy trying to reduce
+ * its impact across the code. This ensures blocks of events stay
+ * sequential and reproducible.
+ */
+
+void replay_mutex_lock(void);
+void replay_mutex_unlock(void);
 
 /* Replay process control functions */
 
@@ -95,7 +113,7 @@ int64_t replay_read_clock(ReplayClockKind kind);
 /* Events */
 
 /*! Called when qemu shutdown is requested. */
-void replay_shutdown_request(void);
+void replay_shutdown_request(ShutdownCause cause);
 /*! Should be called at check points in the execution.
     These check points are skipped, if they were not met.
     Saves checkpoint in the SAVE mode and validates in the PLAY mode.
@@ -125,9 +143,9 @@ uint64_t blkreplay_next_id(void);
 /* Character device */
 
 /*! Registers char driver to save it's events */
-void replay_register_char_driver(struct CharDriverState *chr);
+void replay_register_char_driver(struct Chardev *chr);
 /*! Saves write to char device event to the log */
-void replay_chr_be_write(struct CharDriverState *s, uint8_t *buf, int len);
+void replay_chr_be_write(struct Chardev *s, uint8_t *buf, int len);
 /*! Writes char write return value to the replay log. */
 void replay_char_write_event_save(int res, int offset);
 /*! Reads char write return value from the replay log. */
@@ -148,5 +166,21 @@ void replay_unregister_net(ReplayNetState *rns);
 /*! Called to write network packet to the replay log. */
 void replay_net_packet_event(ReplayNetState *rns, unsigned flags,
                              const struct iovec *iov, int iovcnt);
+
+/* Audio */
+
+/*! Saves/restores number of played samples of audio out operation. */
+void replay_audio_out(int *played);
+/*! Saves/restores recorded samples of audio in operation. */
+void replay_audio_in(int *recorded, void *samples, int *wpos, int size);
+
+/* VM state operations */
+
+/*! Called at the start of execution.
+    Loads or saves initial vmstate depending on execution mode. */
+void replay_vmstate_init(void);
+/*! Called to ensure that replay state is consistent and VM snapshot
+    can be created */
+bool replay_can_snapshot(void);
 
 #endif

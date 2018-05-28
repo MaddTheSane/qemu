@@ -28,17 +28,17 @@ int openrisc_cpu_gdb_read_register(CPUState *cs, uint8_t *mem_buf, int n)
     CPUOpenRISCState *env = &cpu->env;
 
     if (n < 32) {
-        return gdb_get_reg32(mem_buf, env->gpr[n]);
+        return gdb_get_reg32(mem_buf, cpu_get_gpr(env, n));
     } else {
         switch (n) {
         case 32:    /* PPC */
             return gdb_get_reg32(mem_buf, env->ppc);
 
-        case 33:    /* NPC */
-            return gdb_get_reg32(mem_buf, env->npc);
+        case 33:    /* NPC (equals PC) */
+            return gdb_get_reg32(mem_buf, env->pc);
 
         case 34:    /* SR */
-            return gdb_get_reg32(mem_buf, env->sr);
+            return gdb_get_reg32(mem_buf, cpu_get_sr(env));
 
         default:
             break;
@@ -61,19 +61,24 @@ int openrisc_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
     tmp = ldl_p(mem_buf);
 
     if (n < 32) {
-        env->gpr[n] = tmp;
+        cpu_set_gpr(env, n, tmp);
     } else {
         switch (n) {
         case 32: /* PPC */
             env->ppc = tmp;
             break;
 
-        case 33: /* NPC */
-            env->npc = tmp;
+        case 33: /* NPC (equals PC) */
+            /* If setting PC to something different,
+               also clear delayed branch status.  */
+            if (env->pc != tmp) {
+                env->pc = tmp;
+                env->dflag = 0;
+            }
             break;
 
         case 34: /* SR */
-            env->sr = tmp;
+            cpu_set_sr(env, tmp);
             break;
 
         default:

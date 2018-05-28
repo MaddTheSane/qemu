@@ -36,6 +36,7 @@
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
 #include "qemu/error-report.h"
+#include "xtensa_memory.h"
 
 static uint64_t translate_phys_addr(void *opaque, uint64_t addr)
 {
@@ -55,23 +56,12 @@ static void xtensa_sim_init(MachineState *machine)
 {
     XtensaCPU *cpu = NULL;
     CPUXtensaState *env = NULL;
-    MemoryRegion *ram, *rom;
     ram_addr_t ram_size = machine->ram_size;
-    const char *cpu_model = machine->cpu_model;
     const char *kernel_filename = machine->kernel_filename;
     int n;
 
-    if (!cpu_model) {
-        cpu_model = XTENSA_DEFAULT_CPU_MODEL;
-    }
-
     for (n = 0; n < smp_cpus; n++) {
-        cpu = cpu_xtensa_init(cpu_model);
-        if (cpu == NULL) {
-            error_report("unable to find CPU definition '%s'",
-                         cpu_model);
-            exit(EXIT_FAILURE);
-        }
+        cpu = XTENSA_CPU(cpu_create(machine->cpu_type));
         env = &cpu->env;
 
         env->sregs[PRID] = n;
@@ -82,16 +72,27 @@ static void xtensa_sim_init(MachineState *machine)
         sim_reset(cpu);
     }
 
-    ram = g_malloc(sizeof(*ram));
-    memory_region_init_ram(ram, NULL, "xtensa.sram", ram_size, &error_fatal);
-    vmstate_register_ram_global(ram);
-    memory_region_add_subregion(get_system_memory(), 0, ram);
+    if (env) {
+        XtensaMemory sysram = env->config->sysram;
 
-    rom = g_malloc(sizeof(*rom));
-    memory_region_init_ram(rom, NULL, "xtensa.rom", 0x1000, &error_fatal);
-    vmstate_register_ram_global(rom);
-    memory_region_add_subregion(get_system_memory(), 0xfe000000, rom);
+        sysram.location[0].size = ram_size;
+        xtensa_create_memory_regions(&env->config->instrom, "xtensa.instrom",
+                                     get_system_memory());
+        xtensa_create_memory_regions(&env->config->instram, "xtensa.instram",
+                                     get_system_memory());
+        xtensa_create_memory_regions(&env->config->datarom, "xtensa.datarom",
+                                     get_system_memory());
+        xtensa_create_memory_regions(&env->config->dataram, "xtensa.dataram",
+                                     get_system_memory());
+        xtensa_create_memory_regions(&env->config->sysrom, "xtensa.sysrom",
+                                     get_system_memory());
+        xtensa_create_memory_regions(&sysram, "xtensa.sysram",
+                                     get_system_memory());
+    }
 
+    if (serial_hd(0)) {
+        xtensa_sim_open_console(serial_hd(0));
+    }
     if (kernel_filename) {
         uint64_t elf_entry;
         uint64_t elf_lowaddr;
@@ -114,6 +115,8 @@ static void xtensa_sim_machine_init(MachineClass *mc)
     mc->is_default = true;
     mc->init = xtensa_sim_init;
     mc->max_cpus = 4;
+    mc->no_serial = 1;
+    mc->default_cpu_type = XTENSA_DEFAULT_CPU_TYPE;
 }
 
 DEFINE_MACHINE("sim", xtensa_sim_machine_init)

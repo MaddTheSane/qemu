@@ -126,8 +126,9 @@ static int vio_make_devnode(VIOsPAPRDevice *dev,
     }
 
     if (dev->irq) {
-        uint32_t ints_prop[] = {cpu_to_be32(dev->irq), 0};
+        uint32_t ints_prop[2];
 
+        spapr_dt_xics_irq(ints_prop, dev->irq, false);
         ret = fdt_setprop(fdt, node_off, "interrupts", ints_prop,
                           sizeof(ints_prop));
         if (ret < 0) {
@@ -454,7 +455,7 @@ static void spapr_vio_busdev_realize(DeviceState *qdev, Error **errp)
         dev->qdev.id = id;
     }
 
-    dev->irq = xics_spapr_alloc(spapr->xics, dev->irq, false, &local_err);
+    dev->irq = spapr_irq_alloc(spapr, dev->irq, false, &local_err);
     if (local_err) {
         error_propagate(errp, local_err);
         return;
@@ -538,21 +539,11 @@ VIOsPAPRBus *spapr_vio_bus_init(void)
     return bus;
 }
 
-/* Represents sPAPR hcall VIO devices */
-
-static int spapr_vio_bridge_init(SysBusDevice *dev)
-{
-    /* nothing */
-    return 0;
-}
-
 static void spapr_vio_bridge_class_init(ObjectClass *klass, void *data)
 {
-    SysBusDeviceClass *k = SYS_BUS_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->fw_name = "vdevice";
-    k->init = spapr_vio_bridge_init;
 }
 
 static const TypeInfo spapr_vio_bridge_info = {
@@ -567,8 +558,8 @@ const VMStateDescription vmstate_spapr_vio = {
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         /* Sanity check */
-        VMSTATE_UINT32_EQUAL(reg, VIOsPAPRDevice),
-        VMSTATE_UINT32_EQUAL(irq, VIOsPAPRDevice),
+        VMSTATE_UINT32_EQUAL(reg, VIOsPAPRDevice, NULL),
+        VMSTATE_UINT32_EQUAL(irq, VIOsPAPRDevice, NULL),
 
         /* General VIO device state */
         VMSTATE_UINT64(signal_state, VIOsPAPRDevice),

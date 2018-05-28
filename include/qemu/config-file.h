@@ -1,8 +1,6 @@
 #ifndef QEMU_CONFIG_FILE_H
 #define QEMU_CONFIG_FILE_H
 
-#include "qemu/option.h"
-#include "qapi/qmp/qdict.h"
 
 QemuOptsList *qemu_find_opts(const char *group);
 QemuOptsList *qemu_find_opts_err(const char *group, Error **errp);
@@ -22,9 +20,5 @@ int qemu_read_config_file(const char *filename);
    enumerated (0..(n-1)) configuration "sections") */
 void qemu_config_parse_qdict(QDict *options, QemuOptsList **lists,
                              Error **errp);
-
-/* Read default QEMU config files
- */
-int qemu_read_default_config_files(bool userconfig);
 
 #endif /* QEMU_CONFIG_FILE_H */

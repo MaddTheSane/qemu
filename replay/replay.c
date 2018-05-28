@@ -11,21 +11,23 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
 #include "sysemu/replay.h"
 #include "replay-internal.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
+#include "qemu/option.h"
+#include "sysemu/cpus.h"
 #include "sysemu/sysemu.h"
 #include "qemu/error-report.h"
 
 /* Current version of the replay mechanism.
    Increase it when file format changes. */
-#define REPLAY_VERSION              0xe02005
+#define REPLAY_VERSION              0xe02007
 /* Size of replay log header */
 #define HEADER_SIZE                 (sizeof(uint32_t) + sizeof(uint64_t))
 
 ReplayMode replay_mode = REPLAY_MODE_NONE;
+char *replay_snapshot;
 
 /* Name of replay file  */
 static char *replay_filename;
@@ -47,9 +49,10 @@ bool replay_next_event_is(int event)
             res = true;
         }
         switch (replay_state.data_kind) {
-        case EVENT_SHUTDOWN:
+        case EVENT_SHUTDOWN ... EVENT_SHUTDOWN_LAST:
             replay_finish_event();
-            qemu_system_shutdown_request();
+            qemu_system_shutdown_request(replay_state.data_kind -
+                                         EVENT_SHUTDOWN);
             break;
         default:
             /* clock, time_t, checkpoint and other events */
@@ -78,10 +81,14 @@ int replay_get_instructions(void)
 void replay_account_executed_instructions(void)
 {
     if (replay_mode == REPLAY_MODE_PLAY) {
-        replay_mutex_lock();
+        g_assert(replay_mutex_locked());
         if (replay_state.instructions_count > 0) {
             int count = (int)(replay_get_current_step()
                               - replay_state.current_step);
+
+            /* Time can only go forward */
+            assert(count >= 0);
+
             replay_state.instructions_count -= count;
             replay_state.current_step += count;
             if (replay_state.instructions_count == 0) {
@@ -93,24 +100,22 @@ void replay_account_executed_instructions(void)
                 qemu_notify_event();
             }
         }
-        replay_mutex_unlock();
     }
 }
 
 bool replay_exception(void)
 {
+
     if (replay_mode == REPLAY_MODE_RECORD) {
+        g_assert(replay_mutex_locked());
         replay_save_instructions();
-        replay_mutex_lock();
         replay_put_event(EVENT_EXCEPTION);
-        replay_mutex_unlock();
         return true;
     } else if (replay_mode == REPLAY_MODE_PLAY) {
+        g_assert(replay_mutex_locked());
         bool res = replay_has_exception();
         if (res) {
-            replay_mutex_lock();
             replay_finish_event();
-            replay_mutex_unlock();
         }
         return res;
     }
@@ -122,10 +127,9 @@ bool replay_has_exception(void)
 {
     bool res = false;
     if (replay_mode == REPLAY_MODE_PLAY) {
+        g_assert(replay_mutex_locked());
         replay_account_executed_instructions();
-        replay_mutex_lock();
         res = replay_next_event_is(EVENT_EXCEPTION);
-        replay_mutex_unlock();
     }
 
     return res;
@@ -134,17 +138,15 @@ bool replay_has_exception(void)
 bool replay_interrupt(void)
 {
     if (replay_mode == REPLAY_MODE_RECORD) {
+        g_assert(replay_mutex_locked());
         replay_save_instructions();
-        replay_mutex_lock();
         replay_put_event(EVENT_INTERRUPT);
-        replay_mutex_unlock();
         return true;
     } else if (replay_mode == REPLAY_MODE_PLAY) {
+        g_assert(replay_mutex_locked());
         bool res = replay_has_interrupt();
         if (res) {
-            replay_mutex_lock();
             replay_finish_event();
-            replay_mutex_unlock();
         }
         return res;
     }
@@ -156,36 +158,45 @@ bool replay_has_interrupt(void)
 {
     bool res = false;
     if (replay_mode == REPLAY_MODE_PLAY) {
+        g_assert(replay_mutex_locked());
         replay_account_executed_instructions();
-        replay_mutex_lock();
         res = replay_next_event_is(EVENT_INTERRUPT);
-        replay_mutex_unlock();
     }
     return res;
 }
 
-void replay_shutdown_request(void)
+void replay_shutdown_request(ShutdownCause cause)
 {
     if (replay_mode == REPLAY_MODE_RECORD) {
-        replay_mutex_lock();
-        replay_put_event(EVENT_SHUTDOWN);
-        replay_mutex_unlock();
+        g_assert(replay_mutex_locked());
+        replay_put_event(EVENT_SHUTDOWN + cause);
     }
 }
 
 bool replay_checkpoint(ReplayCheckpoint checkpoint)
 {
     bool res = false;
+    static bool in_checkpoint;
     assert(EVENT_CHECKPOINT + checkpoint <= EVENT_CHECKPOINT_LAST);
-    replay_save_instructions();
 
     if (!replay_file) {
         return true;
     }
 
-    replay_mutex_lock();
+    if (in_checkpoint) {
+        /* If we are already in checkpoint, then there is no need
+           for additional synchronization.
+           Recursion occurs when HW event modifies timers.
+           Timer modification may invoke the checkpoint and
+           proceed to recursion. */
+        return true;
+    }
+    in_checkpoint = true;
+
+    replay_save_instructions();
 
     if (replay_mode == REPLAY_MODE_PLAY) {
+        g_assert(replay_mutex_locked());
         if (replay_next_event_is(EVENT_CHECKPOINT + checkpoint)) {
             replay_finish_event();
         } else if (replay_state.data_kind != EVENT_ASYNC) {
@@ -198,12 +209,18 @@ bool replay_checkpoint(ReplayCheckpoint checkpoint)
            checkpoint were processed */
         res = replay_state.data_kind != EVENT_ASYNC;
     } else if (replay_mode == REPLAY_MODE_RECORD) {
+        g_assert(replay_mutex_locked());
         replay_put_event(EVENT_CHECKPOINT + checkpoint);
-        replay_save_events(checkpoint);
+        /* This checkpoint belongs to several threads.
+           Processing events from different threads is
+           non-deterministic */
+        if (checkpoint != CHECKPOINT_CLOCK_WARP_START) {
+            replay_save_events(checkpoint);
+        }
         res = true;
     }
 out:
-    replay_mutex_unlock();
+    in_checkpoint = false;
     return res;
 }
 
@@ -226,8 +243,6 @@ static void replay_enable(const char *fname, int mode)
 
     atexit(replay_finish);
 
-    replay_mutex_init();
-
     replay_file = fopen(fname, fmode);
     if (replay_file == NULL) {
         fprintf(stderr, "Replay: open %s: %s\n", fname, strerror(errno));
@@ -235,8 +250,9 @@ static void replay_enable(const char *fname, int mode)
     }
 
     replay_filename = g_strdup(fname);
-
     replay_mode = mode;
+    replay_mutex_init();
+
     replay_state.data_kind = -1;
     replay_state.instructions_count = 0;
     replay_state.current_step = 0;
@@ -292,6 +308,7 @@ void replay_configure(QemuOpts *opts)
         exit(1);
     }
 
+    replay_snapshot = g_strdup(qemu_opt_get(opts, "rrsnapshot"));
     replay_vmstate_register();
     replay_enable(fname, mode);
 
@@ -346,8 +363,10 @@ void replay_finish(void)
         replay_filename = NULL;
     }
 
+    g_free(replay_snapshot);
+    replay_snapshot = NULL;
+
     replay_finish_events();
-    replay_mutex_destroy();
 }
 
 void replay_add_blocker(Error *reason)

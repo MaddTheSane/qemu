@@ -18,14 +18,16 @@
 #include "qemu/timer.h"
 #include "qemu-common.h"
 #include "hw/virtio/virtio.h"
-#include "hw/i386/pc.h"
+#include "hw/mem/pc-dimm.h"
 #include "sysemu/balloon.h"
 #include "hw/virtio/virtio-balloon.h"
 #include "sysemu/kvm.h"
 #include "exec/address-spaces.h"
+#include "qapi/error.h"
+#include "qapi/qapi-events-misc.h"
 #include "qapi/visitor.h"
-#include "qapi-event.h"
 #include "trace.h"
+#include "qemu/error-report.h"
 
 #include "hw/virtio/virtio-bus.h"
 #include "hw/virtio/virtio-access.h"
@@ -49,6 +51,9 @@ static const char *balloon_stat_names[] = {
    [VIRTIO_BALLOON_S_MEMFREE] = "stat-free-memory",
    [VIRTIO_BALLOON_S_MEMTOT] = "stat-total-memory",
    [VIRTIO_BALLOON_S_AVAIL] = "stat-available-memory",
+   [VIRTIO_BALLOON_S_CACHES] = "stat-disk-caches",
+   [VIRTIO_BALLOON_S_HTLB_PGALLOC] = "stat-htlb-pgalloc",
+   [VIRTIO_BALLOON_S_HTLB_PGFAIL] = "stat-htlb-pgfail",
    [VIRTIO_BALLOON_S_NR] = NULL
 };
 
@@ -228,8 +233,14 @@ static void virtio_balloon_handle_output(VirtIODevice *vdev, VirtQueue *vq)
 
             /* FIXME: remove get_system_memory(), but how? */
             section = memory_region_find(get_system_memory(), pa, 1);
-            if (!int128_nz(section.size) || !memory_region_is_ram(section.mr))
+            if (!int128_nz(section.size) ||
+                !memory_region_is_ram(section.mr) ||
+                memory_region_is_rom(section.mr) ||
+                memory_region_is_romd(section.mr)) {
+                trace_virtio_balloon_bad_addr(pa);
+                memory_region_unref(section.mr);
                 continue;
+            }
 
             trace_virtio_balloon_handle_output(memory_region_name(section.mr),
                                                pa);
@@ -287,7 +298,7 @@ static void virtio_balloon_receive_stats(VirtIODevice *vdev, VirtQueue *vq)
     s->stats_vq_offset = offset;
 
     if (qemu_gettimeofday(&tv) < 0) {
-        fprintf(stderr, "warning: %s: failed to get time of day\n", __func__);
+        warn_report("%s: failed to get time of day", __func__);
         goto out;
     }
 

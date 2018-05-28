@@ -33,15 +33,7 @@
 #include "target/i386/cpu.h"
 #include "hw/i386/apic-msidef.h"
 #include "hw/i386/x86-iommu.h"
-
-//#define DEBUG_IOAPIC
-
-#ifdef DEBUG_IOAPIC
-#define DPRINTF(fmt, ...)                                       \
-    do { printf("ioapic: " fmt , ## __VA_ARGS__); } while (0)
-#else
-#define DPRINTF(fmt, ...)
-#endif
+#include "trace.h"
 
 #define APIC_DELIVERY_MODE_SHIFT 8
 #define APIC_POLARITY_SHIFT 14
@@ -115,6 +107,7 @@ static void ioapic_service(IOAPICCommonState *s)
                     s->irr &= ~mask;
                 } else {
                     coalesce = s->ioredtbl[i] & IOAPIC_LVT_REMOTE_IRR;
+                    trace_ioapic_set_remote_irr(i);
                     s->ioredtbl[i] |= IOAPIC_LVT_REMOTE_IRR;
                 }
 
@@ -155,7 +148,7 @@ static void ioapic_set_irq(void *opaque, int vector, int level)
      * to GSI 2.  GSI maps to ioapic 1-1.  This is not
      * the cleanest way of doing it but it should work. */
 
-    DPRINTF("%s: %s vec %x\n", __func__, level ? "raise" : "lower", vector);
+    trace_ioapic_set_irq(vector, level);
     if (vector == 0) {
         vector = 2;
     }
@@ -220,6 +213,8 @@ void ioapic_eoi_broadcast(int vector)
     uint64_t entry;
     int i, n;
 
+    trace_ioapic_eoi_broadcast(vector);
+
     for (i = 0; i < MAX_IOAPICS; i++) {
         s = ioapics[i];
         if (!s) {
@@ -229,6 +224,7 @@ void ioapic_eoi_broadcast(int vector)
             entry = s->ioredtbl[n];
             if ((entry & IOAPIC_LVT_REMOTE_IRR)
                 && (entry & IOAPIC_VECTOR_MASK) == vector) {
+                trace_ioapic_clear_remote_irr(n, vector);
                 s->ioredtbl[n] = entry & ~IOAPIC_LVT_REMOTE_IRR;
                 if (!(entry & IOAPIC_LVT_MASKED) && (s->irr & (1 << n))) {
                     ioapic_service(s);
@@ -256,7 +252,9 @@ ioapic_mem_read(void *opaque, hwaddr addr, unsigned int size)
     int index;
     uint32_t val = 0;
 
-    switch (addr & 0xff) {
+    addr &= 0xff;
+
+    switch (addr) {
     case IOAPIC_IOREGSEL:
         val = s->ioregsel;
         break;
@@ -283,9 +281,11 @@ ioapic_mem_read(void *opaque, hwaddr addr, unsigned int size)
                 }
             }
         }
-        DPRINTF("read: %08x = %08x\n", s->ioregsel, val);
         break;
     }
+
+    trace_ioapic_mem_read(addr, s->ioregsel, size, val);
+
     return val;
 }
 
@@ -324,7 +324,10 @@ ioapic_mem_write(void *opaque, hwaddr addr, uint64_t val,
     IOAPICCommonState *s = opaque;
     int index;
 
-    switch (addr & 0xff) {
+    addr &= 0xff;
+    trace_ioapic_mem_write(addr, s->ioregsel, size, val);
+
+    switch (addr) {
     case IOAPIC_IOREGSEL:
         s->ioregsel = val;
         break;
@@ -332,7 +335,6 @@ ioapic_mem_write(void *opaque, hwaddr addr, uint64_t val,
         if (size != 4) {
             break;
         }
-        DPRINTF("write: %08x = %08" PRIx64 "\n", s->ioregsel, val);
         switch (s->ioregsel) {
         case IOAPIC_REG_ID:
             s->id = (val >> IOAPIC_ID_SHIFT) & IOAPIC_ID_MASK;
@@ -395,13 +397,15 @@ static void ioapic_machine_done_notify(Notifier *notifier, void *data)
 #endif
 }
 
+#define IOAPIC_VER_DEF 0x20
+
 static void ioapic_realize(DeviceState *dev, Error **errp)
 {
     IOAPICCommonState *s = IOAPIC_COMMON(dev);
 
     if (s->version != 0x11 && s->version != 0x20) {
         error_report("IOAPIC only supports version 0x11 or 0x20 "
-                     "(default: 0x11).");
+                     "(default: 0x%x).", IOAPIC_VER_DEF);
         exit(1);
     }
 
@@ -416,7 +420,7 @@ static void ioapic_realize(DeviceState *dev, Error **errp)
 }
 
 static Property ioapic_properties[] = {
-    DEFINE_PROP_UINT8("version", IOAPICCommonState, version, 0x20),
+    DEFINE_PROP_UINT8("version", IOAPICCommonState, version, IOAPIC_VER_DEF),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -426,6 +430,11 @@ static void ioapic_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     k->realize = ioapic_realize;
+    /*
+     * If APIC is in kernel, we need to update the kernel cache after
+     * migration, otherwise first 24 gsi routes will be invalid.
+     */
+    k->post_load = ioapic_update_kvm_routes;
     dc->reset = ioapic_reset_common;
     dc->props = ioapic_properties;
 }

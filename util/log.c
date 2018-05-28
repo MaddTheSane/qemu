@@ -183,13 +183,13 @@ void qemu_set_dfilter_ranges(const char *filter_spec, Error **errp)
             goto out;
         }
 
-        if (qemu_strtoull(r, &e, 0, &r1val)
+        if (qemu_strtou64(r, &e, 0, &r1val)
             || e != range_op) {
             error_setg(errp, "Invalid number to the left of %.*s",
                        (int)(r2 - range_op), range_op);
             goto out;
         }
-        if (qemu_strtoull(r2, NULL, 0, &r2val)) {
+        if (qemu_strtou64(r2, NULL, 0, &r2val)) {
             error_setg(errp, "Invalid number to the right of %.*s",
                        (int)(r2 - range_op), range_op);
             goto out;
@@ -256,6 +256,8 @@ const QEMULogItem qemu_log_items[] = {
       "show trace before each executed TB (lots of logs)" },
     { CPU_LOG_TB_CPU, "cpu",
       "show CPU registers before entering a TB (lots of logs)" },
+    { CPU_LOG_TB_FPU, "fpu",
+      "include FPU registers in the 'cpu' logging" },
     { CPU_LOG_MMU, "mmu",
       "log MMU-related activities" },
     { CPU_LOG_PCALL, "pcall",

@@ -27,13 +27,21 @@
 
 #if defined(CONFIG_USER_ONLY)
 
-int sparc_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int rw,
+int sparc_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int size, int rw,
                                int mmu_idx)
 {
+    SPARCCPU *cpu = SPARC_CPU(cs);
+    CPUSPARCState *env = &cpu->env;
+
     if (rw & 2) {
         cs->exception_index = TT_TFAULT;
     } else {
         cs->exception_index = TT_DFAULT;
+#ifdef TARGET_SPARC64
+        env->dmmu.mmuregs[4] = address;
+#else
+        env->mmuregs[4] = address;
+#endif
     }
     return 1;
 }
@@ -95,7 +103,7 @@ static int get_physical_address(CPUSPARCState *env, hwaddr *physical,
     if (mmu_idx == MMU_PHYS_IDX) {
         *page_size = TARGET_PAGE_SIZE;
         /* Boot mode: instruction fetches are taken from PROM */
-        if (rw == 2 && (env->mmuregs[0] & env->def->mmu_bm)) {
+        if (rw == 2 && (env->mmuregs[0] & env->def.mmu_bm)) {
             *physical = env->prom_addr | (address & 0x7ffffULL);
             *prot = PAGE_READ | PAGE_EXEC;
             return 0;
@@ -200,7 +208,7 @@ static int get_physical_address(CPUSPARCState *env, hwaddr *physical,
 }
 
 /* Perform address translation */
-int sparc_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int rw,
+int sparc_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int size, int rw,
                                int mmu_idx)
 {
     SPARCCPU *cpu = SPARC_CPU(cs);
@@ -456,23 +464,7 @@ static inline int ultrasparc_tag_match(SparcTLBEntry *tlb,
                                        uint64_t address, uint64_t context,
                                        hwaddr *physical)
 {
-    uint64_t mask;
-
-    switch (TTE_PGSIZE(tlb->tte)) {
-    default:
-    case 0x0: /* 8k */
-        mask = 0xffffffffffffe000ULL;
-        break;
-    case 0x1: /* 64k */
-        mask = 0xffffffffffff0000ULL;
-        break;
-    case 0x2: /* 512k */
-        mask = 0xfffffffffff80000ULL;
-        break;
-    case 0x3: /* 4M */
-        mask = 0xffffffffffc00000ULL;
-        break;
-    }
+    uint64_t mask = -(8192ULL << 3 * TTE_PGSIZE(tlb->tte));
 
     /* valid, context match, virtual address match? */
     if (TTE_IS_VALID(tlb->tte) &&
@@ -721,7 +713,7 @@ static int get_physical_address(CPUSPARCState *env, hwaddr *physical,
 }
 
 /* Perform address translation */
-int sparc_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int rw,
+int sparc_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int size, int rw,
                                int mmu_idx)
 {
     SPARCCPU *cpu = SPARC_CPU(cs);
@@ -757,6 +749,8 @@ void dump_mmu(FILE *f, fprintf_function cpu_fprintf, CPUSPARCState *env)
                    PRId64 "\n",
                    env->dmmu.mmu_primary_context,
                    env->dmmu.mmu_secondary_context);
+    (*cpu_fprintf)(f, "DMMU Tag Access: %" PRIx64 ", TSB Tag Target: %" PRIx64
+                   "\n", env->dmmu.tag_access, env->dmmu.tsb_tag_target);
     if ((env->lsu & DMMU_E) == 0) {
         (*cpu_fprintf)(f, "DMMU disabled\n");
     } else {
@@ -863,17 +857,11 @@ hwaddr sparc_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
     CPUSPARCState *env = &cpu->env;
     hwaddr phys_addr;
     int mmu_idx = cpu_mmu_index(env, false);
-    MemoryRegionSection section;
 
     if (cpu_sparc_get_phys_page(env, &phys_addr, addr, 2, mmu_idx) != 0) {
         if (cpu_sparc_get_phys_page(env, &phys_addr, addr, 0, mmu_idx) != 0) {
             return -1;
         }
-    }
-    section = memory_region_find(get_system_memory(), phys_addr, 1);
-    memory_region_unref(section.mr);
-    if (!int128_nz(section.size)) {
-        return -1;
     }
     return phys_addr;
 }

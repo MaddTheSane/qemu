@@ -29,8 +29,6 @@
 
 #include "exec/cpu-defs.h"
 
-#include "fpu/softfloat.h"
-
 /*#define EXCP_INTERRUPT 0x100*/
 
 /* trap definitions */
@@ -68,6 +66,8 @@
 #define TT_DATA_ACCESS 0x32
 #define TT_UNALIGNED 0x34
 #define TT_PRIV_ACT 0x37
+#define TT_INSN_REAL_TRANSLATION_MISS 0x3e
+#define TT_DATA_REAL_TRANSLATION_MISS 0x3f
 #define TT_EXTINT   0x40
 #define TT_IVEC     0x60
 #define TT_TMISS    0x64
@@ -77,6 +77,7 @@
 #define TT_FILL     0xc0
 #define TT_WOTHER   (1 << 5)
 #define TT_TRAP     0x100
+#define TT_HTRAP    0x180
 #endif
 
 #define PSR_NEG_SHIFT 23
@@ -227,7 +228,7 @@ enum {
 #if !defined(TARGET_SPARC64)
 #define NB_MMU_MODES 3
 #else
-#define NB_MMU_MODES 7
+#define NB_MMU_MODES 6
 typedef struct trap_state {
     uint64_t tpc;
     uint64_t tnpc;
@@ -237,7 +238,7 @@ typedef struct trap_state {
 #endif
 #define TARGET_INSN_START_EXTRA_WORDS 1
 
-typedef struct sparc_def_t {
+struct sparc_def_t {
     const char *name;
     target_ulong iu_version;
     uint32_t fpu_version;
@@ -251,7 +252,7 @@ typedef struct sparc_def_t {
     uint32_t features;
     uint32_t nwindows;
     uint32_t maxtl;
-} sparc_def_t;
+};
 
 #define CPU_FEATURE_FLOAT        (1 << 0)
 #define CPU_FEATURE_FLOAT128     (1 << 1)
@@ -302,20 +303,41 @@ enum {
 #define TTE_W_OK_BIT        (1ULL <<  1)
 #define TTE_GLOBAL_BIT      (1ULL <<  0)
 
+#define TTE_NFO_BIT_UA2005  (1ULL << 62)
+#define TTE_USED_BIT_UA2005 (1ULL << 47)
+#define TTE_LOCKED_BIT_UA2005 (1ULL <<  61)
+#define TTE_SIDEEFFECT_BIT_UA2005 (1ULL <<  11)
+#define TTE_PRIV_BIT_UA2005 (1ULL <<  8)
+#define TTE_W_OK_BIT_UA2005 (1ULL <<  6)
+
 #define TTE_IS_VALID(tte)   ((tte) & TTE_VALID_BIT)
 #define TTE_IS_NFO(tte)     ((tte) & TTE_NFO_BIT)
 #define TTE_IS_USED(tte)    ((tte) & TTE_USED_BIT)
 #define TTE_IS_LOCKED(tte)  ((tte) & TTE_LOCKED_BIT)
 #define TTE_IS_SIDEEFFECT(tte) ((tte) & TTE_SIDEEFFECT_BIT)
+#define TTE_IS_SIDEEFFECT_UA2005(tte) ((tte) & TTE_SIDEEFFECT_BIT_UA2005)
 #define TTE_IS_PRIV(tte)    ((tte) & TTE_PRIV_BIT)
 #define TTE_IS_W_OK(tte)    ((tte) & TTE_W_OK_BIT)
+
+#define TTE_IS_NFO_UA2005(tte)     ((tte) & TTE_NFO_BIT_UA2005)
+#define TTE_IS_USED_UA2005(tte)    ((tte) & TTE_USED_BIT_UA2005)
+#define TTE_IS_LOCKED_UA2005(tte)  ((tte) & TTE_LOCKED_BIT_UA2005)
+#define TTE_IS_SIDEEFFECT_UA2005(tte) ((tte) & TTE_SIDEEFFECT_BIT_UA2005)
+#define TTE_IS_PRIV_UA2005(tte)    ((tte) & TTE_PRIV_BIT_UA2005)
+#define TTE_IS_W_OK_UA2005(tte)    ((tte) & TTE_W_OK_BIT_UA2005)
+
 #define TTE_IS_GLOBAL(tte)  ((tte) & TTE_GLOBAL_BIT)
 
 #define TTE_SET_USED(tte)   ((tte) |= TTE_USED_BIT)
 #define TTE_SET_UNUSED(tte) ((tte) &= ~TTE_USED_BIT)
 
 #define TTE_PGSIZE(tte)     (((tte) >> 61) & 3ULL)
+#define TTE_PGSIZE_UA2005(tte)     ((tte) & 7ULL)
 #define TTE_PA(tte)         ((tte) & 0x1ffffffe000ULL)
+
+/* UltraSPARC T1 specific */
+#define TLB_UST1_IS_REAL_BIT   (1ULL << 9)  /* Real translation entry */
+#define TLB_UST1_IS_SUN4V_BIT  (1ULL << 10) /* sun4u/sun4v TTE format switch */
 
 #define SFSR_NF_BIT         (1ULL << 24)   /* JPS1 NoFault */
 #define SFSR_TM_BIT         (1ULL << 15)   /* JPS1 TLB Miss */
@@ -360,6 +382,9 @@ enum {
 #define CACHE_CTRL_FD (1 << 22)  /* Flush Data cache (Write only) */
 #define CACHE_CTRL_DS (1 << 23)  /* Data cache snoop enable */
 
+#define CONVERT_BIT(X, SRC, DST) \
+         (SRC > DST ? (X) / (SRC / DST) & (DST) : ((X) & SRC) * (DST / SRC))
+
 typedef struct SparcTLBEntry {
     uint64_t tag;
     uint64_t tte;
@@ -380,7 +405,24 @@ struct CPUTimer
 typedef struct CPUTimer CPUTimer;
 
 typedef struct CPUSPARCState CPUSPARCState;
-
+#if defined(TARGET_SPARC64)
+typedef union {
+   uint64_t mmuregs[16];
+   struct {
+    uint64_t tsb_tag_target;
+    uint64_t mmu_primary_context;
+    uint64_t mmu_secondary_context;
+    uint64_t sfsr;
+    uint64_t sfar;
+    uint64_t tsb;
+    uint64_t tag_access;
+    uint64_t virtual_watchpoint;
+    uint64_t physical_watchpoint;
+    uint64_t sun4v_ctx_config[2];
+    uint64_t sun4v_tsb_pointers[4];
+   };
+} SparcV9MMU;
+#endif
 struct CPUSPARCState {
     target_ulong gregs[8]; /* general registers */
     target_ulong *regwptr; /* pointer to current register window */
@@ -419,6 +461,9 @@ struct CPUSPARCState {
     /* NOTE: we allow 8 more registers to handle wrapping */
     target_ulong regbase[MAX_NWINDOWS * 16 + 8];
 
+    /* Fields up to this point are cleared by a CPU reset */
+    struct {} end_reset_fields;
+
     CPU_COMMON
 
     /* Fields from here on are preserved across CPU reset. */
@@ -430,31 +475,8 @@ struct CPUSPARCState {
     uint64_t lsu;
 #define DMMU_E 0x8
 #define IMMU_E 0x4
-    //typedef struct SparcMMU
-    union {
-        uint64_t immuregs[16];
-        struct {
-            uint64_t tsb_tag_target;
-            uint64_t unused_mmu_primary_context;   // use DMMU
-            uint64_t unused_mmu_secondary_context; // use DMMU
-            uint64_t sfsr;
-            uint64_t sfar;
-            uint64_t tsb;
-            uint64_t tag_access;
-        } immu;
-    };
-    union {
-        uint64_t dmmuregs[16];
-        struct {
-            uint64_t tsb_tag_target;
-            uint64_t mmu_primary_context;
-            uint64_t mmu_secondary_context;
-            uint64_t sfsr;
-            uint64_t sfar;
-            uint64_t tsb;
-            uint64_t tag_access;
-        } dmmu;
-    };
+    SparcV9MMU immu;
+    SparcV9MMU dmmu;
     SparcTLBEntry itlb[64];
     SparcTLBEntry dtlb[64];
     uint32_t mmu_version;
@@ -484,6 +506,7 @@ struct CPUSPARCState {
     uint64_t bgregs[8]; /* backup for normal global registers */
     uint64_t igregs[8]; /* interrupt general registers */
     uint64_t mgregs[8]; /* mmu general registers */
+    uint64_t glregs[8 * MAXTL_MAX];
     uint64_t fprs;
     uint64_t tick_cmpr, stick_cmpr;
     CPUTimer *tick, *stick;
@@ -493,6 +516,7 @@ struct CPUSPARCState {
     uint32_t gl; // UA2005
     /* UA 2005 hyperprivileged registers */
     uint64_t hpstate, htstate[MAXTL_MAX], hintp, htba, hver, hstick_cmpr, ssr;
+    uint64_t scratch[8];
     CPUTimer *hstick; // UA 2005
     /* Interrupt vector registers */
     uint64_t ivec_status;
@@ -503,7 +527,7 @@ struct CPUSPARCState {
 #define SOFTINT_INTRMASK (0xFFFE)
 #define SOFTINT_REG_MASK (SOFTINT_STIMER|SOFTINT_INTRMASK|SOFTINT_TIMER)
 #endif
-    sparc_def_t *def;
+    sparc_def_t def;
 
     void *irq_manager;
     void (*qemu_irq_ack)(CPUSPARCState *env, void *irq_manager, int intno);
@@ -553,11 +577,10 @@ void cpu_raise_exception_ra(CPUSPARCState *, int, uintptr_t) QEMU_NORETURN;
 
 #ifndef NO_CPU_IO_DEFS
 /* cpu_init.c */
-SPARCCPU *cpu_sparc_init(const char *cpu_model);
 void cpu_sparc_set_id(CPUSPARCState *env, unsigned int cpu);
 void sparc_cpu_list(FILE *f, fprintf_function cpu_fprintf);
 /* mmu_helper.c */
-int sparc_cpu_handle_mmu_fault(CPUState *cpu, vaddr address, int rw,
+int sparc_cpu_handle_mmu_fault(CPUState *cpu, vaddr address, int size, int rw,
                                int mmu_idx);
 target_ulong mmu_probe(CPUSPARCState *env, target_ulong address, int mmulev);
 void dump_mmu(FILE *f, fprintf_function cpu_fprintf, CPUSPARCState *env);
@@ -569,7 +592,7 @@ int sparc_cpu_memory_rw_debug(CPUState *cpu, vaddr addr,
 
 
 /* translate.c */
-void gen_intermediate_code_init(CPUSPARCState *env);
+void sparc_tcg_init(void);
 
 /* cpu-exec.c */
 
@@ -583,6 +606,7 @@ void cpu_put_ccr(CPUSPARCState *env1, target_ulong val);
 target_ulong cpu_get_cwp64(CPUSPARCState *env1);
 void cpu_put_cwp64(CPUSPARCState *env1, int cwp);
 void cpu_change_pstate(CPUSPARCState *env1, uint32_t new_pstate);
+void cpu_gl_switch_gregs(CPUSPARCState *env, uint32_t new_gl);
 #endif
 int cpu_cwp_inc(CPUSPARCState *env1, int cwp);
 int cpu_cwp_dec(CPUSPARCState *env1, int cwp);
@@ -628,9 +652,9 @@ hwaddr cpu_get_phys_page_nofault(CPUSPARCState *env, target_ulong addr,
 #endif
 int cpu_sparc_signal_handler(int host_signum, void *pinfo, void *puc);
 
-#ifndef NO_CPU_IO_DEFS
-#define cpu_init(cpu_model) CPU(cpu_sparc_init(cpu_model))
-#endif
+#define SPARC_CPU_TYPE_SUFFIX "-" TYPE_SPARC_CPU
+#define SPARC_CPU_TYPE_NAME(model) model SPARC_CPU_TYPE_SUFFIX
+#define CPU_RESOLVING_TYPE TYPE_SPARC_CPU
 
 #define cpu_signal_handler cpu_sparc_signal_handler
 #define cpu_list sparc_cpu_list
@@ -642,8 +666,7 @@ int cpu_sparc_signal_handler(int host_signum, void *pinfo, void *puc);
 #define MMU_KERNEL_IDX 2
 #define MMU_KERNEL_SECONDARY_IDX 3
 #define MMU_NUCLEUS_IDX 4
-#define MMU_HYPV_IDX   5
-#define MMU_PHYS_IDX   6
+#define MMU_PHYS_IDX   5
 #else
 #define MMU_USER_IDX   0
 #define MMU_KERNEL_IDX 1
@@ -653,7 +676,7 @@ int cpu_sparc_signal_handler(int host_signum, void *pinfo, void *puc);
 #if defined (TARGET_SPARC64)
 static inline int cpu_has_hypervisor(CPUSPARCState *env1)
 {
-    return env1->def->features & CPU_FEATURE_HYPV;
+    return env1->def.features & CPU_FEATURE_HYPV;
 }
 
 static inline int cpu_hypervisor_mode(CPUSPARCState *env1)
@@ -664,6 +687,11 @@ static inline int cpu_hypervisor_mode(CPUSPARCState *env1)
 static inline int cpu_supervisor_mode(CPUSPARCState *env1)
 {
     return env1->pstate & PS_PRIV;
+}
+#else
+static inline int cpu_supervisor_mode(CPUSPARCState *env1)
+{
+    return env1->psrs;
 }
 #endif
 
@@ -683,10 +711,10 @@ static inline int cpu_mmu_index(CPUSPARCState *env, bool ifetch)
         ? (env->lsu & IMMU_E) == 0 || (env->pstate & PS_RED) != 0
         : (env->lsu & DMMU_E) == 0) {
         return MMU_PHYS_IDX;
+    } else if (cpu_hypervisor_mode(env)) {
+        return MMU_PHYS_IDX;
     } else if (env->tl > 0) {
         return MMU_NUCLEUS_IDX;
-    } else if (cpu_hypervisor_mode(env)) {
-        return MMU_HYPV_IDX;
     } else if (cpu_supervisor_mode(env)) {
         return MMU_KERNEL_IDX;
     } else {
@@ -701,8 +729,9 @@ static inline int cpu_interrupts_enabled(CPUSPARCState *env1)
     if (env1->psret != 0)
         return 1;
 #else
-    if (env1->pstate & PS_IE)
+    if ((env1->pstate & PS_IE) && !cpu_hypervisor_mode(env1)) {
         return 1;
+    }
 #endif
 
     return 0;
@@ -731,6 +760,8 @@ trap_state* cpu_tsptr(CPUSPARCState* env);
 #define TB_FLAG_MMU_MASK     7
 #define TB_FLAG_FPU_ENABLED  (1 << 4)
 #define TB_FLAG_AM_ENABLED   (1 << 5)
+#define TB_FLAG_SUPER        (1 << 6)
+#define TB_FLAG_HYPER        (1 << 7)
 #define TB_FLAG_ASI_SHIFT    24
 
 static inline void cpu_get_tb_cpu_state(CPUSPARCState *env, target_ulong *pc,
@@ -740,18 +771,28 @@ static inline void cpu_get_tb_cpu_state(CPUSPARCState *env, target_ulong *pc,
     *pc = env->pc;
     *cs_base = env->npc;
     flags = cpu_mmu_index(env, false);
+#ifndef CONFIG_USER_ONLY
+    if (cpu_supervisor_mode(env)) {
+        flags |= TB_FLAG_SUPER;
+    }
+#endif
 #ifdef TARGET_SPARC64
+#ifndef CONFIG_USER_ONLY
+    if (cpu_hypervisor_mode(env)) {
+        flags |= TB_FLAG_HYPER;
+    }
+#endif
     if (env->pstate & PS_AM) {
         flags |= TB_FLAG_AM_ENABLED;
     }
-    if ((env->def->features & CPU_FEATURE_FLOAT)
+    if ((env->def.features & CPU_FEATURE_FLOAT)
         && (env->pstate & PS_PEF)
         && (env->fprs & FPRS_FEF)) {
         flags |= TB_FLAG_FPU_ENABLED;
     }
     flags |= env->asi << TB_FLAG_ASI_SHIFT;
 #else
-    if ((env->def->features & CPU_FEATURE_FLOAT) && env->psref) {
+    if ((env->def.features & CPU_FEATURE_FLOAT) && env->psref) {
         flags |= TB_FLAG_FPU_ENABLED;
     }
 #endif

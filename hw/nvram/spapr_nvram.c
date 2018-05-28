@@ -141,9 +141,25 @@ static void rtas_nvram_store(PowerPCCPU *cpu, sPAPRMachineState *spapr,
 static void spapr_nvram_realize(VIOsPAPRDevice *dev, Error **errp)
 {
     sPAPRNVRAM *nvram = VIO_SPAPR_NVRAM(dev);
+    int ret;
 
     if (nvram->blk) {
-        nvram->size = blk_getlength(nvram->blk);
+        int64_t len = blk_getlength(nvram->blk);
+
+        if (len < 0) {
+            error_setg_errno(errp, -len,
+                             "could not get length of backing image");
+            return;
+        }
+
+        nvram->size = len;
+
+        ret = blk_set_perm(nvram->blk,
+                           BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                           BLK_PERM_ALL, errp);
+        if (ret < 0) {
+            return;
+        }
     } else {
         nvram->size = DEFAULT_NVRAM_SIZE;
     }
@@ -224,7 +240,7 @@ static const VMStateDescription vmstate_spapr_nvram = {
     .post_load = spapr_nvram_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(size, sPAPRNVRAM),
-        VMSTATE_VBUFFER_ALLOC_UINT32(buf, sPAPRNVRAM, 1, NULL, 0, size),
+        VMSTATE_VBUFFER_ALLOC_UINT32(buf, sPAPRNVRAM, 1, NULL, size),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -248,6 +264,8 @@ static void spapr_nvram_class_init(ObjectClass *klass, void *data)
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     dc->props = spapr_nvram_properties;
     dc->vmsd = &vmstate_spapr_nvram;
+    /* Reason: Internal device only, uses spapr_rtas_register() in realize() */
+    dc->user_creatable = false;
 }
 
 static const TypeInfo spapr_nvram_type_info = {

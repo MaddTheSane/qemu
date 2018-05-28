@@ -39,6 +39,7 @@ struct VirtIOBlkConf
     uint32_t config_wce;
     uint32_t request_merging;
     uint16_t num_queues;
+    uint16_t queue_size;
 };
 
 struct VirtIOBlockDataPlane;
@@ -80,6 +81,6 @@ typedef struct MultiReqBuffer {
     bool is_write;
 } MultiReqBuffer;
 
-void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq);
+bool virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq);
 
 #endif

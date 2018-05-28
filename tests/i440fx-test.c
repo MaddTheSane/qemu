@@ -38,7 +38,7 @@ static QPCIBus *test_start_get_bus(const TestData *s)
     cmdline = g_strdup_printf("-smp %d", s->num_cpus);
     qtest_start(cmdline);
     g_free(cmdline);
-    return qpci_init_pc(NULL);
+    return qpci_init_pc(global_qtest, NULL);
 }
 
 static void test_i440fx_defaults(gconstpointer opaque)
@@ -134,6 +134,8 @@ static void test_i440fx_defaults(gconstpointer opaque)
     /* 3.2.26 */
     g_assert_cmpint(qpci_config_readb(dev, 0x93), ==, 0x00); /* TRC */
 
+    g_free(dev);
+    qpci_free_pc(bus);
     qtest_end();
 }
 
@@ -270,6 +272,9 @@ static void test_i440fx_pam(gconstpointer opaque)
         /* Verify the area is not our new mask */
         g_assert(!verify_area(pam_area[i].start, pam_area[i].end, 0x82));
     }
+
+    g_free(dev);
+    qpci_free_pc(bus);
     qtest_end();
 }
 

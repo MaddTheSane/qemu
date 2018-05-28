@@ -127,7 +127,9 @@ void arm_handle_psci_call(ARMCPU *cpu)
                 break;
             }
             target_cpu = ARM_CPU(target_cpu_state);
-            ret = target_cpu->powered_off ? 1 : 0;
+
+            g_assert(qemu_mutex_iothread_locked());
+            ret = target_cpu->power_state;
             break;
         default:
             /* Everything above affinity level 0 is always on. */
@@ -135,7 +137,7 @@ void arm_handle_psci_call(ARMCPU *cpu)
         }
         break;
     case QEMU_PSCI_0_2_FN_SYSTEM_RESET:
-        qemu_system_reset_request();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         /* QEMU reset and shutdown are async requests, but PSCI
          * mandates that we never return from the reset/shutdown
          * call, so power the CPU off now so it doesn't execute
@@ -143,22 +145,33 @@ void arm_handle_psci_call(ARMCPU *cpu)
          */
         goto cpu_off;
     case QEMU_PSCI_0_2_FN_SYSTEM_OFF:
-        qemu_system_shutdown_request();
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         goto cpu_off;
     case QEMU_PSCI_0_1_FN_CPU_ON:
     case QEMU_PSCI_0_2_FN_CPU_ON:
     case QEMU_PSCI_0_2_FN64_CPU_ON:
+    {
+        /* The PSCI spec mandates that newly brought up CPUs start
+         * in the highest exception level which exists and is enabled
+         * on the calling CPU. Since the QEMU PSCI implementation is
+         * acting as a "fake EL3" or "fake EL2" firmware, this for us
+         * means that we want to start at the highest NS exception level
+         * that we are providing to the guest.
+         * The execution mode should be that which is currently in use
+         * by the same exception level on the calling CPU.
+         * The CPU should be started with the context_id value
+         * in x0 (if AArch64) or r0 (if AArch32).
+         */
+        int target_el = arm_feature(env, ARM_FEATURE_EL2) ? 2 : 1;
+        bool target_aarch64 = arm_el_is_aa64(env, target_el);
+
         mpidr = param[1];
         entry = param[2];
         context_id = param[3];
-        /*
-         * The PSCI spec mandates that newly brought up CPUs enter the
-         * exception level of the caller in the same execution mode as
-         * the caller, with context_id in x0/r0, respectively.
-         */
-        ret = arm_set_cpu_on(mpidr, entry, context_id, arm_current_el(env),
-                             is_a64(env));
+        ret = arm_set_cpu_on(mpidr, entry, context_id,
+                             target_el, target_aarch64);
         break;
+    }
     case QEMU_PSCI_0_1_FN_CPU_OFF:
     case QEMU_PSCI_0_2_FN_CPU_OFF:
         goto cpu_off;
@@ -176,7 +189,7 @@ void arm_handle_psci_call(ARMCPU *cpu)
         } else {
             env->regs[0] = 0;
         }
-        helper_wfi(env);
+        helper_wfi(env, 4);
         break;
     case QEMU_PSCI_0_1_FN_MIGRATE:
     case QEMU_PSCI_0_2_FN_MIGRATE:

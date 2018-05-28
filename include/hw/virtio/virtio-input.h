@@ -62,7 +62,10 @@ struct VirtIOInput {
     VirtQueue                         *evt, *sts;
     char                              *serial;
 
-    virtio_input_event                *queue;
+    struct {
+        virtio_input_event event;
+        VirtQueueElement *elem;
+    }                                 *queue;
     uint32_t                          qindex, qsize;
 
     bool                              active;
@@ -86,6 +89,7 @@ struct VirtIOInputHID {
     QemuInputHandler                  *handler;
     QemuInputHandlerState             *hs;
     int                               ledstate;
+    bool                              wheel_axis;
 };
 
 struct VirtIOInputHost {

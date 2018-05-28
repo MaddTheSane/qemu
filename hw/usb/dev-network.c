@@ -1324,7 +1324,7 @@ static void usbnet_cleanup(NetClientState *nc)
     s->nic = NULL;
 }
 
-static void usb_net_handle_destroy(USBDevice *dev)
+static void usb_net_unrealize(USBDevice *dev, Error **errp)
 {
     USBNetState *s = (USBNetState *) dev;
 
@@ -1382,31 +1382,6 @@ static void usb_net_instance_init(Object *obj)
                                   &dev->qdev, NULL);
 }
 
-static USBDevice *usb_net_init(USBBus *bus, const char *cmdline)
-{
-    Error *local_err = NULL;
-    USBDevice *dev;
-    QemuOpts *opts;
-    int idx;
-
-    opts = qemu_opts_parse_noisily(qemu_find_opts("net"), cmdline, false);
-    if (!opts) {
-        return NULL;
-    }
-    qemu_opt_set(opts, "type", "nic", &error_abort);
-    qemu_opt_set(opts, "model", "usb", &error_abort);
-
-    idx = net_client_init(opts, false, &local_err);
-    if (local_err) {
-        error_report_err(local_err);
-        return NULL;
-    }
-
-    dev = usb_create(bus, "usb-net");
-    qdev_set_nic_properties(&dev->qdev, &nd_table[idx]);
-    return dev;
-}
-
 static const VMStateDescription vmstate_usb_net = {
     .name = "usb-net",
     .unmigratable = 1,
@@ -1428,7 +1403,7 @@ static void usb_net_class_initfn(ObjectClass *klass, void *data)
     uc->handle_reset   = usb_net_handle_reset;
     uc->handle_control = usb_net_handle_control;
     uc->handle_data    = usb_net_handle_data;
-    uc->handle_destroy = usb_net_handle_destroy;
+    uc->unrealize      = usb_net_unrealize;
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
     dc->fw_name = "network";
     dc->vmsd = &vmstate_usb_net;
@@ -1446,7 +1421,6 @@ static const TypeInfo net_info = {
 static void usb_net_register_types(void)
 {
     type_register_static(&net_info);
-    usb_legacy_register(TYPE_USB_NET, "net", usb_net_init);
 }
 
 type_init(usb_net_register_types)

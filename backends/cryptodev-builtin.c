@@ -78,6 +78,7 @@ static void cryptodev_builtin_init(
               "cryptodev-builtin", NULL);
     cc->info_str = g_strdup_printf("cryptodev-builtin0");
     cc->queue_index = 0;
+    cc->type = CRYPTODEV_BACKEND_TYPE_BUILTIN;
     backend->conf.peers.ccs[0] = cc;
 
     backend->conf.crypto_services =
@@ -94,6 +95,8 @@ static void cryptodev_builtin_init(
     backend->conf.max_size = LONG_MAX - sizeof(CryptoDevBackendSymOpInfo);
     backend->conf.max_cipher_key_len = CRYPTODEV_BUITLIN_MAX_CIPHER_KEY_LEN;
     backend->conf.max_auth_key_len = CRYPTODEV_BUITLIN_MAX_AUTH_KEY_LEN;
+
+    cryptodev_backend_set_ready(backend, true);
 }
 
 static int
@@ -318,10 +321,12 @@ static int cryptodev_builtin_sym_operation(
 
     sess = builtin->sessions[op_info->session_id];
 
-    ret = qcrypto_cipher_setiv(sess->cipher, op_info->iv,
-                               op_info->iv_len, errp);
-    if (ret < 0) {
-        return -VIRTIO_CRYPTO_ERR;
+    if (op_info->iv_len > 0) {
+        ret = qcrypto_cipher_setiv(sess->cipher, op_info->iv,
+                                   op_info->iv_len, errp);
+        if (ret < 0) {
+            return -VIRTIO_CRYPTO_ERR;
+        }
     }
 
     if (sess->direction == VIRTIO_CRYPTO_OP_ENCRYPT) {
@@ -357,8 +362,6 @@ static void cryptodev_builtin_cleanup(
         }
     }
 
-    assert(queues == 1);
-
     for (i = 0; i < queues; i++) {
         cc = backend->conf.peers.ccs[i];
         if (cc) {
@@ -366,6 +369,8 @@ static void cryptodev_builtin_cleanup(
             backend->conf.peers.ccs[i] = NULL;
         }
     }
+
+    cryptodev_backend_set_ready(backend, false);
 }
 
 static void

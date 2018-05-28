@@ -97,6 +97,9 @@ typedef struct CPUTLGState {
     uint32_t sigcode;                  /* Signal code */
 #endif
 
+    /* Fields up to this point are cleared by a CPU reset */
+    struct {} end_reset_fields;
+
     CPU_COMMON
 } CPUTLGState;
 
@@ -161,9 +164,7 @@ static inline TileGXCPU *tilegx_env_get_cpu(CPUTLGState *env)
 void tilegx_tcg_init(void);
 int cpu_tilegx_signal_handler(int host_signum, void *pinfo, void *puc);
 
-TileGXCPU *cpu_tilegx_init(const char *cpu_model);
-
-#define cpu_init(cpu_model) CPU(cpu_tilegx_init(cpu_model))
+#define CPU_RESOLVING_TYPE TYPE_TILEGX_CPU
 
 #define cpu_signal_handler cpu_tilegx_signal_handler
 

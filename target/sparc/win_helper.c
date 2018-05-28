@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "cpu.h"
 #include "exec/exec-all.h"
 #include "exec/helper-proto.h"
@@ -82,6 +83,7 @@ void cpu_put_psr_raw(CPUSPARCState *env, target_ulong val)
 #endif
 }
 
+/* Called with BQL held */
 void cpu_put_psr(CPUSPARCState *env, target_ulong val)
 {
     cpu_put_psr_raw(env, val);
@@ -153,7 +155,10 @@ void helper_wrpsr(CPUSPARCState *env, target_ulong new_psr)
     if ((new_psr & PSR_CWP) >= env->nwindows) {
         cpu_raise_exception_ra(env, TT_ILL_INSN, GETPC());
     } else {
+        /* cpu_put_psr may trigger interrupts, hence BQL */
+        qemu_mutex_lock_iothread();
         cpu_put_psr(env, new_psr);
+        qemu_mutex_unlock_iothread();
     }
 }
 
@@ -290,6 +295,10 @@ void helper_wrcwp(CPUSPARCState *env, target_ulong new_cwp)
 
 static inline uint64_t *get_gregset(CPUSPARCState *env, uint32_t pstate)
 {
+    if (env->def.features & CPU_FEATURE_GL) {
+        return env->glregs + (env->gl & 7) * 8;
+    }
+
     switch (pstate) {
     default:
         trace_win_helper_gregset_error(pstate);
@@ -305,14 +314,40 @@ static inline uint64_t *get_gregset(CPUSPARCState *env, uint32_t pstate)
     }
 }
 
+static inline uint64_t *get_gl_gregset(CPUSPARCState *env, uint32_t gl)
+{
+    return env->glregs + (gl & 7) * 8;
+}
+
+/* Switch global register bank */
+void cpu_gl_switch_gregs(CPUSPARCState *env, uint32_t new_gl)
+{
+    uint64_t *src, *dst;
+    src = get_gl_gregset(env, new_gl);
+    dst = get_gl_gregset(env, env->gl);
+
+    if (src != dst) {
+        memcpy32(dst, env->gregs);
+        memcpy32(env->gregs, src);
+    }
+}
+
+void helper_wrgl(CPUSPARCState *env, target_ulong new_gl)
+{
+    cpu_gl_switch_gregs(env, new_gl & 7);
+    env->gl = new_gl & 7;
+}
+
 void cpu_change_pstate(CPUSPARCState *env, uint32_t new_pstate)
 {
     uint32_t pstate_regs, new_pstate_regs;
     uint64_t *src, *dst;
 
-    if (env->def->features & CPU_FEATURE_GL) {
-        /* PS_AG is not implemented in this case */
-        new_pstate &= ~PS_AG;
+    if (env->def.features & CPU_FEATURE_GL) {
+        /* PS_AG, IG and MG are not implemented in this case */
+        new_pstate &= ~(PS_AG | PS_IG | PS_MG);
+        env->pstate = new_pstate;
+        return;
     }
 
     pstate_regs = env->pstate & 0xc01;
@@ -338,7 +373,9 @@ void helper_wrpstate(CPUSPARCState *env, target_ulong new_state)
 
 #if !defined(CONFIG_USER_ONLY)
     if (cpu_interrupts_enabled(env)) {
+        qemu_mutex_lock_iothread();
         cpu_check_irqs(env);
+        qemu_mutex_unlock_iothread();
     }
 #endif
 }
@@ -351,7 +388,9 @@ void helper_wrpil(CPUSPARCState *env, target_ulong new_pil)
     env->psrpil = new_pil;
 
     if (cpu_interrupts_enabled(env)) {
+        qemu_mutex_lock_iothread();
         cpu_check_irqs(env);
+        qemu_mutex_unlock_iothread();
     }
 #endif
 }
@@ -366,13 +405,21 @@ void helper_done(CPUSPARCState *env)
     env->asi = (tsptr->tstate >> 24) & 0xff;
     cpu_change_pstate(env, (tsptr->tstate >> 8) & 0xf3f);
     cpu_put_cwp64(env, tsptr->tstate & 0xff);
+    if (cpu_has_hypervisor(env)) {
+        uint32_t new_gl = (tsptr->tstate >> 40) & 7;
+        env->hpstate = env->htstate[env->tl];
+        cpu_gl_switch_gregs(env, new_gl);
+        env->gl = new_gl;
+    }
     env->tl--;
 
     trace_win_helper_done(env->tl);
 
 #if !defined(CONFIG_USER_ONLY)
     if (cpu_interrupts_enabled(env)) {
+        qemu_mutex_lock_iothread();
         cpu_check_irqs(env);
+        qemu_mutex_unlock_iothread();
     }
 #endif
 }
@@ -387,13 +434,21 @@ void helper_retry(CPUSPARCState *env)
     env->asi = (tsptr->tstate >> 24) & 0xff;
     cpu_change_pstate(env, (tsptr->tstate >> 8) & 0xf3f);
     cpu_put_cwp64(env, tsptr->tstate & 0xff);
+    if (cpu_has_hypervisor(env)) {
+        uint32_t new_gl = (tsptr->tstate >> 40) & 7;
+        env->hpstate = env->htstate[env->tl];
+        cpu_gl_switch_gregs(env, new_gl);
+        env->gl = new_gl;
+    }
     env->tl--;
 
     trace_win_helper_retry(env->tl);
 
 #if !defined(CONFIG_USER_ONLY)
     if (cpu_interrupts_enabled(env)) {
+        qemu_mutex_lock_iothread();
         cpu_check_irqs(env);
+        qemu_mutex_unlock_iothread();
     }
 #endif
 }

@@ -24,6 +24,7 @@
 
 #include "helper_regs.h"
 #include "exec/cpu_ldst.h"
+#include "internal.h"
 
 //#define DEBUG_OP
 
@@ -110,7 +111,7 @@ void helper_lswx(CPUPPCState *env, target_ulong addr, uint32_t reg,
                  uint32_t ra, uint32_t rb)
 {
     if (likely(xer_bc != 0)) {
-        int num_used_regs = (xer_bc + 3) / 4;
+        int num_used_regs = DIV_ROUND_UP(xer_bc, 4);
         if (unlikely((ra != 0 && lsw_reg_in_range(reg, num_used_regs, ra)) ||
                      lsw_reg_in_range(reg, num_used_regs, rb))) {
             raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
@@ -283,6 +284,71 @@ STVE(stvehx, cpu_stw_data_ra, bswap16, u16)
 STVE(stvewx, cpu_stl_data_ra, bswap32, u32)
 #undef I
 #undef LVE
+
+#ifdef TARGET_PPC64
+#define GET_NB(rb) ((rb >> 56) & 0xFF)
+
+#define VSX_LXVL(name, lj)                                              \
+void helper_##name(CPUPPCState *env, target_ulong addr,                 \
+                   target_ulong xt_num, target_ulong rb)                \
+{                                                                       \
+    int i;                                                              \
+    ppc_vsr_t xt;                                                       \
+    uint64_t nb = GET_NB(rb);                                           \
+                                                                        \
+    xt.s128 = int128_zero();                                            \
+    if (nb) {                                                           \
+        nb = (nb >= 16) ? 16 : nb;                                      \
+        if (msr_le && !lj) {                                            \
+            for (i = 16; i > 16 - nb; i--) {                            \
+                xt.VsrB(i - 1) = cpu_ldub_data_ra(env, addr, GETPC());  \
+                addr = addr_add(env, addr, 1);                          \
+            }                                                           \
+        } else {                                                        \
+            for (i = 0; i < nb; i++) {                                  \
+                xt.VsrB(i) = cpu_ldub_data_ra(env, addr, GETPC());      \
+                addr = addr_add(env, addr, 1);                          \
+            }                                                           \
+        }                                                               \
+    }                                                                   \
+    putVSR(xt_num, &xt, env);                                           \
+}
+
+VSX_LXVL(lxvl, 0)
+VSX_LXVL(lxvll, 1)
+#undef VSX_LXVL
+
+#define VSX_STXVL(name, lj)                                       \
+void helper_##name(CPUPPCState *env, target_ulong addr,           \
+                   target_ulong xt_num, target_ulong rb)          \
+{                                                                 \
+    int i;                                                        \
+    ppc_vsr_t xt;                                                 \
+    target_ulong nb = GET_NB(rb);                                 \
+                                                                  \
+    if (!nb) {                                                    \
+        return;                                                   \
+    }                                                             \
+    getVSR(xt_num, &xt, env);                                     \
+    nb = (nb >= 16) ? 16 : nb;                                    \
+    if (msr_le && !lj) {                                          \
+        for (i = 16; i > 16 - nb; i--) {                          \
+            cpu_stb_data_ra(env, addr, xt.VsrB(i - 1), GETPC());  \
+            addr = addr_add(env, addr, 1);                        \
+        }                                                         \
+    } else {                                                      \
+        for (i = 0; i < nb; i++) {                                \
+            cpu_stb_data_ra(env, addr, xt.VsrB(i), GETPC());      \
+            addr = addr_add(env, addr, 1);                        \
+        }                                                         \
+    }                                                             \
+}
+
+VSX_STXVL(stxvl, 0)
+VSX_STXVL(stxvll, 1)
+#undef VSX_STXVL
+#undef GET_NB
+#endif /* TARGET_PPC64 */
 
 #undef HI_IDX
 #undef LO_IDX

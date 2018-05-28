@@ -11,12 +11,19 @@
 #ifndef VHOST_BACKEND_H
 #define VHOST_BACKEND_H
 
+#include "exec/memory.h"
+
 typedef enum VhostBackendType {
     VHOST_BACKEND_TYPE_NONE = 0,
     VHOST_BACKEND_TYPE_KERNEL = 1,
     VHOST_BACKEND_TYPE_USER = 2,
     VHOST_BACKEND_TYPE_MAX = 3,
 } VhostBackendType;
+
+typedef enum VhostSetConfigType {
+    VHOST_SET_CONFIG_TYPE_MASTER = 0,
+    VHOST_SET_CONFIG_TYPE_MIGRATION = 1,
+} VhostSetConfigType;
 
 struct vhost_dev;
 struct vhost_log;
@@ -25,6 +32,7 @@ struct vhost_vring_file;
 struct vhost_vring_state;
 struct vhost_vring_addr;
 struct vhost_scsi_target;
+struct vhost_iotlb_msg;
 
 typedef int (*vhost_backend_init)(struct vhost_dev *dev, void *opaque);
 typedef int (*vhost_backend_cleanup)(struct vhost_dev *dev);
@@ -32,6 +40,7 @@ typedef int (*vhost_backend_memslots_limit)(struct vhost_dev *dev);
 
 typedef int (*vhost_net_set_backend_op)(struct vhost_dev *dev,
                                 struct vhost_vring_file *file);
+typedef int (*vhost_net_set_mtu_op)(struct vhost_dev *dev, uint16_t mtu);
 typedef int (*vhost_scsi_set_endpoint_op)(struct vhost_dev *dev,
                                   struct vhost_scsi_target *target);
 typedef int (*vhost_scsi_clear_endpoint_op)(struct vhost_dev *dev,
@@ -76,6 +85,21 @@ typedef bool (*vhost_backend_can_merge_op)(struct vhost_dev *dev,
 typedef int (*vhost_vsock_set_guest_cid_op)(struct vhost_dev *dev,
                                             uint64_t guest_cid);
 typedef int (*vhost_vsock_set_running_op)(struct vhost_dev *dev, int start);
+typedef void (*vhost_set_iotlb_callback_op)(struct vhost_dev *dev,
+                                           int enabled);
+typedef int (*vhost_send_device_iotlb_msg_op)(struct vhost_dev *dev,
+                                              struct vhost_iotlb_msg *imsg);
+typedef int (*vhost_set_config_op)(struct vhost_dev *dev, const uint8_t *data,
+                                   uint32_t offset, uint32_t size,
+                                   uint32_t flags);
+typedef int (*vhost_get_config_op)(struct vhost_dev *dev, uint8_t *config,
+                                   uint32_t config_len);
+
+typedef int (*vhost_crypto_create_session_op)(struct vhost_dev *dev,
+                                              void *session_info,
+                                              uint64_t *session_id);
+typedef int (*vhost_crypto_close_session_op)(struct vhost_dev *dev,
+                                             uint64_t session_id);
 
 typedef struct VhostOps {
     VhostBackendType backend_type;
@@ -83,6 +107,7 @@ typedef struct VhostOps {
     vhost_backend_cleanup vhost_backend_cleanup;
     vhost_backend_memslots_limit vhost_backend_memslots_limit;
     vhost_net_set_backend_op vhost_net_set_backend;
+    vhost_net_set_mtu_op vhost_net_set_mtu;
     vhost_scsi_set_endpoint_op vhost_scsi_set_endpoint;
     vhost_scsi_clear_endpoint_op vhost_scsi_clear_endpoint;
     vhost_scsi_get_abi_version_op vhost_scsi_get_abi_version;
@@ -107,11 +132,28 @@ typedef struct VhostOps {
     vhost_backend_can_merge_op vhost_backend_can_merge;
     vhost_vsock_set_guest_cid_op vhost_vsock_set_guest_cid;
     vhost_vsock_set_running_op vhost_vsock_set_running;
+    vhost_set_iotlb_callback_op vhost_set_iotlb_callback;
+    vhost_send_device_iotlb_msg_op vhost_send_device_iotlb_msg;
+    vhost_get_config_op vhost_get_config;
+    vhost_set_config_op vhost_set_config;
+    vhost_crypto_create_session_op vhost_crypto_create_session;
+    vhost_crypto_close_session_op vhost_crypto_close_session;
 } VhostOps;
 
 extern const VhostOps user_ops;
 
 int vhost_set_backend_type(struct vhost_dev *dev,
                            VhostBackendType backend_type);
+
+int vhost_backend_update_device_iotlb(struct vhost_dev *dev,
+                                             uint64_t iova, uint64_t uaddr,
+                                             uint64_t len,
+                                             IOMMUAccessFlags perm);
+
+int vhost_backend_invalidate_device_iotlb(struct vhost_dev *dev,
+                                                 uint64_t iova, uint64_t len);
+
+int vhost_backend_handle_iotlb_msg(struct vhost_dev *dev,
+                                          struct vhost_iotlb_msg *imsg);
 
 #endif /* VHOST_BACKEND_H */

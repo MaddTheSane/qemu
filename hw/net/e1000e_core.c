@@ -632,18 +632,18 @@ e1000e_rss_parse_packet(E1000ECore *core,
 static void
 e1000e_setup_tx_offloads(E1000ECore *core, struct e1000e_tx *tx)
 {
-    if (tx->props.tse && tx->props.cptse) {
+    if (tx->props.tse && tx->cptse) {
         net_tx_pkt_build_vheader(tx->tx_pkt, true, true, tx->props.mss);
         net_tx_pkt_update_ip_checksums(tx->tx_pkt);
         e1000x_inc_reg_if_not_full(core->mac, TSCTC);
         return;
     }
 
-    if (tx->props.sum_needed & E1000_TXD_POPTS_TXSM) {
+    if (tx->sum_needed & E1000_TXD_POPTS_TXSM) {
         net_tx_pkt_build_vheader(tx->tx_pkt, false, true, 0);
     }
 
-    if (tx->props.sum_needed & E1000_TXD_POPTS_IXSM) {
+    if (tx->sum_needed & E1000_TXD_POPTS_IXSM) {
         net_tx_pkt_update_ip_hdr_checksum(tx->tx_pkt);
     }
 }
@@ -715,13 +715,13 @@ e1000e_process_tx_desc(E1000ECore *core,
         return;
     } else if (dtype == (E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D)) {
         /* data descriptor */
-        tx->props.sum_needed = le32_to_cpu(dp->upper.data) >> 8;
-        tx->props.cptse = (txd_lower & E1000_TXD_CMD_TSE) ? 1 : 0;
+        tx->sum_needed = le32_to_cpu(dp->upper.data) >> 8;
+        tx->cptse = (txd_lower & E1000_TXD_CMD_TSE) ? 1 : 0;
         e1000e_process_ts_option(core, dp);
     } else {
         /* legacy descriptor */
         e1000e_process_ts_option(core, dp);
-        tx->props.cptse = 0;
+        tx->cptse = 0;
     }
 
     addr = le64_to_cpu(dp->buffer_addr);
@@ -747,8 +747,8 @@ e1000e_process_tx_desc(E1000ECore *core,
         tx->skip_cp = false;
         net_tx_pkt_reset(tx->tx_pkt);
 
-        tx->props.sum_needed = 0;
-        tx->props.cptse = 0;
+        tx->sum_needed = 0;
+        tx->cptse = 0;
     }
 }
 
@@ -806,7 +806,8 @@ typedef struct E1000E_RingInfo_st {
 static inline bool
 e1000e_ring_empty(E1000ECore *core, const E1000E_RingInfo *r)
 {
-    return core->mac[r->dh] == core->mac[r->dt];
+    return core->mac[r->dh] == core->mac[r->dt] ||
+                core->mac[r->dt] >= core->mac[r->dlen] / E1000_RING_DESC_LEN;
 }
 
 static inline uint64_t
@@ -1507,6 +1508,7 @@ e1000e_write_packet_to_guest(E1000ECore *core, struct NetRxPkt *pkt,
     const E1000E_RingInfo *rxi;
     size_t ps_hdr_len = 0;
     bool do_ps = e1000e_do_ps(core, pkt, &ps_hdr_len);
+    bool is_first = true;
 
     rxi = rxr->i;
 
@@ -1514,12 +1516,15 @@ e1000e_write_packet_to_guest(E1000ECore *core, struct NetRxPkt *pkt,
         hwaddr ba[MAX_PS_BUFFERS];
         e1000e_ba_state bastate = { { 0 } };
         bool is_last = false;
-        bool is_first = true;
 
         desc_size = total_size - desc_offset;
 
         if (desc_size > core->rx_desc_buf_size) {
             desc_size = core->rx_desc_buf_size;
+        }
+
+        if (e1000e_ring_empty(core, rxi)) {
+            return;
         }
 
         base = e1000e_ring_head_descr(core, rxi);
@@ -2449,14 +2454,20 @@ e1000e_set_ics(E1000ECore *core, int index, uint32_t val)
 static void
 e1000e_set_icr(E1000ECore *core, int index, uint32_t val)
 {
+    uint32_t icr = 0;
     if ((core->mac[ICR] & E1000_ICR_ASSERTED) &&
         (core->mac[CTRL_EXT] & E1000_CTRL_EXT_IAME)) {
         trace_e1000e_irq_icr_process_iame();
         e1000e_clear_ims_bits(core, core->mac[IAM]);
     }
 
-    trace_e1000e_irq_icr_write(val, core->mac[ICR], core->mac[ICR] & ~val);
-    core->mac[ICR] &= ~val;
+    icr = core->mac[ICR] & ~val;
+    /* Windows driver expects that the "receive overrun" bit and other
+     * ones to be cleared when the "Other" bit (#24) is cleared.
+     */
+    icr = (val & E1000_ICR_OTHER) ? (icr & ~E1000_ICR_OTHER_CAUSES) : icr;
+    trace_e1000e_irq_icr_write(val, core->mac[ICR], icr);
+    core->mac[ICR] = icr;
     e1000e_update_interrupt_state(core);
 }
 
@@ -2844,7 +2855,7 @@ static uint32_t (*e1000e_macreg_readops[])(E1000ECore *, int) = {
     e1000e_getreg(RDLEN0),
     e1000e_getreg(RDH1),
     e1000e_getreg(LATECOL),
-    e1000e_getreg(SEC),
+    e1000e_getreg(SEQEC),
     e1000e_getreg(XONTXC),
     e1000e_getreg(WUS),
     e1000e_getreg(GORCL),

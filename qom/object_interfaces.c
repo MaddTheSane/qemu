@@ -1,10 +1,12 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qerror.h"
 #include "qom/object_interfaces.h"
 #include "qemu/module.h"
-#include "qapi-visit.h"
-#include "qapi/qobject-output-visitor.h"
+#include "qemu/option.h"
 #include "qapi/opts-visitor.h"
+#include "qemu/config-file.h"
 
 void user_creatable_complete(Object *obj, Error **errp)
 {
@@ -23,68 +25,17 @@ void user_creatable_complete(Object *obj, Error **errp)
     }
 }
 
-bool user_creatable_can_be_deleted(UserCreatable *uc, Error **errp)
+bool user_creatable_can_be_deleted(UserCreatable *uc)
 {
 
     UserCreatableClass *ucc = USER_CREATABLE_GET_CLASS(uc);
 
     if (ucc->can_be_deleted) {
-        return ucc->can_be_deleted(uc, errp);
+        return ucc->can_be_deleted(uc);
     } else {
         return true;
     }
 }
-
-
-Object *user_creatable_add(const QDict *qdict,
-                           Visitor *v, Error **errp)
-{
-    char *type = NULL;
-    char *id = NULL;
-    Object *obj = NULL;
-    Error *local_err = NULL;
-    QDict *pdict;
-
-    pdict = qdict_clone_shallow(qdict);
-
-    visit_start_struct(v, NULL, NULL, 0, &local_err);
-    if (local_err) {
-        goto out;
-    }
-
-    qdict_del(pdict, "qom-type");
-    visit_type_str(v, "qom-type", &type, &local_err);
-    if (local_err) {
-        goto out_visit;
-    }
-
-    qdict_del(pdict, "id");
-    visit_type_str(v, "id", &id, &local_err);
-    if (local_err) {
-        goto out_visit;
-    }
-    visit_check_struct(v, &local_err);
-    if (local_err) {
-        goto out_visit;
-    }
-
-    obj = user_creatable_add_type(type, id, pdict, v, &local_err);
-
-out_visit:
-    visit_end_struct(v, NULL);
-
-out:
-    QDECREF(pdict);
-    g_free(id);
-    g_free(type);
-    if (local_err) {
-        error_propagate(errp, local_err);
-        object_unref(obj);
-        return NULL;
-    }
-    return obj;
-}
-
 
 Object *user_creatable_add_type(const char *type, const char *id,
                                 const QDict *qdict,
@@ -158,14 +109,32 @@ Object *user_creatable_add_opts(QemuOpts *opts, Error **errp)
 {
     Visitor *v;
     QDict *pdict;
-    Object *obj = NULL;
+    Object *obj;
+    const char *id = qemu_opts_id(opts);
+    char *type = qemu_opt_get_del(opts, "qom-type");
 
-    v = opts_visitor_new(opts);
+    if (!type) {
+        error_setg(errp, QERR_MISSING_PARAMETER, "qom-type");
+        return NULL;
+    }
+    if (!id) {
+        error_setg(errp, QERR_MISSING_PARAMETER, "id");
+        qemu_opt_set(opts, "qom-type", type, &error_abort);
+        g_free(type);
+        return NULL;
+    }
+
+    qemu_opts_set_id(opts, NULL);
     pdict = qemu_opts_to_qdict(opts, NULL);
 
-    obj = user_creatable_add(pdict, v, errp);
+    v = opts_visitor_new(opts);
+    obj = user_creatable_add_type(type, id, pdict, v, errp);
     visit_free(v);
-    QDECREF(pdict);
+
+    qemu_opts_set_id(opts, (char *) id);
+    qemu_opt_set(opts, "qom-type", type, &error_abort);
+    g_free(type);
+    qobject_unref(pdict);
     return obj;
 }
 
@@ -205,11 +174,24 @@ void user_creatable_del(const char *id, Error **errp)
         return;
     }
 
-    if (!user_creatable_can_be_deleted(USER_CREATABLE(obj), errp)) {
+    if (!user_creatable_can_be_deleted(USER_CREATABLE(obj))) {
         error_setg(errp, "object '%s' is in use, can not be deleted", id);
         return;
     }
+
+    /*
+     * if object was defined on the command-line, remove its corresponding
+     * option group entry
+     */
+    qemu_opts_del(qemu_opts_find(qemu_find_opts_err("object", &error_abort),
+                                 id));
+
     object_unparent(obj);
+}
+
+void user_creatable_cleanup(void)
+{
+    object_unparent(object_get_objects_root());
 }
 
 static void register_types(void)

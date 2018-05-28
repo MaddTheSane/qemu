@@ -79,7 +79,7 @@ int qemu_init_main_loop(Error **errp);
  *
  * @nonblocking: Whether the caller should block until an event occurs.
  */
-int main_loop_wait(int nonblocking);
+void main_loop_wait(int nonblocking);
 
 /**
  * qemu_get_aio_context: Return the main loop's AioContext
@@ -202,6 +202,21 @@ void qemu_set_fd_handler(int fd,
                          IOHandler *fd_read,
                          IOHandler *fd_write,
                          void *opaque);
+
+
+/**
+ * event_notifier_set_handler: Register an EventNotifier with the main loop
+ *
+ * This function tells the main loop to wake up whenever the
+ * #EventNotifier was set.
+ *
+ * @e: The #EventNotifier to be observed.
+ *
+ * @handler: A level-triggered callback that is fired when @e
+ * has been set.  @e is passed to it as a parameter.
+ */
+void event_notifier_set_handler(EventNotifier *e,
+                                EventNotifierHandler *handler);
 
 GSource *iohandler_get_g_source(void);
 AioContext *iohandler_get_aio_context(void);

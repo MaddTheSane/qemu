@@ -49,11 +49,30 @@
 #include <libutil.h>
 #endif
 
+#ifdef __NetBSD__
+#include <sys/sysctl.h>
+#endif
+
 #include "qemu/mmap-alloc.h"
 
 #ifdef CONFIG_DEBUG_STACK_USAGE
 #include "qemu/error-report.h"
 #endif
+
+#define MAX_MEM_PREALLOC_THREAD_COUNT 16
+
+struct MemsetThread {
+    char *addr;
+    size_t numpages;
+    size_t hpagesize;
+    QemuThread pgthread;
+    sigjmp_buf env;
+};
+typedef struct MemsetThread MemsetThread;
+
+static MemsetThread *memset_thread;
+static int memset_num_threads;
+static bool memset_thread_failed;
 
 int qemu_get_thread_id(void)
 {
@@ -86,7 +105,7 @@ void *qemu_try_memalign(size_t alignment, size_t size)
         alignment = sizeof(void*);
     }
 
-#if defined(_POSIX_C_SOURCE) && !defined(__sun__)
+#if defined(CONFIG_POSIX_MEMALIGN)
     int ret;
     ret = posix_memalign(&ptr, alignment, size);
     if (ret != 0) {
@@ -108,10 +127,10 @@ void *qemu_memalign(size_t alignment, size_t size)
 }
 
 /* alloc shared memory pages */
-void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment)
+void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared)
 {
     size_t align = QEMU_VMALLOC_ALIGN;
-    void *ptr = qemu_ram_mmap(-1, size, align, false);
+    void *ptr = qemu_ram_mmap(-1, size, align, shared);
 
     if (ptr == MAP_FAILED) {
         return NULL;
@@ -167,7 +186,9 @@ void qemu_set_cloexec(int fd)
 {
     int f;
     f = fcntl(fd, F_GETFD);
-    fcntl(fd, F_SETFD, f | FD_CLOEXEC);
+    assert(f != -1);
+    f = fcntl(fd, F_SETFD, f | FD_CLOEXEC);
+    assert(f != -1);
 }
 
 /*
@@ -190,53 +211,6 @@ int qemu_pipe(int pipefd[2])
     }
 
     return ret;
-}
-
-int qemu_utimens(const char *path, const struct timespec *times)
-{
-    struct timeval tv[2], tv_now;
-    struct stat st;
-    int i;
-#ifdef CONFIG_UTIMENSAT
-    int ret;
-
-    ret = utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW);
-    if (ret != -1 || errno != ENOSYS) {
-        return ret;
-    }
-#endif
-    /* Fallback: use utimes() instead of utimensat() */
-
-    /* happy if special cases */
-    if (times[0].tv_nsec == UTIME_OMIT && times[1].tv_nsec == UTIME_OMIT) {
-        return 0;
-    }
-    if (times[0].tv_nsec == UTIME_NOW && times[1].tv_nsec == UTIME_NOW) {
-        return utimes(path, NULL);
-    }
-
-    /* prepare for hard cases */
-    if (times[0].tv_nsec == UTIME_NOW || times[1].tv_nsec == UTIME_NOW) {
-        gettimeofday(&tv_now, NULL);
-    }
-    if (times[0].tv_nsec == UTIME_OMIT || times[1].tv_nsec == UTIME_OMIT) {
-        stat(path, &st);
-    }
-
-    for (i = 0; i < 2; i++) {
-        if (times[i].tv_nsec == UTIME_NOW) {
-            tv[i].tv_sec = tv_now.tv_sec;
-            tv[i].tv_usec = tv_now.tv_usec;
-        } else if (times[i].tv_nsec == UTIME_OMIT) {
-            tv[i].tv_sec = (i == 0) ? st.st_atime : st.st_mtime;
-            tv[i].tv_usec = 0;
-        } else {
-            tv[i].tv_sec = times[i].tv_sec;
-            tv[i].tv_usec = times[i].tv_nsec / 1000;
-        }
-    }
-
-    return utimes(path, &tv[0]);
 }
 
 char *
@@ -280,9 +254,14 @@ void qemu_init_exec_dir(const char *argv0)
             p = buf;
         }
     }
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) \
+      || (defined(__NetBSD__) && defined(KERN_PROC_PATHNAME))
     {
+#if defined(__FreeBSD__)
         static int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+#else
+        static int mib[4] = {CTL_KERN, KERN_PROC_ARGS, -1, KERN_PROC_PATHNAME};
+#endif
         size_t len = sizeof(buf) - 1;
 
         *buf = '\0';
@@ -316,18 +295,108 @@ char *qemu_get_exec_dir(void)
     return g_strdup(exec_dir);
 }
 
-static sigjmp_buf sigjump;
-
 static void sigbus_handler(int signal)
 {
-    siglongjmp(sigjump, 1);
+    int i;
+    if (memset_thread) {
+        for (i = 0; i < memset_num_threads; i++) {
+            if (qemu_thread_is_self(&memset_thread[i].pgthread)) {
+                siglongjmp(memset_thread[i].env, 1);
+            }
+        }
+    }
 }
 
-void os_mem_prealloc(int fd, char *area, size_t memory, Error **errp)
+static void *do_touch_pages(void *arg)
+{
+    MemsetThread *memset_args = (MemsetThread *)arg;
+    sigset_t set, oldset;
+
+    /* unblock SIGBUS */
+    sigemptyset(&set);
+    sigaddset(&set, SIGBUS);
+    pthread_sigmask(SIG_UNBLOCK, &set, &oldset);
+
+    if (sigsetjmp(memset_args->env, 1)) {
+        memset_thread_failed = true;
+    } else {
+        char *addr = memset_args->addr;
+        size_t numpages = memset_args->numpages;
+        size_t hpagesize = memset_args->hpagesize;
+        size_t i;
+        for (i = 0; i < numpages; i++) {
+            /*
+             * Read & write back the same value, so we don't
+             * corrupt existing user/app data that might be
+             * stored.
+             *
+             * 'volatile' to stop compiler optimizing this away
+             * to a no-op
+             *
+             * TODO: get a better solution from kernel so we
+             * don't need to write at all so we don't cause
+             * wear on the storage backing the region...
+             */
+            *(volatile char *)addr = *addr;
+            addr += hpagesize;
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+    return NULL;
+}
+
+static inline int get_memset_num_threads(int smp_cpus)
+{
+    long host_procs = sysconf(_SC_NPROCESSORS_ONLN);
+    int ret = 1;
+
+    if (host_procs > 0) {
+        ret = MIN(MIN(host_procs, MAX_MEM_PREALLOC_THREAD_COUNT), smp_cpus);
+    }
+    /* In case sysconf() fails, we fall back to single threaded */
+    return ret;
+}
+
+static bool touch_all_pages(char *area, size_t hpagesize, size_t numpages,
+                            int smp_cpus)
+{
+    size_t numpages_per_thread;
+    size_t size_per_thread;
+    char *addr = area;
+    int i = 0;
+
+    memset_thread_failed = false;
+    memset_num_threads = get_memset_num_threads(smp_cpus);
+    memset_thread = g_new0(MemsetThread, memset_num_threads);
+    numpages_per_thread = (numpages / memset_num_threads);
+    size_per_thread = (hpagesize * numpages_per_thread);
+    for (i = 0; i < memset_num_threads; i++) {
+        memset_thread[i].addr = addr;
+        memset_thread[i].numpages = (i == (memset_num_threads - 1)) ?
+                                    numpages : numpages_per_thread;
+        memset_thread[i].hpagesize = hpagesize;
+        qemu_thread_create(&memset_thread[i].pgthread, "touch_pages",
+                           do_touch_pages, &memset_thread[i],
+                           QEMU_THREAD_JOINABLE);
+        addr += size_per_thread;
+        numpages -= numpages_per_thread;
+    }
+    for (i = 0; i < memset_num_threads; i++) {
+        qemu_thread_join(&memset_thread[i].pgthread);
+    }
+    g_free(memset_thread);
+    memset_thread = NULL;
+
+    return memset_thread_failed;
+}
+
+void os_mem_prealloc(int fd, char *area, size_t memory, int smp_cpus,
+                     Error **errp)
 {
     int ret;
     struct sigaction act, oldact;
-    sigset_t set, oldset;
+    size_t hpagesize = qemu_fd_getpagesize(fd);
+    size_t numpages = DIV_ROUND_UP(memory, hpagesize);
 
     memset(&act, 0, sizeof(act));
     act.sa_handler = &sigbus_handler;
@@ -340,23 +409,10 @@ void os_mem_prealloc(int fd, char *area, size_t memory, Error **errp)
         return;
     }
 
-    /* unblock SIGBUS */
-    sigemptyset(&set);
-    sigaddset(&set, SIGBUS);
-    pthread_sigmask(SIG_UNBLOCK, &set, &oldset);
-
-    if (sigsetjmp(sigjump, 1)) {
+    /* touch pages simultaneously */
+    if (touch_all_pages(area, hpagesize, numpages, smp_cpus)) {
         error_setg(errp, "os_mem_prealloc: Insufficient free host memory "
-            "pages available to allocate guest RAM\n");
-    } else {
-        int i;
-        size_t hpagesize = qemu_fd_getpagesize(fd);
-        size_t numpages = DIV_ROUND_UP(memory, hpagesize);
-
-        /* MAP_POPULATE silently ignores failures */
-        for (i = 0; i < numpages; i++) {
-            memset(area + (hpagesize * i), 0, 1);
-        }
+            "pages available to allocate guest RAM");
     }
 
     ret = sigaction(SIGBUS, &oldact, NULL);
@@ -365,73 +421,6 @@ void os_mem_prealloc(int fd, char *area, size_t memory, Error **errp)
         perror("os_mem_prealloc: failed to reinstall signal handler");
         exit(1);
     }
-    pthread_sigmask(SIG_SETMASK, &oldset, NULL);
-}
-
-
-static struct termios oldtty;
-
-static void term_exit(void)
-{
-    tcsetattr(0, TCSANOW, &oldtty);
-}
-
-static void term_init(void)
-{
-    struct termios tty;
-
-    tcgetattr(0, &tty);
-    oldtty = tty;
-
-    tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP
-                          |INLCR|IGNCR|ICRNL|IXON);
-    tty.c_oflag |= OPOST;
-    tty.c_lflag &= ~(ECHO|ECHONL|ICANON|IEXTEN);
-    tty.c_cflag &= ~(CSIZE|PARENB);
-    tty.c_cflag |= CS8;
-    tty.c_cc[VMIN] = 1;
-    tty.c_cc[VTIME] = 0;
-
-    tcsetattr(0, TCSANOW, &tty);
-
-    atexit(term_exit);
-}
-
-int qemu_read_password(char *buf, int buf_size)
-{
-    uint8_t ch;
-    int i, ret;
-
-    printf("password: ");
-    fflush(stdout);
-    term_init();
-    i = 0;
-    for (;;) {
-        ret = read(0, &ch, 1);
-        if (ret == -1) {
-            if (errno == EAGAIN || errno == EINTR) {
-                continue;
-            } else {
-                break;
-            }
-        } else if (ret == 0) {
-            ret = -1;
-            break;
-        } else {
-            if (ch == '\r' ||
-                ch == '\n') {
-                ret = 0;
-                break;
-            }
-            if (i < (buf_size - 1)) {
-                buf[i++] = ch;
-            }
-        }
-    }
-    term_exit();
-    buf[i] = '\0';
-    printf("\n");
-    return ret;
 }
 
 
@@ -551,6 +540,7 @@ void *qemu_alloc_stack(size_t *sz)
     ptr = mmap(NULL, *sz, PROT_READ | PROT_WRITE,
                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ptr == MAP_FAILED) {
+        perror("failed to allocate memory for stack");
         abort();
     }
 
@@ -565,6 +555,7 @@ void *qemu_alloc_stack(size_t *sz)
     guardpage = ptr;
 #endif
     if (mprotect(guardpage, pagesz, PROT_NONE) != 0) {
+        perror("failed to set up stack guard page");
         abort();
     }
 
@@ -602,4 +593,35 @@ void qemu_free_stack(void *stack, size_t sz)
 #endif
 
     munmap(stack, sz);
+}
+
+void sigaction_invoke(struct sigaction *action,
+                      struct qemu_signalfd_siginfo *info)
+{
+    siginfo_t si = {};
+    si.si_signo = info->ssi_signo;
+    si.si_errno = info->ssi_errno;
+    si.si_code = info->ssi_code;
+
+    /* Convert the minimal set of fields defined by POSIX.
+     * Positive si_code values are reserved for kernel-generated
+     * signals, where the valid siginfo fields are determined by
+     * the signal number.  But according to POSIX, it is unspecified
+     * whether SI_USER and SI_QUEUE have values less than or equal to
+     * zero.
+     */
+    if (info->ssi_code == SI_USER || info->ssi_code == SI_QUEUE ||
+        info->ssi_code <= 0) {
+        /* SIGTERM, etc.  */
+        si.si_pid = info->ssi_pid;
+        si.si_uid = info->ssi_uid;
+    } else if (info->ssi_signo == SIGILL || info->ssi_signo == SIGFPE ||
+               info->ssi_signo == SIGSEGV || info->ssi_signo == SIGBUS) {
+        si.si_addr = (void *)(uintptr_t)info->ssi_addr;
+    } else if (info->ssi_signo == SIGCHLD) {
+        si.si_pid = info->ssi_pid;
+        si.si_status = info->ssi_status;
+        si.si_uid = info->ssi_uid;
+    }
+    action->sa_sigaction(info->ssi_signo, &si, NULL);
 }

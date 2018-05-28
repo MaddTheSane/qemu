@@ -23,13 +23,14 @@
 #define TYPE_S390_PCI_HOST_BRIDGE "s390-pcihost"
 #define TYPE_S390_PCI_BUS "s390-pcibus"
 #define TYPE_S390_PCI_DEVICE "zpci"
+#define TYPE_S390_PCI_IOMMU "s390-pci-iommu"
+#define TYPE_S390_IOMMU_MEMORY_REGION "s390-iommu-memory-region"
 #define FH_MASK_ENABLE   0x80000000
 #define FH_MASK_INSTANCE 0x7f000000
 #define FH_MASK_SHM      0x00ff0000
-#define FH_MASK_INDEX    0x0000001f
+#define FH_MASK_INDEX    0x0000ffff
 #define FH_SHM_VFIO      0x00010000
 #define FH_SHM_EMUL      0x00020000
-#define S390_PCIPT_ADAPTER 2
 #define ZPCI_MAX_FID 0xffffffff
 #define ZPCI_MAX_UID 0xffff
 #define UID_UNDEFINED 0
@@ -42,6 +43,8 @@
     OBJECT_CHECK(S390PCIBus, (obj), TYPE_S390_PCI_BUS)
 #define S390_PCI_DEVICE(obj) \
     OBJECT_CHECK(S390PCIBusDevice, (obj), TYPE_S390_PCI_DEVICE)
+#define S390_PCI_IOMMU(obj) \
+    OBJECT_CHECK(S390PCIIOMMU, (obj), TYPE_S390_PCI_IOMMU)
 
 #define HP_EVENT_TO_CONFIGURED        0x0301
 #define HP_EVENT_RESERVED_TO_STANDBY  0x0302
@@ -145,6 +148,8 @@ enum ZpciIoatDtype {
 #define ZPCI_STE_FLAG_MASK      0x7ffULL
 #define ZPCI_STE_ADDR_MASK      (~ZPCI_STE_FLAG_MASK)
 
+#define ZPCI_SFAA_MASK          (~((1ULL << 20) - 1))
+
 /* I/O Page tables */
 #define ZPCI_PTE_VALID_MASK             0x400
 #define ZPCI_PTE_INVALID                0x400
@@ -162,9 +167,14 @@ enum ZpciIoatDtype {
 #define ZPCI_TABLE_INVALID              0x20
 #define ZPCI_TABLE_PROTECTED            0x200
 #define ZPCI_TABLE_UNPROTECTED          0x000
+#define ZPCI_TABLE_FC                   0x400
 
 #define ZPCI_TABLE_VALID_MASK           0x20
 #define ZPCI_TABLE_PROT_MASK            0x200
+
+#define ZPCI_ETT_RT 1
+#define ZPCI_ETT_ST 0
+#define ZPCI_ETT_PT -1
 
 /* PCI Function States
  *
@@ -180,8 +190,8 @@ enum ZpciIoatDtype {
  *          may enter an error state
  * blocked: ignore all DMA and interrupts; transition back to enabled or from
  *          error state via mpcifc
- * error: an error occured; transition back to enabled via mpcifc
- * permanent error: an unrecoverable error occured; transition to standby via
+ * error: an error occurred; transition back to enabled via mpcifc
+ * permanent error: an unrecoverable error occurred; transition to standby via
  *                  sclp deconfigure
  */
 typedef enum {
@@ -241,14 +251,6 @@ typedef struct ChscSeiNt2Res {
     uint8_t ccdf[4016];
 } QEMU_PACKED ChscSeiNt2Res;
 
-typedef struct PciCfgSccb {
-    SCCBHeader header;
-    uint8_t atype;
-    uint8_t reserved1;
-    uint16_t reserved2;
-    uint32_t aid;
-} QEMU_PACKED PciCfgSccb;
-
 typedef struct S390MsixInfo {
     bool available;
     uint8_t table_bar;
@@ -258,37 +260,56 @@ typedef struct S390MsixInfo {
     uint32_t pba_offset;
 } S390MsixInfo;
 
+typedef struct S390IOTLBEntry {
+    uint64_t iova;
+    uint64_t translated_addr;
+    uint64_t len;
+    uint64_t perm;
+} S390IOTLBEntry;
+
+typedef struct S390PCIBusDevice S390PCIBusDevice;
 typedef struct S390PCIIOMMU {
+    Object parent_obj;
+    S390PCIBusDevice *pbdev;
     AddressSpace as;
     MemoryRegion mr;
-} S390PCIIOMMU;
-
-typedef struct S390PCIBusDevice {
-    DeviceState qdev;
-    PCIDevice *pdev;
-    ZpciState state;
-    bool iommu_enabled;
-    char *target;
-    uint16_t uid;
-    uint32_t fh;
-    uint32_t fid;
-    bool fid_defined;
+    IOMMUMemoryRegion iommu_mr;
+    bool enabled;
     uint64_t g_iota;
     uint64_t pba;
     uint64_t pal;
+    GHashTable *iotlb;
+} S390PCIIOMMU;
+
+typedef struct S390PCIIOMMUTable {
+    uint64_t key;
+    S390PCIIOMMU *iommu[PCI_SLOT_MAX];
+} S390PCIIOMMUTable;
+
+struct S390PCIBusDevice {
+    DeviceState qdev;
+    PCIDevice *pdev;
+    ZpciState state;
+    char *target;
+    uint16_t uid;
+    uint32_t idx;
+    uint32_t fh;
+    uint32_t fid;
+    bool fid_defined;
     uint64_t fmb_addr;
     uint8_t isc;
     uint16_t noi;
+    uint16_t maxstbl;
     uint8_t sum;
     S390MsixInfo msix;
     AdapterRoutes routes;
     S390PCIIOMMU *iommu;
-    MemoryRegion iommu_mr;
     MemoryRegion msix_notify_mr;
     IndAddr *summary_ind;
     IndAddr *indicator;
     QEMUTimer *release_timer;
-} S390PCIBusDevice;
+    QTAILQ_ENTRY(S390PCIBusDevice) link;
+};
 
 typedef struct S390PCIBus {
     BusState qbus;
@@ -296,23 +317,32 @@ typedef struct S390PCIBus {
 
 typedef struct S390pciState {
     PCIHostState parent_obj;
+    uint32_t next_idx;
+    int bus_no;
     S390PCIBus *bus;
-    S390PCIBusDevice *pbdev[PCI_SLOT_MAX];
-    S390PCIIOMMU *iommu[PCI_SLOT_MAX];
+    GHashTable *iommu_table;
+    GHashTable *zpci_table;
     QTAILQ_HEAD(, SeiContainer) pending_sei;
+    QTAILQ_HEAD(, S390PCIBusDevice) zpci_devs;
 } S390pciState;
 
-int chsc_sei_nt2_get_event(void *res);
-int chsc_sei_nt2_have_event(void);
+S390pciState *s390_get_phb(void);
+int pci_chsc_sei_nt2_get_event(void *res);
+int pci_chsc_sei_nt2_have_event(void);
 void s390_pci_sclp_configure(SCCB *sccb);
 void s390_pci_sclp_deconfigure(SCCB *sccb);
-void s390_pci_iommu_enable(S390PCIBusDevice *pbdev);
-void s390_pci_iommu_disable(S390PCIBusDevice *pbdev);
+void s390_pci_iommu_enable(S390PCIIOMMU *iommu);
+void s390_pci_iommu_disable(S390PCIIOMMU *iommu);
 void s390_pci_generate_error_event(uint16_t pec, uint32_t fh, uint32_t fid,
                                    uint64_t faddr, uint32_t e);
-S390PCIBusDevice *s390_pci_find_dev_by_idx(uint32_t idx);
-S390PCIBusDevice *s390_pci_find_dev_by_fh(uint32_t fh);
-S390PCIBusDevice *s390_pci_find_dev_by_fid(uint32_t fid);
-S390PCIBusDevice *s390_pci_find_next_avail_dev(S390PCIBusDevice *pbdev);
+uint16_t s390_guest_io_table_walk(uint64_t g_iota, hwaddr addr,
+                                  S390IOTLBEntry *entry);
+S390PCIBusDevice *s390_pci_find_dev_by_idx(S390pciState *s, uint32_t idx);
+S390PCIBusDevice *s390_pci_find_dev_by_fh(S390pciState *s, uint32_t fh);
+S390PCIBusDevice *s390_pci_find_dev_by_fid(S390pciState *s, uint32_t fid);
+S390PCIBusDevice *s390_pci_find_dev_by_target(S390pciState *s,
+                                              const char *target);
+S390PCIBusDevice *s390_pci_find_next_avail_dev(S390pciState *s,
+                                               S390PCIBusDevice *pbdev);
 
 #endif

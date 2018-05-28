@@ -30,6 +30,10 @@ QEMUTimerListGroup main_loop_tlg;
 
 int64_t ptimer_test_time_ns;
 
+/* Do not artificially limit period - see hw/core/ptimer.c.  */
+int use_icount = 1;
+bool qtest_allowed;
+
 void timer_init_tl(QEMUTimer *ts,
                    QEMUTimerList *timer_list, int scale,
                    QEMUTimerCB *cb, void *opaque)
@@ -106,6 +110,11 @@ QEMUBH *qemu_bh_new(QEMUBHFunc *cb, void *opaque)
     bh->opaque = opaque;
 
     return bh;
+}
+
+void qemu_bh_delete(QEMUBH *bh)
+{
+    g_free(bh);
 }
 
 void replay_bh_schedule_event(QEMUBH *bh)

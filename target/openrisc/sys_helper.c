@@ -22,6 +22,8 @@
 #include "cpu.h"
 #include "exec/exec-all.h"
 #include "exec/helper-proto.h"
+#include "exception.h"
+#include "sysemu/sysemu.h"
 
 #define TO_SPR(group, number) (((group) << 11) + (number))
 
@@ -29,28 +31,37 @@ void HELPER(mtspr)(CPUOpenRISCState *env,
                    target_ulong ra, target_ulong rb, target_ulong offset)
 {
 #ifndef CONFIG_USER_ONLY
-    int spr = (ra | offset);
-    int idx;
-
     OpenRISCCPU *cpu = openrisc_env_get_cpu(env);
     CPUState *cs = CPU(cpu);
+    int spr = (ra | offset);
+    int idx;
 
     switch (spr) {
     case TO_SPR(0, 0): /* VR */
         env->vr = rb;
         break;
 
+    case TO_SPR(0, 11): /* EVBAR */
+        env->evbar = rb;
+        break;
+
     case TO_SPR(0, 16): /* NPC */
-        env->npc = rb;
+        cpu_restore_state(cs, GETPC(), true);
+        /* ??? Mirror or1ksim in not trashing delayed branch state
+           when "jumping" to the current instruction.  */
+        if (env->pc != rb) {
+            env->pc = rb;
+            env->dflag = 0;
+            cpu_loop_exit(cs);
+        }
         break;
 
     case TO_SPR(0, 17): /* SR */
         if ((env->sr & (SR_IME | SR_DME | SR_SM)) ^
             (rb & (SR_IME | SR_DME | SR_SM))) {
-            tlb_flush(cs, 1);
+            tlb_flush(cs);
         }
-        env->sr = rb;
-        env->sr |= SR_FO;      /* FO is const equal to 1 */
+        cpu_set_sr(env, rb);
         if (env->sr & SR_DME) {
             env->tlb->cpu_openrisc_map_address_data =
                 &cpu_openrisc_get_phys_data;
@@ -83,6 +94,11 @@ void HELPER(mtspr)(CPUOpenRISCState *env,
     case TO_SPR(0, 64): /* ESR */
         env->esr = rb;
         break;
+
+    case TO_SPR(0, 1024) ... TO_SPR(0, 1024 + (16 * 32)): /* Shadow GPRs */
+        idx = (spr - 1024);
+        env->shadow_gpr[idx / 32][idx % 32] = rb;
+
     case TO_SPR(1, 512) ... TO_SPR(1, 512+DTLB_SIZE-1): /* DTLBW0MR 0-127 */
         idx = spr - TO_SPR(1, 512);
         if (!(rb & 1)) {
@@ -121,6 +137,21 @@ void HELPER(mtspr)(CPUOpenRISCState *env,
     case TO_SPR(2, 1280) ... TO_SPR(2, 1407): /* ITLBW3MR 0-127 */
     case TO_SPR(2, 1408) ... TO_SPR(2, 1535): /* ITLBW3TR 0-127 */
         break;
+    case TO_SPR(5, 1):  /* MACLO */
+        env->mac = deposit64(env->mac, 0, 32, rb);
+        break;
+    case TO_SPR(5, 2):  /* MACHI */
+        env->mac = deposit64(env->mac, 32, 32, rb);
+        break;
+    case TO_SPR(8, 0):  /* PMR */
+        env->pmr = rb;
+        if (env->pmr & PMR_DME || env->pmr & PMR_SME) {
+            cpu_restore_state(cs, GETPC(), true);
+            env->pc += 4;
+            cs->halted = 1;
+            raise_exception(cpu, EXCP_HALTED);
+        }
+        break;
     case TO_SPR(9, 0):  /* PICMR */
         env->picmr |= rb;
         break;
@@ -158,14 +189,13 @@ void HELPER(mtspr)(CPUOpenRISCState *env,
         break;
 
     case TO_SPR(10, 1): /* TTCR */
-        env->ttcr = rb;
+        cpu_openrisc_count_set(cpu, rb);
         if (env->ttmr & TIMER_NONE) {
             return;
         }
         cpu_openrisc_timer_update(cpu);
         break;
     default:
-
         break;
     }
 #endif
@@ -175,10 +205,10 @@ target_ulong HELPER(mfspr)(CPUOpenRISCState *env,
                            target_ulong rd, target_ulong ra, uint32_t offset)
 {
 #ifndef CONFIG_USER_ONLY
+    OpenRISCCPU *cpu = openrisc_env_get_cpu(env);
+    CPUState *cs = CPU(cpu);
     int spr = (ra | offset);
     int idx;
-
-    OpenRISCCPU *cpu = openrisc_env_get_cpu(env);
 
     switch (spr) {
     case TO_SPR(0, 0): /* VR */
@@ -196,13 +226,18 @@ target_ulong HELPER(mfspr)(CPUOpenRISCState *env,
     case TO_SPR(0, 4): /* IMMUCFGR */
         return env->immucfgr;
 
-    case TO_SPR(0, 16): /* NPC */
-        return env->npc;
+    case TO_SPR(0, 11): /* EVBAR */
+        return env->evbar;
+
+    case TO_SPR(0, 16): /* NPC (equals PC) */
+        cpu_restore_state(cs, GETPC(), false);
+        return env->pc;
 
     case TO_SPR(0, 17): /* SR */
-        return env->sr;
+        return cpu_get_sr(env);
 
     case TO_SPR(0, 18): /* PPC */
+        cpu_restore_state(cs, GETPC(), false);
         return env->ppc;
 
     case TO_SPR(0, 32): /* EPCR */
@@ -213,6 +248,16 @@ target_ulong HELPER(mfspr)(CPUOpenRISCState *env,
 
     case TO_SPR(0, 64): /* ESR */
         return env->esr;
+
+    case TO_SPR(0, 128): /* COREID */
+        return cpu->parent_obj.cpu_index;
+
+    case TO_SPR(0, 129): /* NUMCORES */
+        return max_cpus;
+
+    case TO_SPR(0, 1024) ... TO_SPR(0, 1024 + (16 * 32)): /* Shadow GPRs */
+        idx = (spr - 1024);
+        return env->shadow_gpr[idx / 32][idx % 32];
 
     case TO_SPR(1, 512) ... TO_SPR(1, 512+DTLB_SIZE-1): /* DTLBW0MR 0-127 */
         idx = spr - TO_SPR(1, 512);
@@ -246,6 +291,16 @@ target_ulong HELPER(mfspr)(CPUOpenRISCState *env,
     case TO_SPR(2, 1408) ... TO_SPR(2, 1535): /* ITLBW3TR 0-127 */
         break;
 
+    case TO_SPR(5, 1):  /* MACLO */
+        return (uint32_t)env->mac;
+        break;
+    case TO_SPR(5, 2):  /* MACHI */
+        return env->mac >> 32;
+        break;
+
+    case TO_SPR(8, 0):  /* PMR */
+        return env->pmr;
+
     case TO_SPR(9, 0):  /* PICMR */
         return env->picmr;
 
@@ -257,31 +312,12 @@ target_ulong HELPER(mfspr)(CPUOpenRISCState *env,
 
     case TO_SPR(10, 1): /* TTCR */
         cpu_openrisc_count_update(cpu);
-        return env->ttcr;
+        return cpu_openrisc_count_get(cpu);
 
     default:
         break;
     }
 #endif
-
-/*If we later need to add tracepoints (or debug printfs) for the return
-value, it may be useful to structure the code like this:
-
-target_ulong ret = 0;
-
-switch() {
-case x:
- ret = y;
- break;
-case z:
- ret = 42;
- break;
-...
-}
-
-later something like trace_spr_read(ret);
-
-return ret;*/
 
     /* for rd is passed in, if rd unchanged, just keep it back.  */
     return rd;

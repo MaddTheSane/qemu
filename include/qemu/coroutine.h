@@ -77,6 +77,11 @@ void qemu_coroutine_enter(Coroutine *coroutine);
 void qemu_coroutine_enter_if_inactive(Coroutine *co);
 
 /**
+ * Transfer control to a coroutine and associate it with ctx
+ */
+void qemu_aio_coroutine_enter(AioContext *ctx, Coroutine *co);
+
+/**
  * Transfer control back to a coroutine's caller
  *
  * This function does not return until the coroutine is re-entered using
@@ -112,59 +117,32 @@ bool qemu_in_coroutine(void);
  */
 bool qemu_coroutine_entered(Coroutine *co);
 
-
-/**
- * CoQueues are a mechanism to queue coroutines in order to continue executing
- * them later. They provide the fundamental primitives on which coroutine locks
- * are built.
- */
-typedef struct CoQueue {
-    QSIMPLEQ_HEAD(, Coroutine) entries;
-} CoQueue;
-
-/**
- * Initialise a CoQueue. This must be called before any other operation is used
- * on the CoQueue.
- */
-void qemu_co_queue_init(CoQueue *queue);
-
-/**
- * Adds the current coroutine to the CoQueue and transfers control to the
- * caller of the coroutine.
- */
-void coroutine_fn qemu_co_queue_wait(CoQueue *queue);
-
-/**
- * Restarts the next coroutine in the CoQueue and removes it from the queue.
- *
- * Returns true if a coroutine was restarted, false if the queue is empty.
- */
-bool coroutine_fn qemu_co_queue_next(CoQueue *queue);
-
-/**
- * Restarts all coroutines in the CoQueue and leaves the queue empty.
- */
-void coroutine_fn qemu_co_queue_restart_all(CoQueue *queue);
-
-/**
- * Enter the next coroutine in the queue
- */
-bool qemu_co_enter_next(CoQueue *queue);
-
-/**
- * Checks if the CoQueue is empty.
- */
-bool qemu_co_queue_empty(CoQueue *queue);
-
-
 /**
  * Provides a mutex that can be used to synchronise coroutines
  */
-typedef struct CoMutex {
-    bool locked;
+struct CoWaitRecord;
+struct CoMutex {
+    /* Count of pending lockers; 0 for a free mutex, 1 for an
+     * uncontended mutex.
+     */
+    unsigned locked;
+
+    /* Context that is holding the lock.  Useful to avoid spinning
+     * when two coroutines on the same AioContext try to get the lock. :)
+     */
+    AioContext *ctx;
+
+    /* A queue of waiters.  Elements are added atomically in front of
+     * from_push.  to_pop is only populated, and popped from, by whoever
+     * is in charge of the next wakeup.  This can be an unlocker or,
+     * through the handoff protocol, a locker that is about to go to sleep.
+     */
+    QSLIST_HEAD(, CoWaitRecord) from_push, to_pop;
+
+    unsigned handoff, sequence;
+
     Coroutine *holder;
-    CoQueue queue;
-} CoMutex;
+};
 
 /**
  * Initialises a CoMutex. This must be called before any other operation is used
@@ -184,9 +162,65 @@ void coroutine_fn qemu_co_mutex_lock(CoMutex *mutex);
  */
 void coroutine_fn qemu_co_mutex_unlock(CoMutex *mutex);
 
+
+/**
+ * CoQueues are a mechanism to queue coroutines in order to continue executing
+ * them later.  They are similar to condition variables, but they need help
+ * from an external mutex in order to maintain thread-safety.
+ */
+typedef struct CoQueue {
+    QSIMPLEQ_HEAD(, Coroutine) entries;
+} CoQueue;
+
+/**
+ * Initialise a CoQueue. This must be called before any other operation is used
+ * on the CoQueue.
+ */
+void qemu_co_queue_init(CoQueue *queue);
+
+/**
+ * Adds the current coroutine to the CoQueue and transfers control to the
+ * caller of the coroutine.  The mutex is unlocked during the wait and
+ * locked again afterwards.
+ */
+#define qemu_co_queue_wait(queue, lock) \
+    qemu_co_queue_wait_impl(queue, QEMU_MAKE_LOCKABLE(lock))
+void coroutine_fn qemu_co_queue_wait_impl(CoQueue *queue, QemuLockable *lock);
+
+/**
+ * Removes the next coroutine from the CoQueue, and wake it up.
+ * Returns true if a coroutine was removed, false if the queue is empty.
+ */
+bool coroutine_fn qemu_co_queue_next(CoQueue *queue);
+
+/**
+ * Empties the CoQueue; all coroutines are woken up.
+ */
+void coroutine_fn qemu_co_queue_restart_all(CoQueue *queue);
+
+/**
+ * Removes the next coroutine from the CoQueue, and wake it up.  Unlike
+ * qemu_co_queue_next, this function releases the lock during aio_co_wake
+ * because it is meant to be used outside coroutine context; in that case, the
+ * coroutine is entered immediately, before qemu_co_enter_next returns.
+ *
+ * If used in coroutine context, qemu_co_enter_next is equivalent to
+ * qemu_co_queue_next.
+ */
+#define qemu_co_enter_next(queue, lock) \
+    qemu_co_enter_next_impl(queue, QEMU_MAKE_LOCKABLE(lock))
+bool qemu_co_enter_next_impl(CoQueue *queue, QemuLockable *lock);
+
+/**
+ * Checks if the CoQueue is empty.
+ */
+bool qemu_co_queue_empty(CoQueue *queue);
+
+
 typedef struct CoRwlock {
-    bool writer;
+    int pending_writer;
     int reader;
+    CoMutex mutex;
     CoQueue queue;
 } CoRwlock;
 
@@ -204,6 +238,24 @@ void qemu_co_rwlock_init(CoRwlock *lock);
 void qemu_co_rwlock_rdlock(CoRwlock *lock);
 
 /**
+ * Write Locks the CoRwlock from a reader.  This is a bit more efficient than
+ * @qemu_co_rwlock_unlock followed by a separate @qemu_co_rwlock_wrlock.
+ * However, if the lock cannot be upgraded immediately, control is transferred
+ * to the caller of the current coroutine.  Also, @qemu_co_rwlock_upgrade
+ * only overrides CoRwlock fairness if there are no concurrent readers, so
+ * another writer might run while @qemu_co_rwlock_upgrade blocks.
+ */
+void qemu_co_rwlock_upgrade(CoRwlock *lock);
+
+/**
+ * Downgrades a write-side critical section to a reader.  Downgrading with
+ * @qemu_co_rwlock_downgrade never blocks, unlike @qemu_co_rwlock_unlock
+ * followed by @qemu_co_rwlock_rdlock.  This makes it more efficient, but
+ * may also sometimes be necessary for correctness.
+ */
+void qemu_co_rwlock_downgrade(CoRwlock *lock);
+
+/**
  * Write Locks the mutex. If the lock cannot be taken immediately because
  * of a parallel reader, control is transferred to the caller of the current
  * coroutine.
@@ -218,12 +270,8 @@ void qemu_co_rwlock_unlock(CoRwlock *lock);
 
 /**
  * Yield the coroutine for a given duration
- *
- * Behaves similarly to co_sleep_ns(), but the sleeping coroutine will be
- * resumed when using aio_poll().
  */
-void coroutine_fn co_aio_sleep_ns(AioContext *ctx, QEMUClockType type,
-                                  int64_t ns);
+void coroutine_fn qemu_co_sleep_ns(QEMUClockType type, int64_t ns);
 
 /**
  * Yield until a file descriptor becomes readable
@@ -231,5 +279,7 @@ void coroutine_fn co_aio_sleep_ns(AioContext *ctx, QEMUClockType type,
  * Note that this function clobbers the handlers for the file descriptor.
  */
 void coroutine_fn yield_until_fd_readable(int fd);
+
+#include "qemu/lockable.h"
 
 #endif /* QEMU_COROUTINE_H */

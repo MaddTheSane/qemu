@@ -222,6 +222,10 @@ enum bfd_architecture
   bfd_arch_ia64,      /* HP/Intel ia64 */
 #define bfd_mach_ia64_elf64    64
 #define bfd_mach_ia64_elf32    32
+  bfd_arch_nios2,	/* Nios II */
+#define bfd_mach_nios2          0
+#define bfd_mach_nios2r1        1
+#define bfd_mach_nios2r2        2
   bfd_arch_lm32,       /* Lattice Mico32 */
 #define bfd_mach_lm32 1
   bfd_arch_last
@@ -291,6 +295,7 @@ typedef struct disassemble_info {
      The bottom 16 bits are for the internal use of the disassembler.  */
   unsigned long flags;
 #define INSN_HAS_RELOC	0x80000000
+#define INSN_ARM_BE32	0x00010000
   PTR private_data;
 
   /* Function used to get bytes to disassemble.  MEMADDR is the
@@ -366,6 +371,12 @@ typedef struct disassemble_info {
   /* Command line options specific to the target disassembler.  */
   char * disassembler_options;
 
+  /* Options for Capstone disassembly.  */
+  int cap_arch;
+  int cap_mode;
+  int cap_insn_unit;
+  int cap_insn_split;
+
 } disassemble_info;
 
 
@@ -415,6 +426,11 @@ int print_insn_crisv10          (bfd_vma, disassemble_info*);
 int print_insn_microblaze       (bfd_vma, disassemble_info*);
 int print_insn_ia64             (bfd_vma, disassemble_info*);
 int print_insn_lm32             (bfd_vma, disassemble_info*);
+int print_insn_big_nios2        (bfd_vma, disassemble_info*);
+int print_insn_little_nios2     (bfd_vma, disassemble_info*);
+int print_insn_xtensa           (bfd_vma, disassemble_info*);
+int print_insn_riscv32          (bfd_vma, disassemble_info*);
+int print_insn_riscv64          (bfd_vma, disassemble_info*);
 
 #if 0
 /* Fetch the disassembler for a given BFD, if that support is available.  */

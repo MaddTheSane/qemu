@@ -24,6 +24,7 @@
 #include "qemu/host-utils.h"
 #include "exec/exec-all.h"
 #include "exec/cpu_ldst.h"
+#include "fpu/softfloat.h"
 
 #define FPU_RC_MASK         0xc00
 #define FPU_RC_NEAR         0x000
@@ -1377,6 +1378,18 @@ void helper_fxrstor(CPUX86State *env, target_ulong ptr)
     }
 }
 
+#if defined(CONFIG_USER_ONLY)
+void cpu_x86_fxsave(CPUX86State *env, target_ulong ptr)
+{
+    helper_fxsave(env, ptr);
+}
+
+void cpu_x86_fxrstor(CPUX86State *env, target_ulong ptr)
+{
+    helper_fxrstor(env, ptr);
+}
+#endif
+
 void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
 {
     uintptr_t ra = GETPC();
@@ -1465,7 +1478,7 @@ void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
         }
         if (env->pkru != old_pkru) {
             CPUState *cs = CPU(x86_env_get_cpu(env));
-            tlb_flush(cs, 1);
+            tlb_flush(cs);
         }
     }
 }
@@ -1527,24 +1540,6 @@ void helper_xsetbv(CPUX86State *env, uint32_t ecx, uint64_t mask)
     raise_exception_ra(env, EXCP0D_GPF, GETPC());
 }
 
-void cpu_get_fp80(uint64_t *pmant, uint16_t *pexp, floatx80 f)
-{
-    CPU_LDoubleU temp;
-
-    temp.d = f;
-    *pmant = temp.l.lower;
-    *pexp = temp.l.upper;
-}
-
-floatx80 cpu_set_fp80(uint64_t mant, uint16_t upper)
-{
-    CPU_LDoubleU temp;
-
-    temp.l.upper = upper;
-    temp.l.lower = mant;
-    return temp.d;
-}
-
 /* MMX/SSE */
 /* XXX: optimize by storing fptt and fptags in the static cpu state */
 
@@ -1556,11 +1551,10 @@ floatx80 cpu_set_fp80(uint64_t mant, uint16_t upper)
 #define SSE_RC_CHOP         0x6000
 #define SSE_FZ              0x8000
 
-void cpu_set_mxcsr(CPUX86State *env, uint32_t mxcsr)
+void update_mxcsr_status(CPUX86State *env)
 {
+    uint32_t mxcsr = env->mxcsr;
     int rnd_type;
-
-    env->mxcsr = mxcsr;
 
     /* set rounding mode */
     switch (mxcsr & SSE_RC_MASK) {
@@ -1585,12 +1579,6 @@ void cpu_set_mxcsr(CPUX86State *env, uint32_t mxcsr)
 
     /* set flush to zero */
     set_flush_to_zero((mxcsr & SSE_FZ) ? 1 : 0, &env->fp_status);
-}
-
-void cpu_set_fpuc(CPUX86State *env, uint16_t val)
-{
-    env->fpuc = val;
-    update_fp_status(env);
 }
 
 void helper_ldmxcsr(CPUX86State *env, uint32_t val)

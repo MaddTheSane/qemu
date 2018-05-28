@@ -12,8 +12,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "hyperv.h"
-#include "standard-headers/asm-x86/hyperv.h"
+#include "hyperv-proto.h"
 
 int kvm_hv_handle_exit(X86CPU *cpu, struct kvm_hyperv_exit *exit)
 {
@@ -49,8 +50,8 @@ int kvm_hv_handle_exit(X86CPU *cpu, struct kvm_hyperv_exit *exit)
 
         code  = exit->u.hcall.input & 0xffff;
         switch (code) {
-        case HVCALL_POST_MESSAGE:
-        case HVCALL_SIGNAL_EVENT:
+        case HV_POST_MESSAGE:
+        case HV_SIGNAL_EVENT:
         default:
             exit->u.hcall.result = HV_STATUS_INVALID_HYPERCALL_CODE;
             return 0;
@@ -88,7 +89,7 @@ HvSintRoute *kvm_hv_sint_route_create(uint32_t vcpu_id, uint32_t sint,
         goto err_sint_set_notifier;
     }
 
-    event_notifier_set_handler(&sint_route->sint_ack_notifier, false,
+    event_notifier_set_handler(&sint_route->sint_ack_notifier,
                                kvm_hv_sint_ack_handler);
 
     gsi = kvm_irqchip_add_hv_sint_route(kvm_state, vcpu_id, sint);
@@ -112,7 +113,7 @@ HvSintRoute *kvm_hv_sint_route_create(uint32_t vcpu_id, uint32_t sint,
 err_irqfd:
     kvm_irqchip_release_virq(kvm_state, gsi);
 err_gsi:
-    event_notifier_set_handler(&sint_route->sint_ack_notifier, false, NULL);
+    event_notifier_set_handler(&sint_route->sint_ack_notifier, NULL);
     event_notifier_cleanup(&sint_route->sint_ack_notifier);
 err_sint_set_notifier:
     event_notifier_cleanup(&sint_route->sint_set_notifier);
@@ -128,7 +129,7 @@ void kvm_hv_sint_route_destroy(HvSintRoute *sint_route)
                                           &sint_route->sint_set_notifier,
                                           sint_route->gsi);
     kvm_irqchip_release_virq(kvm_state, sint_route->gsi);
-    event_notifier_set_handler(&sint_route->sint_ack_notifier, false, NULL);
+    event_notifier_set_handler(&sint_route->sint_ack_notifier, NULL);
     event_notifier_cleanup(&sint_route->sint_ack_notifier);
     event_notifier_cleanup(&sint_route->sint_set_notifier);
     g_free(sint_route);

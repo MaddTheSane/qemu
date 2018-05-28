@@ -32,8 +32,8 @@ void HELPER(rfe)(CPUOpenRISCState *env)
                          (cpu->env.esr & (SR_SM | SR_IME | SR_DME));
 #endif
     cpu->env.pc = cpu->env.epcr;
-    cpu->env.npc = cpu->env.epcr;
-    cpu->env.sr = cpu->env.esr;
+    cpu_set_sr(&cpu->env, cpu->env.esr);
+    cpu->env.lock_addr = -1;
 
 #ifndef CONFIG_USER_ONLY
     if (cpu->env.sr & SR_DME) {
@@ -53,7 +53,7 @@ void HELPER(rfe)(CPUOpenRISCState *env)
     }
 
     if (need_flush_tlb) {
-        tlb_flush(cs, 1);
+        tlb_flush(cs);
     }
 #endif
     cs->interrupt_request |= CPU_INTERRUPT_EXITTB;

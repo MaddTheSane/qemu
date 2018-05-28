@@ -113,6 +113,17 @@ static const IMXClk imx6_gpt_clocks[] = {
     CLK_HIGH,      /* 111 reference clock */
 };
 
+static const IMXClk imx7_gpt_clocks[] = {
+    CLK_NONE,      /* 000 No clock source */
+    CLK_IPG,       /* 001 ipg_clk, 532MHz*/
+    CLK_IPG_HIGH,  /* 010 ipg_clk_highfreq */
+    CLK_EXT,       /* 011 External clock */
+    CLK_32k,       /* 100 ipg_clk_32k */
+    CLK_HIGH,      /* 101 reference clock */
+    CLK_NONE,      /* 110 not defined */
+    CLK_NONE,      /* 111 not defined */
+};
+
 static void imx_gpt_set_freq(IMXGPTState *s)
 {
     uint32_t clksrc = extract32(s->cr, GPT_CR_CLKSRC_SHIFT, 3);
@@ -296,18 +307,23 @@ static uint64_t imx_gpt_read(void *opaque, hwaddr offset, unsigned size)
     return reg_value;
 }
 
-static void imx_gpt_reset(DeviceState *dev)
-{
-    IMXGPTState *s = IMX_GPT(dev);
 
+static void imx_gpt_reset_common(IMXGPTState *s, bool is_soft_reset)
+{
     /* stop timer */
     ptimer_stop(s->timer);
 
-    /*
-     * Soft reset doesn't touch some bits; hard reset clears them
+    /* Soft reset and hard reset differ only in their handling of the CR
+     * register -- soft reset preserves the values of some bits there.
      */
-    s->cr &= ~(GPT_CR_EN|GPT_CR_ENMOD|GPT_CR_STOPEN|GPT_CR_DOZEN|
-               GPT_CR_WAITEN|GPT_CR_DBGEN);
+    if (is_soft_reset) {
+        /* Clear all CR bits except those that are preserved by soft reset. */
+        s->cr &= GPT_CR_EN | GPT_CR_ENMOD | GPT_CR_STOPEN | GPT_CR_DOZEN |
+            GPT_CR_WAITEN | GPT_CR_DBGEN |
+            (GPT_CR_CLKSRC_MASK << GPT_CR_CLKSRC_SHIFT);
+    } else {
+        s->cr = 0;
+    }
     s->sr = 0;
     s->pr = 0;
     s->ir = 0;
@@ -333,6 +349,18 @@ static void imx_gpt_reset(DeviceState *dev)
     }
 }
 
+static void imx_gpt_soft_reset(DeviceState *dev)
+{
+    IMXGPTState *s = IMX_GPT(dev);
+    imx_gpt_reset_common(s, true);
+}
+
+static void imx_gpt_reset(DeviceState *dev)
+{
+    IMXGPTState *s = IMX_GPT(dev);
+    imx_gpt_reset_common(s, false);
+}
+
 static void imx_gpt_write(void *opaque, hwaddr offset, uint64_t value,
                           unsigned size)
 {
@@ -348,7 +376,7 @@ static void imx_gpt_write(void *opaque, hwaddr offset, uint64_t value,
         s->cr = value & ~0x7c14;
         if (s->cr & GPT_CR_SWR) { /* force reset */
             /* handle the reset */
-            imx_gpt_reset(DEVICE(s));
+            imx_gpt_soft_reset(DEVICE(s));
         } else {
             /* set our freq, as the source might have changed */
             imx_gpt_set_freq(s);
@@ -495,6 +523,13 @@ static void imx6_gpt_init(Object *obj)
     s->clocks = imx6_gpt_clocks;
 }
 
+static void imx7_gpt_init(Object *obj)
+{
+    IMXGPTState *s = IMX_GPT(obj);
+
+    s->clocks = imx7_gpt_clocks;
+}
+
 static const TypeInfo imx25_gpt_info = {
     .name = TYPE_IMX25_GPT,
     .parent = TYPE_SYS_BUS_DEVICE,
@@ -515,11 +550,18 @@ static const TypeInfo imx6_gpt_info = {
     .instance_init = imx6_gpt_init,
 };
 
+static const TypeInfo imx7_gpt_info = {
+    .name = TYPE_IMX7_GPT,
+    .parent = TYPE_IMX25_GPT,
+    .instance_init = imx7_gpt_init,
+};
+
 static void imx_gpt_register_types(void)
 {
     type_register_static(&imx25_gpt_info);
     type_register_static(&imx31_gpt_info);
     type_register_static(&imx6_gpt_info);
+    type_register_static(&imx7_gpt_info);
 }
 
 type_init(imx_gpt_register_types)

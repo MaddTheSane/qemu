@@ -42,7 +42,6 @@ static void __attribute__((constructor)) do_qemu_init_ ## function(void)    \
 typedef enum {
     MODULE_INIT_BLOCK,
     MODULE_INIT_OPTS,
-    MODULE_INIT_QAPI,
     MODULE_INIT_QOM,
     MODULE_INIT_TRACE,
     MODULE_INIT_MAX
@@ -50,11 +49,12 @@ typedef enum {
 
 #define block_init(function) module_init(function, MODULE_INIT_BLOCK)
 #define opts_init(function) module_init(function, MODULE_INIT_OPTS)
-#define qapi_init(function) module_init(function, MODULE_INIT_QAPI)
 #define type_init(function) module_init(function, MODULE_INIT_QOM)
 #define trace_init(function) module_init(function, MODULE_INIT_TRACE)
 
 #define block_module_load_one(lib) module_load_one("block-", lib)
+#define ui_module_load_one(lib) module_load_one("ui-", lib)
+#define audio_module_load_one(lib) module_load_one("audio-", lib)
 
 void register_module_init(void (*fn)(void), module_init_type type);
 void register_dso_module_init(void (*fn)(void), module_init_type type);

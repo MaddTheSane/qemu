@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/log.h"
 #include "hw/display/xlnx_dp.h"
 
@@ -34,7 +35,7 @@
     if (DEBUG_DP) {                                                            \
         qemu_log("xlnx_dp: " fmt , ## __VA_ARGS__);                            \
     }                                                                          \
-} while (0);
+} while (0)
 
 /*
  * Register offset for DP.
@@ -515,7 +516,7 @@ static void xlnx_dp_aux_set_command(XlnxDPState *s, uint32_t value)
     s->core_registers[DP_INTERRUPT_SIGNAL_STATE] |= 0x04;
 }
 
-static void xlnx_dp_set_dpdma(Object *obj, const char *name, Object *val,
+static void xlnx_dp_set_dpdma(const Object *obj, const char *name, Object *val,
                               Error **errp)
 {
     XlnxDPState *s = XLNX_DP(obj);
@@ -555,7 +556,7 @@ static void xlnx_dp_recreate_surface(XlnxDPState *s)
     if ((width != 0) && (height != 0)) {
         /*
          * As dpy_gfx_replace_surface calls qemu_free_displaysurface on the
-         * surface we need to be carefull and don't free the surface associated
+         * surface we need to be careful and don't free the surface associated
          * to the console or double free will happen.
          */
         if (s->bout_plane.surface != current_console_surface) {
@@ -623,6 +624,9 @@ static void xlnx_dp_change_graphic_fmt(XlnxDPState *s)
     switch (s->avbufm_registers[AV_BUF_FORMAT] & DP_NL_VID_FMT_MASK) {
     case 0:
         s->v_plane.format = PIXMAN_x8b8g8r8;
+        break;
+    case DP_NL_VID_Y0_CB_Y1_CR:
+        s->v_plane.format = PIXMAN_yuy2;
         break;
     case DP_NL_VID_RGBA8880:
         s->v_plane.format = PIXMAN_x8b8g8r8;
@@ -1160,7 +1164,7 @@ static void xlnx_dp_update_display(void *opaque)
      */
     if (!xlnx_dpdma_start_operation(s->dpdma, 3, false)) {
         /*
-         * An error occured don't do anything with the data..
+         * An error occurred don't do anything with the data..
          * Trigger an underflow interrupt.
          */
         s->core_registers[DP_INT_STATUS] |= (1 << 21);

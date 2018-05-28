@@ -29,6 +29,9 @@ struct QIOTask {
     QIOTaskFunc func;
     gpointer opaque;
     GDestroyNotify destroy;
+    Error *err;
+    gpointer result;
+    GDestroyNotify destroyResult;
 };
 
 
@@ -57,6 +60,12 @@ static void qio_task_free(QIOTask *task)
     if (task->destroy) {
         task->destroy(task->opaque);
     }
+    if (task->destroyResult) {
+        task->destroyResult(task->result);
+    }
+    if (task->err) {
+        error_free(task->err);
+    }
     object_unref(task->source);
 
     g_free(task);
@@ -68,25 +77,23 @@ struct QIOTaskThreadData {
     QIOTaskWorker worker;
     gpointer opaque;
     GDestroyNotify destroy;
-    Error *err;
-    int ret;
+    GMainContext *context;
 };
 
 
-static gboolean gio_task_thread_result(gpointer opaque)
+static gboolean qio_task_thread_result(gpointer opaque)
 {
     struct QIOTaskThreadData *data = opaque;
 
     trace_qio_task_thread_result(data->task);
-    if (data->ret == 0) {
-        qio_task_complete(data->task);
-    } else {
-        qio_task_abort(data->task, data->err);
-    }
+    qio_task_complete(data->task);
 
-    error_free(data->err);
     if (data->destroy) {
         data->destroy(data->opaque);
+    }
+
+    if (data->context) {
+        g_main_context_unref(data->context);
     }
 
     g_free(data);
@@ -98,12 +105,10 @@ static gboolean gio_task_thread_result(gpointer opaque)
 static gpointer qio_task_thread_worker(gpointer opaque)
 {
     struct QIOTaskThreadData *data = opaque;
+    GSource *idle;
 
     trace_qio_task_thread_run(data->task);
-    data->ret = data->worker(data->task, &data->err, data->opaque);
-    if (data->ret < 0 && data->err == NULL) {
-        error_setg(&data->err, "Task worker failed but did not set an error");
-    }
+    data->worker(data->task, data->opaque);
 
     /* We're running in the background thread, and must only
      * ever report the task results in the main event loop
@@ -111,7 +116,11 @@ static gpointer qio_task_thread_worker(gpointer opaque)
      * the worker results
      */
     trace_qio_task_thread_exit(data->task);
-    g_idle_add(gio_task_thread_result, data);
+
+    idle = g_idle_source_new();
+    g_source_set_callback(idle, qio_task_thread_result, data, NULL);
+    g_source_attach(idle, data->context);
+
     return NULL;
 }
 
@@ -119,15 +128,21 @@ static gpointer qio_task_thread_worker(gpointer opaque)
 void qio_task_run_in_thread(QIOTask *task,
                             QIOTaskWorker worker,
                             gpointer opaque,
-                            GDestroyNotify destroy)
+                            GDestroyNotify destroy,
+                            GMainContext *context)
 {
     struct QIOTaskThreadData *data = g_new0(struct QIOTaskThreadData, 1);
     QemuThread thread;
+
+    if (context) {
+        g_main_context_ref(context);
+    }
 
     data->task = task;
     data->worker = worker;
     data->opaque = opaque;
     data->destroy = destroy;
+    data->context = context;
 
     trace_qio_task_thread_start(task, worker, opaque);
     qemu_thread_create(&thread,
@@ -140,22 +155,48 @@ void qio_task_run_in_thread(QIOTask *task,
 
 void qio_task_complete(QIOTask *task)
 {
-    task->func(task->source, NULL, task->opaque);
+    task->func(task, task->opaque);
     trace_qio_task_complete(task);
     qio_task_free(task);
 }
 
-void qio_task_abort(QIOTask *task,
-                    Error *err)
+
+void qio_task_set_error(QIOTask *task,
+                        Error *err)
 {
-    task->func(task->source, err, task->opaque);
-    trace_qio_task_abort(task);
-    qio_task_free(task);
+    error_propagate(&task->err, err);
+}
+
+
+bool qio_task_propagate_error(QIOTask *task,
+                              Error **errp)
+{
+    if (task->err) {
+        error_propagate(errp, task->err);
+        task->err = NULL;
+        return true;
+    }
+
+    return false;
+}
+
+
+void qio_task_set_result_pointer(QIOTask *task,
+                                 gpointer result,
+                                 GDestroyNotify destroy)
+{
+    task->result = result;
+    task->destroyResult = destroy;
+}
+
+
+gpointer qio_task_get_result_pointer(QIOTask *task)
+{
+    return task->result;
 }
 
 
 Object *qio_task_get_source(QIOTask *task)
 {
-    object_ref(task->source);
     return task->source;
 }

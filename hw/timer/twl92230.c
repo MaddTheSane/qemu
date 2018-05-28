@@ -403,7 +403,7 @@ static uint8_t menelaus_read(void *opaque, uint8_t addr)
 
     default:
 #ifdef VERBOSE
-        printf("%s: unknown register %02x\n", __FUNCTION__, addr);
+        printf("%s: unknown register %02x\n", __func__, addr);
 #endif
         break;
     }
@@ -615,7 +615,7 @@ static void menelaus_write(void *opaque, uint8_t addr, uint8_t value)
         rtc_badness:
         default:
             fprintf(stderr, "%s: bad RTC_UPDATE value %02x\n",
-                            __FUNCTION__, value);
+                            __func__, value);
             s->status |= 1 << 10;				/* RTCERR */
             menelaus_update(s);
         }
@@ -708,7 +708,7 @@ static void menelaus_write(void *opaque, uint8_t addr, uint8_t value)
 
     default:
 #ifdef VERBOSE
-        printf("%s: unknown register %02x\n", __FUNCTION__, addr);
+        printf("%s: unknown register %02x\n", __func__, addr);
 #endif
     }
 }
@@ -749,17 +749,21 @@ static int menelaus_rx(I2CSlave *i2c)
    Or we broke compatibility in the state, or we can't use struct tm
  */
 
-static int get_int32_as_uint16(QEMUFile *f, void *pv, size_t size)
+static int get_int32_as_uint16(QEMUFile *f, void *pv, size_t size,
+                               VMStateField *field)
 {
     int *v = pv;
     *v = qemu_get_be16(f);
     return 0;
 }
 
-static void put_int32_as_uint16(QEMUFile *f, void *pv, size_t size)
+static int put_int32_as_uint16(QEMUFile *f, void *pv, size_t size,
+                               VMStateField *field, QJSON *vmdesc)
 {
     int *v = pv;
     qemu_put_be16(f, *v);
+
+    return 0;
 }
 
 static const VMStateInfo vmstate_hack_int32_as_uint16 = {
@@ -787,11 +791,13 @@ static const VMStateDescription vmstate_menelaus_tm = {
     }
 };
 
-static void menelaus_pre_save(void *opaque)
+static int menelaus_pre_save(void *opaque)
 {
     MenelausState *s = opaque;
     /* Should be <= 1000 */
     s->rtc_next_vmstate =  s->rtc.next - qemu_clock_get_ms(rtc_clock);
+
+    return 0;
 }
 
 static int menelaus_post_load(void *opaque, int version_id)

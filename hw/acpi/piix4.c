@@ -440,6 +440,8 @@ static void piix4_update_bus_hotplug(PCIBus *pci_bus, void *opaque)
 {
     PIIX4PMState *s = opaque;
 
+    /* pci_bus cannot outlive PIIX4PMState, because /machine keeps it alive
+     * and it's not hot-unpluggable */
     qbus_set_hotplug_handler(BUS(pci_bus), DEVICE(s), &error_abort);
 }
 
@@ -458,9 +460,9 @@ static void piix4_pm_machine_ready(Notifier *n, void *opaque)
         (memory_region_present(io_as, 0x2f8) ? 0x90 : 0);
 
     if (s->use_acpi_pci_hotplug) {
-        pci_for_each_bus(d->bus, piix4_update_bus_hotplug, s);
+        pci_for_each_bus(pci_get_bus(d), piix4_update_bus_hotplug, s);
     } else {
-        piix4_update_bus_hotplug(d->bus, s);
+        piix4_update_bus_hotplug(pci_get_bus(d), s);
     }
 }
 
@@ -533,7 +535,8 @@ static void piix4_pm_realize(PCIDevice *dev, Error **errp)
     qemu_add_machine_init_done_notifier(&s->machine_ready);
     qemu_register_reset(piix4_reset, s);
 
-    piix4_acpi_system_hot_add_init(pci_address_space_io(dev), dev->bus, s);
+    piix4_acpi_system_hot_add_init(pci_address_space_io(dev),
+                                   pci_get_bus(dev), s);
 
     piix4_pm_add_propeties(s);
 }
@@ -644,7 +647,8 @@ static void piix4_acpi_system_hot_add_init(MemoryRegion *parent,
                                  PIIX4_CPU_HOTPLUG_IO_BASE);
 
     if (s->acpi_memory_hotplug.is_enabled) {
-        acpi_memory_hotplug_init(parent, OBJECT(s), &s->acpi_memory_hotplug);
+        acpi_memory_hotplug_init(parent, OBJECT(s), &s->acpi_memory_hotplug,
+                                 ACPI_MEMORY_HOTPLUG_BASE);
     }
 }
 
@@ -697,7 +701,7 @@ static void piix4_pm_class_init(ObjectClass *klass, void *data)
      * Reason: part of PIIX4 southbridge, needs to be wired up,
      * e.g. by mips_malta_init()
      */
-    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->user_creatable = false;
     dc->hotpluggable = false;
     hc->plug = piix4_device_plug_cb;
     hc->unplug_request = piix4_device_unplug_request_cb;
@@ -715,6 +719,7 @@ static const TypeInfo piix4_pm_info = {
     .interfaces = (InterfaceInfo[]) {
         { TYPE_HOTPLUG_HANDLER },
         { TYPE_ACPI_DEVICE_IF },
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { }
     }
 };
