@@ -306,6 +306,7 @@ static void QEMU_Alert(NSString *message)
     alert = [NSAlert new];
     [alert setMessageText: message];
     [alert runModal];
+    [alert release];
 }
 
 /* Handles any errors that happen with a device transaction */
@@ -478,17 +479,23 @@ QemuCocoaView *cocoaView;
         CGContextSetRGBFillColor(viewContextRef, 0, 0, 0, 1.0);
         CGContextFillRect(viewContextRef, NSRectToCGRect(rect));
     } else {
+        CGColorSpaceRef colorRef =
+#ifdef __LITTLE_ENDIAN__
+        CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB) //colorspace for OS X >= 10.4
+#else
+        CGColorSpaceCreateDeviceRGB() //colorspace for OS X < 10.4 (actually ppc)
+#endif
+        ;
         CGImageRef imageRef = CGImageCreate(
             screen.width, //width
             screen.height, //height
             screen.bitsPerComponent, //bitsPerComponent
             screen.bitsPerPixel, //bitsPerPixel
             (screen.width * (screen.bitsPerComponent/2)), //bytesPerRow
+            colorRef,
 #ifdef __LITTLE_ENDIAN__
-            CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB), //colorspace for OS X >= 10.4
             kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
 #else
-            CGColorSpaceCreateDeviceRGB(), //colorspace for OS X < 10.4 (actually ppc)
             kCGImageAlphaNoneSkipFirst, //bitmapInfo
 #endif
             dataProviderRef, //provider
@@ -496,6 +503,7 @@ QemuCocoaView *cocoaView;
             0, //interpolate
             kCGRenderingIntentDefault //intent
         );
+        CGColorSpaceRelease(colorRef);
         // selective drawing code (draws only dirty rectangles) (OS X >= 10.4)
         const NSRect *rectList;
         NSInteger rectCount;
@@ -1439,9 +1447,11 @@ QemuCocoaView *cocoaView;
                                                      picture_rect];
     NSImage *qemu_image = [[NSWorkspace sharedWorkspace] iconForFile:
                                                          program_path];
+    [program_path release];
     [picture_view setImage: qemu_image];
     [picture_view setImageScaling: NSImageScaleProportionallyUpOrDown];
     [superView addSubview: picture_view];
+    [picture_view release];
 
     /* Make the name label */
     x = 0;
@@ -1455,9 +1465,10 @@ QemuCocoaView *cocoaView;
     [name_label setAlignment: NSTextAlignmentCenter];
     NSString *qemu_name = [[NSString alloc] initWithCString: gArgv[0]
                                             encoding: NSASCIIStringEncoding];
-    qemu_name = [qemu_name lastPathComponent];
+    qemu_name = [[qemu_name autorelease] lastPathComponent];
     [name_label setStringValue: qemu_name];
     [superView addSubview: name_label];
+    [name_label release];
 
     /* Set the version label's attributes */
     x = 0;
@@ -1476,7 +1487,9 @@ QemuCocoaView *cocoaView;
     version_string = [[NSString alloc] initWithFormat:
     @"QEMU emulator version %s", QEMU_FULL_VERSION];
     [version_label setStringValue: version_string];
+    [version_string release];
     [superView addSubview: version_label];
+    [version_label release];
 
     /* Make copyright label */
     x = 0;
@@ -1492,6 +1505,7 @@ QemuCocoaView *cocoaView;
     [copyright_label setStringValue: [NSString stringWithFormat: @"%s",
                                      QEMU_COPYRIGHT]];
     [superView addSubview: copyright_label];
+    [copyright_label release];
 }
 
 /* Used by the Speed menu items */
@@ -1691,8 +1705,10 @@ static void addRemovableDevicesMenuItems(void)
     // Add the "Removable Media" menu item
     menuItem = [NSMenuItem new];
     [menuItem setAttributedTitle: attString];
+    [attString release];
     [menuItem setEnabled: NO];
     [menu addItem: menuItem];
+    [menuItem release];
 
     /* Loop through all the block devices in the emulator */
     while (currentDevice) {
@@ -1704,14 +1720,14 @@ static void addRemovableDevicesMenuItems(void)
                                            keyEquivalent: @""];
             [menu addItem: menuItem];
             [menuItem setRepresentedObject: deviceName];
-            [menuItem autorelease];
+            [menuItem release];
 
             menuItem = [[NSMenuItem alloc] initWithTitle: [NSString stringWithFormat: @"Eject %s", currentDevice->value->device]
                                                   action: @selector(ejectDeviceMedia:)
                                            keyEquivalent: @""];
             [menu addItem: menuItem];
             [menuItem setRepresentedObject: deviceName];
-            [menuItem autorelease];
+            [menuItem release];
         }
         currentDevice = currentDevice->next;
     }
